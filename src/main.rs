@@ -871,7 +871,10 @@ fn draw(frame: &mut Frame, app: &App) {
         ))
     } else {
         Line::from(vec![
-            Span::styled(&app.query, Style::default().fg(Color::White)),
+            Span::styled(
+                sanitize_for_display(&app.query),
+                Style::default().fg(Color::White),
+            ),
             Span::styled("▏", Style::default().fg(Color::Cyan)),
         ])
     };
@@ -890,14 +893,16 @@ fn draw(frame: &mut Frame, app: &App) {
         .hits
         .iter()
         .map(|hit| {
-            let name = Path::new(&hit.key)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&hit.key);
+            let name = sanitize_for_display(
+                Path::new(&hit.key)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&hit.key),
+            );
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(
-                        name.to_owned(),
+                        name,
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
@@ -909,7 +914,7 @@ fn draw(frame: &mut Frame, app: &App) {
                     ),
                 ]),
                 Line::from(Span::styled(
-                    hit.key.clone(),
+                    sanitize_for_display(&hit.key),
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -968,7 +973,7 @@ fn draw(frame: &mut Frame, app: &App) {
             ]
         });
     let title = selected
-        .map(|hit| format!(" {} · {:.3} ", hit.key, hit.score))
+        .map(|hit| format!(" {} · {:.3} ", sanitize_for_display(&hit.key), hit.score))
         .unwrap_or_else(|| " Preview ".into());
     frame.render_widget(
         Paragraph::new(preview)
@@ -1052,7 +1057,8 @@ fn preview_lines(body: &str, query: &str) -> Vec<Line<'static>> {
     chosen
         .into_iter()
         .map(|(number, line)| {
-            let excerpt = truncate_utf8(line, 400);
+            let line = sanitize_for_display(line);
+            let excerpt = truncate_utf8(&line, 400);
             let mut spans = vec![Span::styled(
                 format!("{:>4} │ ", number + 1),
                 Style::default().fg(Color::DarkGray),
@@ -1101,6 +1107,39 @@ fn highlight_line(line: &str, terms: &[String]) -> Vec<Span<'static>> {
     spans
 }
 
+const TAB_WIDTH: usize = 4;
+
+fn sanitize_for_display(text: &str) -> String {
+    let mut clean = String::with_capacity(text.len());
+    let mut column = 0;
+    for ch in text.chars() {
+        match ch {
+            '\t' => {
+                let pad = TAB_WIDTH - column % TAB_WIDTH;
+                clean.extend(std::iter::repeat_n(' ', pad));
+                column += pad;
+            }
+            ch if ch.is_control() || is_invisible_format(ch) => {}
+            ch => {
+                clean.push(ch);
+                column += 1;
+            }
+        }
+    }
+    clean
+}
+
+fn is_invisible_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+    )
+}
+
 fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
@@ -1142,4 +1181,42 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - width) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{buffer::Buffer, widgets::Widget};
+
+    fn rendered_symbols(text: &str) -> Vec<String> {
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(preview_lines(text, "lo"))
+            .wrap(Wrap { trim: true })
+            .render(area, &mut buffer);
+        buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn tabs_expand_to_the_next_stop_and_invisibles_vanish() {
+        assert_eq!(sanitize_for_display("\tx"), "    x");
+        assert_eq!(sanitize_for_display("ab\tx"), "ab  x");
+        assert_eq!(sanitize_for_display("\u{FEFF}a\u{FE0F}\u{200D}b\x1b"), "ab");
+        assert_eq!(sanitize_for_display("naïve → ✓"), "naïve → ✓");
+    }
+
+    #[test]
+    fn preview_never_writes_control_characters_to_cells() {
+        let body = "\twhile (lo < hi) {\n\t\tlo = 1;\x1b[31m\x08\x07\u{7f}\n\u{85}x lo\r\n";
+        for symbol in rendered_symbols(body) {
+            assert!(
+                !symbol.chars().any(char::is_control),
+                "control character reached the terminal buffer: {symbol:?}"
+            );
+        }
+    }
 }
