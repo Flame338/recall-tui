@@ -572,19 +572,7 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn 
             if !entry.file_type().is_dir() || entry.depth() == 0 {
                 return true;
             }
-            !matches!(
-                entry.file_name().to_str(),
-                Some(
-                    ".git"
-                        | "build"
-                        | "target"
-                        | "node_modules"
-                        | "vendor"
-                        | ".venv"
-                        | "venv"
-                        | "__pycache__"
-                )
-            )
+            entry.file_name().to_str().is_some_and(should_descend)
         })
         .filter_map(|entry| match entry {
             Ok(entry)
@@ -634,6 +622,14 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn 
         }
     }
     Ok(indexed)
+}
+
+fn should_descend(dir_name: &str) -> bool {
+    !dir_name.starts_with('.')
+        && !matches!(
+            dir_name,
+            "build" | "target" | "node_modules" | "vendor" | "venv" | "__pycache__"
+        )
 }
 
 fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize, current: &str) {
@@ -1199,6 +1195,23 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn hidden_and_build_directories_are_not_indexed() {
+        for skipped in [
+            ".git",
+            ".claude",
+            ".venv",
+            "target",
+            "node_modules",
+            "build",
+        ] {
+            assert!(!should_descend(skipped), "{skipped} should be skipped");
+        }
+        for kept in ["src", "docs", "tests"] {
+            assert!(should_descend(kept), "{kept} should be indexed");
+        }
     }
 
     #[test]
