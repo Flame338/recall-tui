@@ -36,6 +36,9 @@ const INDEX_EXTENSIONS: &[&str] = &[
 ];
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_RESULTS: usize = 40;
+const DEFAULT_LIBRARY: &str = r"F:\LuxCore\build\debug\libluxcore.dll";
+const MARK_START: char = '\u{E000}';
+const MARK_END: char = '\u{E001}';
 
 // These signatures mirror the stable, flat C API in luxcore_c.h.
 type IndexCreate = unsafe extern "C" fn(*mut *mut c_void) -> i32;
@@ -59,6 +62,27 @@ type IndexStored = unsafe extern "C" fn(
     usize,
     *mut *mut c_void,
 ) -> i32;
+#[repr(C)]
+struct SnippetOptions {
+    length: usize,
+    start_marker: *const c_char,
+    start_marker_length: usize,
+    end_marker: *const c_char,
+    end_marker_length: usize,
+    ellipsis: *const c_char,
+    ellipsis_length: usize,
+}
+type IndexSnippet = unsafe extern "C" fn(
+    *const c_void,
+    *const c_char,
+    usize,
+    *const c_char,
+    usize,
+    *const c_char,
+    usize,
+    *const SnippetOptions,
+    *mut *mut c_void,
+) -> i32;
 type HitsCount = unsafe extern "C" fn(*const c_void) -> usize;
 type HitsKey = unsafe extern "C" fn(*const c_void, usize, *mut usize) -> *const c_char;
 type HitsScore = unsafe extern "C" fn(*const c_void, usize) -> f64;
@@ -73,6 +97,7 @@ struct LuxFns {
     add: IndexAdd,
     search: IndexSearch,
     stored: IndexStored,
+    snippet: IndexSnippet,
     hits_count: HitsCount,
     hits_key: HitsKey,
     hits_score: HitsScore,
@@ -99,6 +124,7 @@ impl LuxIndex {
                 add: *library.get(b"lux_index_add\0")?,
                 search: *library.get(b"lux_index_search\0")?,
                 stored: *library.get(b"lux_index_stored\0")?,
+                snippet: *library.get(b"lux_index_snippet\0")?,
                 hits_count: *library.get(b"lux_hits_count\0")?,
                 hits_key: *library.get(b"lux_hits_key\0")?,
                 hits_score: *library.get(b"lux_hits_score\0")?,
@@ -182,6 +208,48 @@ impl LuxIndex {
             )
         };
         check_status(status, "reading a stored field")?;
+        self.take_text(text)
+    }
+
+    fn snippet(
+        &self,
+        key: &str,
+        field: &str,
+        query: &str,
+        length: usize,
+    ) -> Result<String, Box<dyn Error>> {
+        let mut start = [0u8; 4];
+        let mut end = [0u8; 4];
+        let start = MARK_START.encode_utf8(&mut start);
+        let end = MARK_END.encode_utf8(&mut end);
+        let options = SnippetOptions {
+            length,
+            start_marker: start.as_ptr().cast(),
+            start_marker_length: start.len(),
+            end_marker: end.as_ptr().cast(),
+            end_marker_length: end.len(),
+            ellipsis: start.as_ptr().cast(),
+            ellipsis_length: 0,
+        };
+        let mut text = ptr::null_mut();
+        let status = unsafe {
+            (self.fns.snippet)(
+                self.raw,
+                key.as_ptr().cast(),
+                key.len(),
+                field.as_ptr().cast(),
+                field.len(),
+                query.as_ptr().cast(),
+                query.len(),
+                &options,
+                &mut text,
+            )
+        };
+        check_status(status, "building a snippet")?;
+        self.take_text(text)
+    }
+
+    fn take_text(&self, text: *mut c_void) -> Result<String, Box<dyn Error>> {
         if text.is_null() {
             return Err("LuxCore returned a null text handle".into());
         }
@@ -231,8 +299,8 @@ struct App {
     root: PathBuf,
     status: String,
     show_help: bool,
-    preview_key: Option<String>,
-    preview: String,
+    preview_for: Option<(String, String)>,
+    preview: Vec<Line<'static>>,
 }
 
 struct DirectoryPicker {
@@ -283,8 +351,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         root,
         status: "Search words or symbols · F1 help".into(),
         show_help: false,
-        preview_key: None,
-        preview: String::new(),
+        preview_for: None,
+        preview: Vec::new(),
     };
     run_tui(&mut app, &index)?;
     Ok(())
@@ -310,8 +378,7 @@ fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
             );
         }
     }
-    let library =
-        library.unwrap_or_else(|| PathBuf::from(r"F:\LuxCore\build\debug\libluxcore.dll"));
+    let library = library.unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY));
     Ok((root, library))
 }
 
@@ -803,7 +870,7 @@ fn refresh_hits(app: &mut App, index: &LuxIndex) {
     if app.query.trim().is_empty() {
         app.hits.clear();
         app.selected = 0;
-        app.preview_key = None;
+        app.preview_for = None;
         app.preview.clear();
         app.status = format!("Indexed {} files · type a query", app.total_files);
         return;
@@ -824,14 +891,26 @@ fn refresh_hits(app: &mut App, index: &LuxIndex) {
 }
 
 fn sync_preview(app: &mut App, index: &LuxIndex) {
-    let selected_key = app.hits.get(app.selected).map(|hit| hit.key.clone());
-    if selected_key == app.preview_key {
+    let wanted = app
+        .hits
+        .get(app.selected)
+        .map(|hit| (hit.key.clone(), app.query.clone()));
+    if wanted == app.preview_for {
         return;
     }
-    app.preview_key = selected_key.clone();
-    app.preview = selected_key
-        .and_then(|key| index.stored(&key, "body").ok())
-        .unwrap_or_default();
+    app.preview = match &wanted {
+        Some((key, query)) => build_preview(index, key, query),
+        None => Vec::new(),
+    };
+    app.preview_for = wanted;
+}
+
+fn build_preview(index: &LuxIndex, key: &str, query: &str) -> Vec<Line<'static>> {
+    let body = index.stored(key, "body").unwrap_or_default();
+    let marked = index
+        .snippet(key, "body", query, body.len().max(1))
+        .unwrap_or(body);
+    preview_lines(&marked)
 }
 
 fn open_selected(app: &mut App) {
@@ -957,17 +1036,15 @@ fn draw(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, content[0], &mut list_state);
 
     let selected = app.hits.get(app.selected);
-    let preview = selected
-        .map(|_| preview_lines(&app.preview, &app.query))
-        .unwrap_or_else(|| {
-            vec![
-                Line::from(Span::styled(
-                    "Pick a result to peek inside.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from("Matching passages glow; Enter opens the file."),
-            ]
-        });
+    let preview = selected.map(|_| app.preview.clone()).unwrap_or_else(|| {
+        vec![
+            Line::from(Span::styled(
+                "Pick a result to peek inside.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from("Matching passages glow; Enter opens the file."),
+        ]
+    });
     let title = selected
         .map(|hit| format!(" {} · {:.3} ", sanitize_for_display(&hit.key), hit.score))
         .unwrap_or_else(|| " Preview ".into());
@@ -1026,21 +1103,15 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn preview_lines(body: &str, query: &str) -> Vec<Line<'static>> {
-    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let matching: Vec<(usize, &str)> = body
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            terms
-                .iter()
-                .any(|term| !term.is_empty() && line.to_lowercase().contains(term))
-        })
+fn preview_lines(marked: &str) -> Vec<Line<'static>> {
+    let numbered = marked.lines().enumerate();
+    let matching: Vec<(usize, &str)> = numbered
+        .clone()
+        .filter(|(_, line)| line.contains(MARK_START))
         .take(8)
         .collect();
     let chosen: Vec<(usize, &str)> = if matching.is_empty() {
-        body.lines()
-            .enumerate()
+        numbered
             .filter(|(_, line)| !line.trim().is_empty())
             .take(8)
             .collect()
@@ -1059,48 +1130,44 @@ fn preview_lines(body: &str, query: &str) -> Vec<Line<'static>> {
                 format!("{:>4} │ ", number + 1),
                 Style::default().fg(Color::DarkGray),
             )];
-            spans.extend(highlight_line(excerpt, &terms));
+            spans.extend(marked_spans(excerpt));
             Line::from(spans)
         })
         .collect()
 }
 
-fn highlight_line(line: &str, terms: &[String]) -> Vec<Span<'static>> {
-    let folded = line.to_lowercase();
-    if folded.len() != line.len() {
-        return vec![Span::raw(line.to_owned())];
-    }
-    let mut ranges: Vec<(usize, usize)> = terms
-        .iter()
-        .filter(|term| !term.is_empty())
-        .filter_map(|term| folded.find(term).map(|start| (start, start + term.len())))
-        .collect();
-    ranges.sort_unstable();
+fn marked_spans(line: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    let mut cursor = 0;
-    for (start, end) in ranges {
-        if start < cursor || !line.is_char_boundary(start) || !line.is_char_boundary(end) {
-            continue;
+    let mut text = String::new();
+    let mut marked = false;
+    for ch in line.chars() {
+        if ch == MARK_START || ch == MARK_END {
+            if !text.is_empty() {
+                spans.push(match_span(std::mem::take(&mut text), marked));
+            }
+            marked = ch == MARK_START;
+        } else {
+            text.push(ch);
         }
-        if cursor < start {
-            spans.push(Span::raw(line[cursor..start].to_owned()));
-        }
-        spans.push(Span::styled(
-            line[start..end].to_owned(),
+    }
+    if !text.is_empty() {
+        spans.push(match_span(text, marked));
+    }
+    spans
+}
+
+fn match_span(text: String, marked: bool) -> Span<'static> {
+    if marked {
+        Span::styled(
+            text,
             Style::default()
                 .fg(Color::Cyan)
                 .bg(Color::Rgb(36, 53, 68))
                 .add_modifier(Modifier::BOLD),
-        ));
-        cursor = end;
+        )
+    } else {
+        Span::raw(text)
     }
-    if cursor < line.len() {
-        spans.push(Span::raw(line[cursor..].to_owned()));
-    }
-    if spans.is_empty() {
-        spans.push(Span::raw(line.to_owned()));
-    }
-    spans
 }
 
 const TAB_WIDTH: usize = 4;
@@ -1115,6 +1182,7 @@ fn sanitize_for_display(text: &str) -> String {
                 clean.extend(std::iter::repeat_n(' ', pad));
                 column += pad;
             }
+            MARK_START | MARK_END => clean.push(ch),
             ch if ch.is_control() || is_invisible_format(ch) => {}
             ch => {
                 clean.push(ch);
@@ -1187,7 +1255,7 @@ mod tests {
     fn rendered_symbols(text: &str) -> Vec<String> {
         let area = Rect::new(0, 0, 40, 6);
         let mut buffer = Buffer::empty(area);
-        Paragraph::new(preview_lines(text, "lo"))
+        Paragraph::new(preview_lines(text))
             .wrap(Wrap { trim: true })
             .render(area, &mut buffer);
         buffer
@@ -1212,6 +1280,70 @@ mod tests {
         for kept in ["src", "docs", "tests"] {
             assert!(should_descend(kept), "{kept} should be indexed");
         }
+    }
+
+    fn marked(text: &str) -> String {
+        text.replace('[', &MARK_START.to_string())
+            .replace(']', &MARK_END.to_string())
+    }
+
+    fn texts(line: &Line) -> Vec<(String, bool)> {
+        line.spans
+            .iter()
+            .skip(1)
+            .map(|span| (span.content.to_string(), span.style.bg.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn marker_characters_become_highlighted_spans() {
+        let spans = marked_spans(&marked("a[lo]b"));
+        let seen: Vec<(String, bool)> = spans
+            .iter()
+            .map(|span| (span.content.to_string(), span.style.bg.is_some()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a".into(), false),
+                ("lo".into(), true),
+                ("b".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_shows_matching_lines_with_their_numbers_and_falls_back_to_the_top() {
+        let hit = preview_lines(&marked("one\ntwo [lo]\nthree\nfour [lo]"));
+        assert_eq!(hit.len(), 2);
+        assert_eq!(hit[0].spans[0].content.trim(), "2 │");
+        assert_eq!(hit[1].spans[0].content.trim(), "4 │");
+        let none = preview_lines("\n\nalpha\nbeta");
+        assert_eq!(none.len(), 2);
+        assert_eq!(none[0].spans[0].content.trim(), "3 │");
+    }
+
+    #[test]
+    fn luxcore_snippets_mark_prefix_completions_and_keep_line_numbers() {
+        let library = env::var_os("LUXCORE_LIB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY));
+        let mut index = LuxIndex::load(&library).expect("build libluxcore with `make shared`");
+        index
+            .add(
+                "note.md",
+                "note.md",
+                "first line\n\twhile we are testing grounds\nlast line\n",
+            )
+            .unwrap();
+        let lines = build_preview(&index, "note.md", "testin");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content.trim(), "2 │");
+        let seen = texts(&lines[0]);
+        assert!(
+            seen.iter().any(|(text, hot)| *hot && text == "testing"),
+            "expected `testing` highlighted, got {seen:?}"
+        );
     }
 
     #[test]
