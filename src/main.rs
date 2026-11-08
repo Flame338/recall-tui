@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     ptr,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -24,7 +25,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use walkdir::WalkDir;
 
@@ -234,23 +235,45 @@ struct App {
     preview: String,
 }
 
+struct DirectoryPicker {
+    current: PathBuf,
+    entries: Vec<PickerEntry>,
+    selected: usize,
+    path_input: Option<String>,
+    status: String,
+}
+
+enum PickerEntry {
+    Parent(PathBuf),
+    Folder(PathBuf),
+    Drive(PathBuf),
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let (root, library_path) = parse_args()?;
-    let root = root.canonicalize()?;
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()).into());
-    }
     if !library_path.is_file() {
         return Err(format!(
             "LuxCore shared library not found at {}. Build it with `make shared` in F:\\LuxCore or pass --lib PATH.",
             library_path.display()
-        ).into());
+        )
+        .into());
+    }
+    let root = match root {
+        Some(root) => root,
+        None => {
+            let Some(root) = choose_root(env::current_dir()?)? else {
+                return Ok(());
+            };
+            root
+        }
+    };
+    let root = root.canonicalize()?;
+    if !root.is_dir() {
+        return Err(format!("Not a directory: {}", root.display()).into());
     }
 
     let mut index = LuxIndex::load(&library_path)?;
-    eprintln!("Indexing text files under {} ...", root.display());
     let total_files = index_repository(&mut index, &root)?;
-    eprintln!("Indexed {total_files} files. Opening Recall.");
 
     let mut app = App {
         query: String::new(),
@@ -267,7 +290,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_args() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let mut root = None;
     let mut library = env::var_os("LUXCORE_LIB").map(PathBuf::from);
@@ -287,15 +310,262 @@ fn parse_args() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
             );
         }
     }
-    let root = root.unwrap_or(env::current_dir()?);
     let library =
         library.unwrap_or_else(|| PathBuf::from(r"F:\LuxCore\build\debug\libluxcore.dll"));
     Ok((root, library))
 }
 
+fn choose_root(start: PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let mut picker = DirectoryPicker {
+        current: start,
+        entries: Vec::new(),
+        selected: 0,
+        path_input: None,
+        status: "Choose a folder to index".into(),
+    };
+    picker.refresh();
+
+    enable_raw_mode()?;
+    let _cleanup = TerminalCleanup;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(out);
+    let mut terminal = Terminal::new(backend)?;
+
+    loop {
+        terminal.draw(|frame| draw_directory_picker(frame, &picker))?;
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('q' | 'Q'))
+                {
+                    return Ok(None);
+                }
+                if let Some(path_input) = picker.path_input.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => picker.path_input = None,
+                        KeyCode::Enter => {
+                            let path = PathBuf::from(path_input.trim());
+                            match path.canonicalize() {
+                                Ok(path) if path.is_dir() => {
+                                    picker.current = path;
+                                    picker.path_input = None;
+                                    picker.refresh();
+                                }
+                                Ok(_) => picker.status = "That path is not a folder".into(),
+                                Err(error) => {
+                                    picker.status = format!("Cannot open that path: {error}")
+                                }
+                            }
+                        }
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            path_input.clear();
+                        }
+                        KeyCode::Backspace => {
+                            path_input.pop();
+                        }
+                        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            path_input.push(ch);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('q' | 'Q') => return Ok(None),
+                    KeyCode::Char('p' | 'P') => {
+                        picker.path_input = Some(picker.current.to_string_lossy().into_owned());
+                        picker.status = "Edit the folder path, then press Enter".into();
+                    }
+                    KeyCode::Char('s' | 'S' | ' ') => {
+                        return Ok(Some(picker.current.clone()));
+                    }
+                    KeyCode::Backspace | KeyCode::Left => {
+                        if let Some(parent) = picker.current.parent() {
+                            picker.current = parent.to_path_buf();
+                            picker.refresh();
+                        }
+                    }
+                    KeyCode::Up => {
+                        picker.selected = picker.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        picker.selected =
+                            (picker.selected + 1).min(picker.entries.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => {
+                        if let Some(entry) = picker.entries.get(picker.selected) {
+                            picker.current = match entry {
+                                PickerEntry::Parent(path)
+                                | PickerEntry::Folder(path)
+                                | PickerEntry::Drive(path) => path.clone(),
+                            };
+                            picker.refresh();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(3),
+                MouseEventKind::ScrollDown => {
+                    picker.selected =
+                        (picker.selected + 3).min(picker.entries.len().saturating_sub(1));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+impl DirectoryPicker {
+    fn refresh(&mut self) {
+        self.entries.clear();
+        self.selected = 0;
+        match fs::read_dir(&self.current) {
+            Ok(entries) => {
+                let mut folders: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        entry
+                            .file_type()
+                            .ok()
+                            .filter(|kind| kind.is_dir())
+                            .map(|_| entry.path())
+                    })
+                    .collect();
+                folders.sort_by_key(|path| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase()
+                });
+                if let Some(parent) = self
+                    .current
+                    .parent()
+                    .filter(|parent| *parent != &self.current)
+                {
+                    self.entries.push(PickerEntry::Parent(parent.to_path_buf()));
+                }
+                self.entries
+                    .extend(folders.into_iter().map(PickerEntry::Folder));
+                #[cfg(windows)]
+                if self.current.parent().is_none() {
+                    for letter in b'A'..=b'Z' {
+                        let drive = PathBuf::from(format!("{}:\\", letter as char));
+                        if drive != self.current && drive.is_dir() {
+                            self.entries.push(PickerEntry::Drive(drive));
+                        }
+                    }
+                }
+                if !self.entries.is_empty() {
+                    self.selected =
+                        usize::from(matches!(self.entries.first(), Some(PickerEntry::Parent(_))));
+                }
+                self.status = format!(
+                    "{} locations · press S to index this folder",
+                    self.entries.len()
+                );
+            }
+            Err(error) => self.status = format!("Cannot read this folder: {error}"),
+        }
+    }
+}
+
+fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+    let path = picker
+        .path_input
+        .as_deref()
+        .unwrap_or_else(|| picker.current.to_str().unwrap_or(""));
+    let path_label = if picker.path_input.is_some() {
+        format!(" Folder path (editing) · {path}▏ ")
+    } else {
+        format!(" Current folder · {path} ")
+    };
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Choose a project folder",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(path_label, Style::default().fg(Color::White))),
+    ])
+    .block(
+        Block::default()
+            .title(" Recall · Project setup ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(header, sections[0]);
+
+    let items: Vec<ListItem> = if picker.entries.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "No subfolders here",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        picker
+            .entries
+            .iter()
+            .map(|entry| {
+                let label = match entry {
+                    PickerEntry::Parent(_) => "..  (parent folder)".to_owned(),
+                    PickerEntry::Folder(path) => path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    PickerEntry::Drive(path) => path.display().to_string(),
+                };
+                ListItem::new(format!("  {label}"))
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Locations · Enter to browse ")
+                .borders(Borders::ALL),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(36, 53, 68))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ");
+    let mut state = ListState::default();
+    if !picker.entries.is_empty() {
+        state.select(Some(picker.selected));
+    }
+    frame.render_stateful_widget(list, sections[1], &mut state);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                &picker.status,
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(Span::styled(
+                "↑/↓ browse  Enter open  .. / Backspace up  S index here  P type path  Esc quit",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]),
+        sections[2],
+    );
+}
+
 fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn Error>> {
-    let mut count = 0;
-    for entry in WalkDir::new(root)
+    let files: Vec<PathBuf> = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
@@ -316,31 +586,99 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn 
                 )
             )
         })
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
+        .filter_map(|entry| match entry {
+            Ok(entry)
+                if entry.file_type().is_file()
+                    && is_indexable(entry.path())
+                    && matches!(entry.metadata(), Ok(metadata) if metadata.len() <= MAX_FILE_BYTES) =>
+            {
+                Some(entry.into_path())
+            }
+            Ok(_) => None,
             Err(error) => {
                 eprintln!("Skipping unreadable path: {error}");
-                continue;
+                None
             }
-        };
-        if !entry.file_type().is_file() || !is_indexable(entry.path()) {
-            continue;
+        })
+        .collect();
+
+    enable_raw_mode()?;
+    let _cleanup = TerminalCleanup;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(out);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut indexed = 0;
+    let total = files.len();
+    let mut last_draw = Instant::now() - Duration::from_secs(1);
+    let mut current_file = String::new();
+    terminal.draw(|frame| draw_indexing(frame, root, 0, total, &current_file))?;
+    for (position, path) in files.iter().enumerate() {
+        current_file = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Ok(body) = fs::read_to_string(path) {
+            let relative = path.strip_prefix(root)?;
+            let key = relative.to_string_lossy().replace('\\', "/");
+            let title = path.file_name().unwrap_or_default().to_string_lossy();
+            index.add(&key, &title, &body)?;
+            indexed += 1;
         }
-        if !matches!(entry.metadata(), Ok(metadata) if metadata.len() <= MAX_FILE_BYTES) {
-            continue;
+        let completed = position + 1;
+        if last_draw.elapsed() >= Duration::from_millis(60) || completed == total {
+            terminal.draw(|frame| draw_indexing(frame, root, completed, total, &current_file))?;
+            last_draw = Instant::now();
         }
-        let body = match fs::read_to_string(entry.path()) {
-            Ok(body) => body,
-            Err(_) => continue,
-        };
-        let relative = entry.path().strip_prefix(root)?;
-        let key = relative.to_string_lossy().replace('\\', "/");
-        let title = entry.file_name().to_string_lossy();
-        index.add(&key, &title, &body)?;
-        count += 1;
     }
-    Ok(count)
+    Ok(indexed)
+}
+
+fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize, current: &str) {
+    let area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(3),
+        ])
+        .split(frame.area());
+    let title = Paragraph::new(format!("Preparing search for {}", compact_path(root, 64))).block(
+        Block::default()
+            .title(" Recall · Indexing ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(title, area[0]);
+
+    let ratio = if total == 0 {
+        1.0
+    } else {
+        (completed as f64 / total as f64).clamp(0.0, 1.0)
+    };
+    let gauge = Gauge::default()
+        .block(Block::default().title(" Progress ").borders(Borders::ALL))
+        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+        .ratio(ratio)
+        .label(if total == 0 {
+            "No matching files".to_owned()
+        } else {
+            format!("{:.0}% · {completed} / {total} files", ratio * 100.0)
+        });
+    frame.render_widget(gauge, area[1]);
+
+    let detail = if current.is_empty() {
+        "Starting index…".to_owned()
+    } else {
+        format!("Indexing {current}")
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: true }),
+        area[2],
+    );
 }
 
 fn is_indexable(path: &Path) -> bool {

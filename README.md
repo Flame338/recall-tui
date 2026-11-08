@@ -11,15 +11,21 @@ cd F:\LuxCore
 make shared MODE=release
 ```
 
-Then build and launch Recall:
+Then launch Recall:
 
 ```powershell
 cd F:\LuxCoreTUI
 $env:LUXCORE_LIB = 'F:\LuxCore\build\release\libluxcore.dll'
-cargo run --release -- 'F:\LuxCore'
+cargo run --release
 ```
 
-The app defaults to `F:\LuxCore\build\debug\libluxcore.dll`. Set `LUXCORE_LIB` or pass `--lib PATH` to choose another shared library. If no repository is passed, Recall indexes the current directory.
+Without a repository argument, Recall opens a folder picker at the current directory. Use the arrows to choose a folder and Enter to browse it; choose `..` or press Backspace to go up. At a Windows drive root, other available drives are listed. Press `S` to index the folder currently shown, or `P` to type or edit a path directly (`Ctrl-A` clears it). You can also pass a repository path to skip the picker:
+
+```powershell
+cargo run --release -- 'F:\path\to\project'
+```
+
+The app defaults to `F:\LuxCore\build\debug\libluxcore.dll`. Set `LUXCORE_LIB` or pass `--lib PATH` to choose another shared library.
 
 ## Using Recall
 
@@ -34,4 +40,4 @@ Type words, a phrase, or a code symbol. Results update as you type. Use the arro
 
 Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. The index is rebuilt at startup; the C API does not expose LuxCore persistence yet.
 
-The scanner indexes common source and text formats, including C/C++, Rust, Python, JavaScript/TypeScript, Markdown, JSON, TOML, YAML, HTML, and SQL. It skips `.git`, build output, package directories, and files over 512 KiB. Binary or non-UTF-8 files are skipped.
+During indexing, Recall shows a progress bar, the completed file count, and the file currently being read. The scanner indexes common source and text formats, including C/C++, Rust, Python, JavaScript/TypeScript, Markdown, JSON, TOML, YAML, HTML, and SQL. It skips `.git`, build output, package directories, and files over 512 KiB. Binary or non-UTF-8 files are skipped.
