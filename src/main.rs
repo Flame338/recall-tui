@@ -341,7 +341,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut index = LuxIndex::load(&library_path)?;
-    let total_files = index_repository(&mut index, &root)?;
+    let Some(total_files) = index_repository(&mut index, &root)? else {
+        return Ok(());
+    };
 
     let mut app = App {
         query: String::new(),
@@ -631,38 +633,19 @@ fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
     );
 }
 
-fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn Error>> {
-    let files: Vec<PathBuf> = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            if !entry.file_type().is_dir() || entry.depth() == 0 {
-                return true;
-            }
-            entry.file_name().to_str().is_some_and(should_descend)
-        })
-        .filter_map(|entry| match entry {
-            Ok(entry)
-                if entry.file_type().is_file()
-                    && is_indexable(entry.path())
-                    && matches!(entry.metadata(), Ok(metadata) if metadata.len() <= MAX_FILE_BYTES) =>
-            {
-                Some(entry.into_path())
-            }
-            Ok(_) => None,
-            Err(error) => {
-                eprintln!("Skipping unreadable path: {error}");
-                None
-            }
-        })
-        .collect();
+type RecallTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
+fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<Option<usize>, Box<dyn Error>> {
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
+
+    let Some(files) = scan_files(&mut terminal, root)? else {
+        return Ok(None);
+    };
 
     let mut indexed = 0;
     let total = files.len();
@@ -684,11 +667,67 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn 
         }
         let completed = position + 1;
         if last_draw.elapsed() >= Duration::from_millis(60) || completed == total {
+            if cancel_requested()? {
+                return Ok(None);
+            }
             terminal.draw(|frame| draw_indexing(frame, root, completed, total, &current_file))?;
             last_draw = Instant::now();
         }
     }
-    Ok(indexed)
+    Ok(Some(indexed))
+}
+
+fn scan_files(
+    terminal: &mut RecallTerminal,
+    root: &Path,
+) -> Result<Option<Vec<PathBuf>>, Box<dyn Error>> {
+    let mut files = Vec::new();
+    let mut last_draw = Instant::now() - Duration::from_secs(1);
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() || entry.depth() == 0 {
+                return true;
+            }
+            entry.file_name().to_str().is_some_and(should_descend)
+        });
+    for entry in walker.filter_map(Result::ok) {
+        if entry.file_type().is_file()
+            && is_indexable(entry.path())
+            && matches!(entry.metadata(), Ok(metadata) if metadata.len() <= MAX_FILE_BYTES)
+        {
+            files.push(entry.into_path());
+        }
+        if last_draw.elapsed() >= Duration::from_millis(60) {
+            if cancel_requested()? {
+                return Ok(None);
+            }
+            let latest = files.last().map_or_else(String::new, |path| {
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            });
+            terminal.draw(|frame| draw_scanning(frame, root, files.len(), &latest))?;
+            last_draw = Instant::now();
+        }
+    }
+    Ok(Some(files))
+}
+
+fn cancel_requested() -> Result<bool, Box<dyn Error>> {
+    let mut cancel = false;
+    while event::poll(Duration::ZERO)? {
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            cancel |= key.code == KeyCode::Esc
+                || ctrl && matches!(key.code, KeyCode::Char('q' | 'Q' | 'c' | 'C'));
+        }
+    }
+    Ok(cancel)
 }
 
 fn should_descend(dir_name: &str) -> bool {
@@ -699,7 +738,7 @@ fn should_descend(dir_name: &str) -> bool {
         )
 }
 
-fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize, current: &str) {
+fn indexing_layout(frame: &mut Frame, root: &Path) -> [Rect; 3] {
     let area = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -714,7 +753,42 @@ fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize,
             .borders(Borders::ALL),
     );
     frame.render_widget(title, area[0]);
+    [area[0], area[1], area[2]]
+}
 
+fn draw_detail(frame: &mut Frame, area: Rect, detail: &str) {
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(sanitize_for_display(detail)),
+            Line::from(""),
+            Line::from("Esc cancels"),
+        ])
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_scanning(frame: &mut Frame, root: &Path, found: usize, latest: &str) {
+    let area = indexing_layout(frame, root);
+    frame.render_widget(
+        Paragraph::new(format!("{found} files found so far")).block(
+            Block::default()
+                .title(" Scanning folders ")
+                .borders(Borders::ALL),
+        ),
+        area[1],
+    );
+    let detail = if latest.is_empty() {
+        "Looking for files…".to_owned()
+    } else {
+        format!("Found {latest}")
+    };
+    draw_detail(frame, area[2], &detail);
+}
+
+fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize, current: &str) {
+    let area = indexing_layout(frame, root);
     let ratio = if total == 0 {
         1.0
     } else {
@@ -736,12 +810,7 @@ fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize,
     } else {
         format!("Indexing {current}")
     };
-    frame.render_widget(
-        Paragraph::new(detail)
-            .style(Style::default().fg(Color::DarkGray))
-            .wrap(Wrap { trim: true }),
-        area[2],
-    );
+    draw_detail(frame, area[2], &detail);
 }
 
 fn is_indexable(path: &Path) -> bool {
@@ -782,7 +851,7 @@ impl Drop for TerminalCleanup {
 }
 
 fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut RecallTerminal,
     app: &mut App,
     index: &LuxIndex,
 ) -> Result<(), Box<dyn Error>> {
