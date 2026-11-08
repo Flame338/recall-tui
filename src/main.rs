@@ -655,7 +655,7 @@ fn draw(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(footer, sections[2]);
     if app.show_help {
-        let area = centered_rect(62, 62, frame.area());
+        let area = centered_rect(80, 62, frame.area());
         frame.render_widget(Clear, area);
         let help = Paragraph::new(vec![
             Line::from(Span::styled(
@@ -666,7 +666,7 @@ fn draw(frame: &mut Frame, app: &App) {
             )),
             Line::from(""),
             Line::from("Search by words, filenames, or exact code symbols."),
-            Line::from("LuxCore uses lexical ranking with typo tolerance; select a file to preview matches."),
+            Line::from("BM25 ranks results and tolerates typos."),
             Line::from("Readable text files are indexed again each launch."),
             Line::from(""),
             Line::from("Type       Search as you go"),
@@ -676,6 +676,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Line::from("Ctrl-W     Delete last word    Ctrl-U clear all"),
             Line::from("F1         Close this panel    Ctrl-Q quit"),
         ])
+        .wrap(Wrap { trim: true })
         .block(
             Block::default()
                 .title(" How to use Recall ")
