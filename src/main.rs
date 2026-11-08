@@ -1,7 +1,7 @@
 use std::{
     env,
     error::Error,
-    ffi::{c_char, c_void, OsString},
+    ffi::{c_char, c_void},
     fs,
     io::{self, stdout},
     path::{Path, PathBuf},
@@ -10,25 +10,28 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use libloading::Library;
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use walkdir::WalkDir;
 
 const INDEX_EXTENSIONS: &[&str] = &[
-    "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "rs", "md", "txt", "rst",
-    "py", "go", "java", "js", "jsx", "ts", "tsx", "json", "toml", "yaml", "yml",
-    "ini", "sh", "bat", "ps1", "html", "css", "sql", "cmake",
+    "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "rs", "md", "txt", "rst", "py", "go", "java",
+    "js", "jsx", "ts", "tsx", "json", "toml", "yaml", "yml", "ini", "sh", "bat", "ps1", "html",
+    "css", "sql", "cmake",
 ];
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_RESULTS: usize = 40;
@@ -45,7 +48,8 @@ type IndexAdd = unsafe extern "C" fn(
     *const c_char,
     usize,
 ) -> i32;
-type IndexSearch = unsafe extern "C" fn(*const c_void, *const c_char, usize, usize, *mut *mut c_void) -> i32;
+type IndexSearch =
+    unsafe extern "C" fn(*const c_void, *const c_char, usize, usize, *mut *mut c_void) -> i32;
 type IndexStored = unsafe extern "C" fn(
     *const c_void,
     *const c_char,
@@ -109,16 +113,23 @@ impl LuxIndex {
         if raw.is_null() {
             return Err("LuxCore returned a null index".into());
         }
-        Ok(Self { raw, _library: library, fns })
+        Ok(Self {
+            raw,
+            _library: library,
+            fns,
+        })
     }
 
     fn add(&mut self, key: &str, title: &str, body: &str) -> Result<(), Box<dyn Error>> {
         let status = unsafe {
             (self.fns.add)(
                 self.raw,
-                key.as_ptr().cast(), key.len(),
-                title.as_ptr().cast(), title.len(),
-                body.as_ptr().cast(), body.len(),
+                key.as_ptr().cast(),
+                key.len(),
+                title.as_ptr().cast(),
+                title.len(),
+                body.as_ptr().cast(),
+                body.len(),
             )
         };
         check_status(status, "adding a file")
@@ -126,7 +137,15 @@ impl LuxIndex {
 
     fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>, Box<dyn Error>> {
         let mut hits = ptr::null_mut();
-        let status = unsafe { (self.fns.search)(self.raw, query.as_ptr().cast(), query.len(), limit, &mut hits) };
+        let status = unsafe {
+            (self.fns.search)(
+                self.raw,
+                query.as_ptr().cast(),
+                query.len(),
+                limit,
+                &mut hits,
+            )
+        };
         check_status(status, "searching")?;
         if hits.is_null() {
             return Err("LuxCore returned a null result handle".into());
@@ -143,8 +162,7 @@ impl LuxIndex {
             let key = unsafe { std::slice::from_raw_parts(key.cast::<u8>(), key_len) };
             let key = String::from_utf8_lossy(key).into_owned();
             let score = unsafe { (self.fns.hits_score)(hits, position) };
-            let preview = self.stored(&key, "body").unwrap_or_default();
-            result.push(Hit { key, score, preview });
+            result.push(Hit { key, score });
         }
         unsafe { (self.fns.hits_free)(hits) };
         Ok(result)
@@ -155,8 +173,10 @@ impl LuxIndex {
         let status = unsafe {
             (self.fns.stored)(
                 self.raw,
-                key.as_ptr().cast(), key.len(),
-                field.as_ptr().cast(), field.len(),
+                key.as_ptr().cast(),
+                key.len(),
+                field.as_ptr().cast(),
+                field.len(),
                 &mut text,
             )
         };
@@ -200,7 +220,6 @@ fn check_status(status: i32, action: &str) -> Result<(), Box<dyn Error>> {
 struct Hit {
     key: String,
     score: f64,
-    preview: String,
 }
 
 struct App {
@@ -210,6 +229,9 @@ struct App {
     total_files: usize,
     root: PathBuf,
     status: String,
+    show_help: bool,
+    preview_key: Option<String>,
+    preview: String,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -236,7 +258,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         selected: 0,
         total_files,
         root,
-        status: "Type to search. ↑/↓ moves · Enter opens · Ctrl-Q quits".into(),
+        status: "Search words or symbols · F1 help".into(),
+        show_help: false,
+        preview_key: None,
+        preview: String::new(),
     };
     run_tui(&mut app, &index)?;
     Ok(())
@@ -250,16 +275,21 @@ fn parse_args() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
         if arg == "--lib" {
             library = Some(PathBuf::from(args.next().ok_or("--lib needs a path")?));
         } else if arg == "--help" || arg == "-h" {
-            println!("Recall — local project memory powered by LuxCore\n\nUsage: recall [ROOT] [--lib PATH]\n\nThe library path can also come from LUXCORE_LIB.");
+            println!(
+                "Recall — local project memory powered by LuxCore\n\nUsage: recall [ROOT] [--lib PATH]\n\nThe library path can also come from LUXCORE_LIB."
+            );
             std::process::exit(0);
         } else if root.is_none() {
             root = Some(PathBuf::from(arg));
         } else {
-            return Err("Only one repository root is supported; use --lib for the library path".into());
+            return Err(
+                "Only one repository root is supported; use --lib for the library path".into(),
+            );
         }
     }
     let root = root.unwrap_or(env::current_dir()?);
-    let library = library.unwrap_or_else(|| PathBuf::from(r"F:\LuxCore\build\debug\libluxcore.dll"));
+    let library =
+        library.unwrap_or_else(|| PathBuf::from(r"F:\LuxCore\build\debug\libluxcore.dll"));
     Ok((root, library))
 }
 
@@ -272,7 +302,19 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn 
             if !entry.file_type().is_dir() || entry.depth() == 0 {
                 return true;
             }
-            !matches!(entry.file_name().to_str(), Some(".git" | "build" | "target" | "node_modules"))
+            !matches!(
+                entry.file_name().to_str(),
+                Some(
+                    ".git"
+                        | "build"
+                        | "target"
+                        | "node_modules"
+                        | "vendor"
+                        | ".venv"
+                        | "venv"
+                        | "__pycache__"
+                )
+            )
         })
     {
         let entry = match entry {
@@ -285,11 +327,9 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn 
         if !entry.file_type().is_file() || !is_indexable(entry.path()) {
             continue;
         }
-        let metadata = match entry.metadata() {
-            Ok(metadata) if metadata.len() <= MAX_FILE_BYTES => metadata,
-            _ => continue,
-        };
-        let _ = metadata;
+        if !matches!(entry.metadata(), Ok(metadata) if metadata.len() <= MAX_FILE_BYTES) {
+            continue;
+        }
         let body = match fs::read_to_string(entry.path()) {
             Ok(body) => body,
             Err(_) => continue,
@@ -304,22 +344,40 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<usize, Box<dyn 
 }
 
 fn is_indexable(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if matches!(
+        name,
+        "Makefile" | "GNUmakefile" | "Dockerfile" | "Justfile" | ".gitignore" | "CMakeLists.txt"
+    ) {
+        return true;
+    }
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| INDEX_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+        .is_some_and(|extension| {
+            INDEX_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
 }
 
 fn run_tui(app: &mut App, index: &LuxIndex) -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
+    let _cleanup = TerminalCleanup;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
-    let result = event_loop(&mut terminal, app, index);
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    event_loop(&mut terminal, app, index)
+}
+
+struct TerminalCleanup;
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    }
 }
 
 fn event_loop(
@@ -329,48 +387,90 @@ fn event_loop(
 ) -> Result<(), Box<dyn Error>> {
     loop {
         terminal.draw(|frame| draw(frame, app))?;
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
-                break;
-            }
-            match key.code {
-                KeyCode::Esc => {
-                    app.query.clear();
-                    app.hits.clear();
-                    app.selected = 0;
-                    app.status = "Search cleared".into();
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('q' | 'Q'))
+                {
+                    break;
                 }
-                KeyCode::Backspace => {
-                    app.query.pop();
-                    refresh_hits(app, index);
+                if key.code == KeyCode::F(1) {
+                    app.show_help = !app.show_help;
+                    continue;
                 }
-                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.query.push(ch);
-                    refresh_hits(app, index);
-                }
-                KeyCode::Up => {
-                    app.selected = app.selected.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    if !app.hits.is_empty() {
-                        app.selected = (app.selected + 1).min(app.hits.len() - 1);
+                if app.show_help {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?')) {
+                        app.show_help = false;
                     }
+                    continue;
                 }
-                KeyCode::Enter => open_selected(app),
-                _ => {}
+                match key.code {
+                    KeyCode::Esc => {
+                        app.query.clear();
+                        refresh_hits(app, index);
+                        app.status = "Search cleared".into();
+                    }
+                    KeyCode::Backspace => {
+                        app.query.pop();
+                        refresh_hits(app, index);
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.query.clear();
+                        refresh_hits(app, index);
+                    }
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        remove_last_word(&mut app.query);
+                        refresh_hits(app, index);
+                    }
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.query.push(ch);
+                        refresh_hits(app, index);
+                    }
+                    KeyCode::Up | KeyCode::PageUp => {
+                        app.selected = app
+                            .selected
+                            .saturating_sub(if key.code == KeyCode::PageUp { 8 } else { 1 });
+                    }
+                    KeyCode::Down | KeyCode::PageDown => {
+                        if !app.hits.is_empty() {
+                            let step = if key.code == KeyCode::PageDown { 8 } else { 1 };
+                            app.selected = (app.selected + step).min(app.hits.len() - 1);
+                        }
+                    }
+                    KeyCode::Home => app.selected = 0,
+                    KeyCode::End => app.selected = app.hits.len().saturating_sub(1),
+                    KeyCode::Enter => open_selected(app),
+                    _ => {}
+                }
             }
+            Event::Mouse(mouse) if !app.hits.is_empty() => match mouse.kind {
+                MouseEventKind::ScrollUp => app.selected = app.selected.saturating_sub(3),
+                MouseEventKind::ScrollDown => {
+                    app.selected = (app.selected + 3).min(app.hits.len() - 1)
+                }
+                _ => {}
+            },
+            _ => {}
         }
+        sync_preview(app, index);
     }
     Ok(())
+}
+
+fn remove_last_word(query: &mut String) {
+    let end = query.trim_end().len();
+    let start = query[..end]
+        .rfind(char::is_whitespace)
+        .map_or(0, |index| index + 1);
+    query.truncate(start);
 }
 
 fn refresh_hits(app: &mut App, index: &LuxIndex) {
     if app.query.trim().is_empty() {
         app.hits.clear();
         app.selected = 0;
+        app.preview_key = None;
+        app.preview.clear();
         app.status = format!("Indexed {} files · type a query", app.total_files);
         return;
     }
@@ -379,14 +479,31 @@ fn refresh_hits(app: &mut App, index: &LuxIndex) {
             let found = hits.len();
             app.hits = hits;
             app.selected = app.selected.min(app.hits.len().saturating_sub(1));
-            app.status = format!("{found} results · {} indexed · Enter opens selected file", app.total_files);
+            sync_preview(app, index);
+            app.status = format!(
+                "{found} results · {} indexed · Enter opens selected file",
+                app.total_files
+            );
         }
         Err(error) => app.status = error.to_string(),
     }
 }
 
+fn sync_preview(app: &mut App, index: &LuxIndex) {
+    let selected_key = app.hits.get(app.selected).map(|hit| hit.key.clone());
+    if selected_key == app.preview_key {
+        return;
+    }
+    app.preview_key = selected_key.clone();
+    app.preview = selected_key
+        .and_then(|key| index.stored(&key, "body").ok())
+        .unwrap_or_default();
+}
+
 fn open_selected(app: &mut App) {
-    let Some(hit) = app.hits.get(app.selected) else { return };
+    let Some(hit) = app.hits.get(app.selected) else {
+        return;
+    };
     let path = app.root.join(&hit.key);
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe").arg(&path).spawn();
@@ -403,70 +520,287 @@ fn open_selected(app: &mut App) {
 fn draw(frame: &mut Frame, app: &App) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(7), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(7),
+            Constraint::Length(2),
+        ])
         .split(frame.area());
-    let search = Paragraph::new(app.query.as_str())
-        .style(Style::default().fg(Color::Cyan))
-        .block(Block::default().title(" Recall · project memory ").borders(Borders::ALL));
+    let query = if app.query.is_empty() {
+        Line::from(Span::styled(
+            "Search terms, a phrase, or a code symbol…",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(&app.query, Style::default().fg(Color::White)),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+        ])
+    };
+    let search = Paragraph::new(query).block(
+        Block::default()
+            .title(format!(" ✦ RECALL · {} ", compact_path(&app.root, 48)))
+            .borders(Borders::ALL),
+    );
     frame.render_widget(search, sections[0]);
 
     let content = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(sections[1]);
-    let items: Vec<ListItem> = app.hits.iter().map(|hit| {
-        let name = Path::new(&hit.key).file_name().and_then(|name| name.to_str()).unwrap_or(&hit.key);
-        ListItem::new(vec![
-            Line::from(Span::styled(name.to_owned(), Style::default().add_modifier(Modifier::BOLD))),
-            Line::from(Span::styled(hit.key.clone(), Style::default().fg(Color::DarkGray))),
-            Line::from(Span::styled(format!("score {:.3}", hit.score), Style::default().fg(Color::Green))),
-        ])
-    }).collect();
-    let results = List::new(items)
-        .block(Block::default().title(format!(" Results ({}) ", app.hits.len())).borders(Borders::ALL))
-        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD))
-        .highlight_symbol("› ");
+    let mut items: Vec<ListItem> = app
+        .hits
+        .iter()
+        .map(|hit| {
+            let name = Path::new(&hit.key)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&hit.key);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        name.to_owned(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:.2}", hit.score),
+                        Style::default().fg(Color::Green),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    hit.key.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(vec![
+            Line::from(Span::styled(
+                if app.query.is_empty() {
+                    "Your repo is indexed"
+                } else {
+                    "No matching files yet"
+                },
+                Style::default().fg(if app.query.is_empty() {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            )),
+            Line::from(if app.query.is_empty() {
+                "Try: PhraseQuery, persistence, fuzzy search"
+            } else {
+                "Try a shorter phrase or a code symbol."
+            }),
+        ]));
+    }
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(format!(" Results ({}) ", app.hits.len()))
+                .borders(Borders::ALL),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(36, 53, 68))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ");
     let mut list_state = ListState::default();
     if !app.hits.is_empty() {
         list_state.select(Some(app.selected));
     }
-    frame.render_stateful_widget(results, content[0], &mut list_state);
+    frame.render_stateful_widget(list, content[0], &mut list_state);
 
-    let preview = app.hits.get(app.selected).map(|hit| preview_lines(&hit.preview, &app.query));
-    let preview_text = preview.unwrap_or_else(|| vec![Line::from("Results will appear here as you type.")]);
-    let preview_title = app.hits.get(app.selected)
-        .map(|hit| format!(" {} ", hit.key))
+    let selected = app.hits.get(app.selected);
+    let preview = selected
+        .map(|_| preview_lines(&app.preview, &app.query))
+        .unwrap_or_else(|| {
+            vec![
+                Line::from(Span::styled(
+                    "Pick a result to peek inside.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from("Matching passages glow; Enter opens the file."),
+            ]
+        });
+    let title = selected
+        .map(|hit| format!(" {} · {:.3} ", hit.key, hit.score))
         .unwrap_or_else(|| " Preview ".into());
     frame.render_widget(
-        Paragraph::new(preview_text)
-            .block(Block::default().title(preview_title).borders(Borders::ALL))
+        Paragraph::new(preview)
+            .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
         content[1],
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(&app.status, Style::default().fg(Color::Yellow))])),
-        sections[2],
-    );
+
+    let footer = if app.show_help {
+        Paragraph::new("F1 close help · Ctrl-Q quit")
+    } else {
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                &app.status,
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(Span::styled(
+                "↑/↓ move  PgUp/PgDn jump  Enter open  Esc clear  Ctrl-W erase word  F1 help  Ctrl-Q quit",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+    };
+    frame.render_widget(footer, sections[2]);
+    if app.show_help {
+        let area = centered_rect(62, 62, frame.area());
+        frame.render_widget(Clear, area);
+        let help = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "A tiny memory for your codebase",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Search by words, filenames, or exact code symbols."),
+            Line::from("LuxCore uses lexical ranking with typo tolerance; select a file to preview matches."),
+            Line::from("Readable text files are indexed again each launch."),
+            Line::from(""),
+            Line::from("Type       Search as you go"),
+            Line::from("↑ / ↓      Move through results (mouse wheel works too)"),
+            Line::from("Enter      Open selected file"),
+            Line::from("Esc        Clear search"),
+            Line::from("Ctrl-W     Delete last word    Ctrl-U clear all"),
+            Line::from("F1         Close this panel    Ctrl-Q quit"),
+        ])
+        .block(
+            Block::default()
+                .title(" How to use Recall ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(help, area);
+    }
 }
 
 fn preview_lines(body: &str, query: &str) -> Vec<Line<'static>> {
-    let terms: Vec<String> = query.split_whitespace().map(|term| term.to_lowercase()).collect();
-    let matching: Vec<&str> = body.lines()
-        .filter(|line| terms.iter().any(|term| !term.is_empty() && line.to_lowercase().contains(term)))
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let matching: Vec<(usize, &str)> = body
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            terms
+                .iter()
+                .any(|term| !term.is_empty() && line.to_lowercase().contains(term))
+        })
         .take(8)
         .collect();
-    let chosen: Vec<&str> = if matching.is_empty() {
-        body.lines().filter(|line| !line.trim().is_empty()).take(8).collect()
+    let chosen: Vec<(usize, &str)> = if matching.is_empty() {
+        body.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .take(8)
+            .collect()
     } else {
         matching
     };
     if chosen.is_empty() {
         return vec![Line::from("(No preview text)")];
     }
-    chosen.into_iter().map(|line| {
-        let line = if line.len() > 400 { format!("{}…", &line[..400]) } else { line.to_owned() };
-        Line::from(line)
-    }).collect()
+    chosen
+        .into_iter()
+        .map(|(number, line)| {
+            let excerpt = truncate_utf8(line, 400);
+            let mut spans = vec![Span::styled(
+                format!("{:>4} │ ", number + 1),
+                Style::default().fg(Color::DarkGray),
+            )];
+            spans.extend(highlight_line(excerpt, &terms));
+            Line::from(spans)
+        })
+        .collect()
 }
 
-fn _keep_os_string(_: OsString) {}
+fn highlight_line(line: &str, terms: &[String]) -> Vec<Span<'static>> {
+    let folded = line.to_lowercase();
+    if folded.len() != line.len() {
+        return vec![Span::raw(line.to_owned())];
+    }
+    let mut ranges: Vec<(usize, usize)> = terms
+        .iter()
+        .filter(|term| !term.is_empty())
+        .filter_map(|term| folded.find(term).map(|start| (start, start + term.len())))
+        .collect();
+    ranges.sort_unstable();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        if start < cursor || !line.is_char_boundary(start) || !line.is_char_boundary(end) {
+            continue;
+        }
+        if cursor < start {
+            spans.push(Span::raw(line[cursor..start].to_owned()));
+        }
+        spans.push(Span::styled(
+            line[start..end].to_owned(),
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(Color::Rgb(36, 53, 68))
+                .add_modifier(Modifier::BOLD),
+        ));
+        cursor = end;
+    }
+    if cursor < line.len() {
+        spans.push(Span::raw(line[cursor..].to_owned()));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(line.to_owned()));
+    }
+    spans
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut boundary = max_bytes;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &text[..boundary]
+}
+
+fn compact_path(path: &Path, max_chars: usize) -> String {
+    let raw = path.to_string_lossy();
+    let value = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_owned();
+    }
+    let tail: String = chars[chars.len().saturating_sub(max_chars - 1)..]
+        .iter()
+        .collect();
+    format!("…{tail}")
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height) / 2),
+            Constraint::Percentage(height),
+            Constraint::Percentage((100 - height) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width) / 2),
+            Constraint::Percentage(width),
+            Constraint::Percentage((100 - width) / 2),
+        ])
+        .split(vertical[1])[1]
+}
