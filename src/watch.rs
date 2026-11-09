@@ -482,31 +482,23 @@ mod reader {
 
         fn pump(mut self, stop: Borrowed, root: &Path, sink: &Sender<Input>) {
             let gone = loop {
-                let raws = match self.wait(&stop) {
+                let copy = match self.wait(&stop) {
                     Done::Stopped => break false,
                     Done::Failed => break true,
-                    Done::Lost => vec![Raw::Lost],
-                    Done::Bytes(bytes) => {
-                        let reissued = self.issue();
-                        let raws = parse(&bytes, root);
-                        if reissued.is_err() {
-                            let _ = raws
-                                .into_iter()
-                                .try_for_each(|raw| sink.send(Input::Raw(raw)));
-                            break true;
-                        }
-                        raws
-                    }
+                    Done::Lost => None,
+                    Done::Bytes(bytes) => Some(bytes),
                 };
-                if !self.pending && self.issue().is_err() {
-                    break true;
-                }
+                let reissued = self.issue();
+                let raws = copy.map_or_else(|| vec![Raw::Lost], |bytes| parse(&bytes, root));
                 if raws
                     .into_iter()
                     .try_for_each(|raw| sink.send(Input::Raw(raw)))
                     .is_err()
                 {
                     break false;
+                }
+                if reissued.is_err() {
+                    break true;
                 }
             };
             drop(self);
@@ -976,6 +968,42 @@ mod tests {
         );
         fs::remove_dir_all(&project.root).unwrap();
         fs::create_dir(&project.root).unwrap();
+    }
+
+    #[test]
+    fn rescan_picks_up_an_ignore_rule_above_the_root_that_no_event_reports() {
+        let project = Project::new("rescan");
+        project.write("secret.md", "s");
+        project.write("open.md", "o");
+        let engine = project.engine();
+        let mut client = Client::of(&engine);
+        client.converge(&project, SOON);
+        fs::write(project.outer.join(".gitignore"), "secret.md\n").unwrap();
+        client.cmd.send(Cmd::Rescan).unwrap();
+        client.converge(&project, SOON);
+        assert_eq!(keys(&client.changes), (vec![], vec!["secret.md"]));
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_watched_is_manual_but_still_scanned() {
+        let project = Project::new("manual");
+        let missing = project.root.join("not-yet");
+        let engine = Engine::spawn(EngineConfig {
+            root: missing,
+            debounce: Debounce::default(),
+            buffer_bytes: 4096,
+        });
+        let (_cmd, rx) = engine.subscribe(None);
+        let first = rx.recv_timeout(SOON).unwrap();
+        assert!(matches!(first, Update::Manual { .. }), "{first:?}");
+        let deadline = Instant::now() + SOON;
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Update::Snapshot { .. }) => break,
+                Ok(Update::Scanning { .. }) => continue,
+                other => panic!("expected a snapshot, got {other:?}"),
+            }
+        }
     }
 
     #[test]
