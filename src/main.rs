@@ -21,8 +21,9 @@ mod cache;
 mod flow;
 mod lux;
 mod manager;
+mod scan;
 
-use cache::{Scanned, Stamp, Summary};
+use cache::{Scanned, Summary};
 use flow::Screen;
 use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
 use manager::{IndexManager, Outcome};
@@ -34,14 +35,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
-use walkdir::WalkDir;
 
-const INDEX_EXTENSIONS: &[&str] = &[
-    "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "rs", "md", "txt", "rst", "py", "go", "java",
-    "js", "jsx", "ts", "tsx", "json", "toml", "yaml", "yml", "ini", "sh", "bat", "ps1", "html",
-    "css", "sql", "cmake",
-];
-const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_RESULTS: usize = 40;
 
 struct App {
@@ -536,43 +530,18 @@ fn scan_files(
     terminal: &mut RecallTerminal,
     root: &Path,
 ) -> Result<Option<BTreeMap<String, Scanned>>, Box<dyn Error>> {
-    let mut files = BTreeMap::new();
-    let mut latest = String::new();
     let mut last_draw = Instant::now() - Duration::from_secs(1);
-    let walker = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            if !entry.file_type().is_dir() || entry.depth() == 0 {
-                return true;
-            }
-            entry.file_name().to_str().is_some_and(should_descend)
-        });
-    for entry in walker.filter_map(Result::ok) {
-        if entry.file_type().is_file()
-            && is_indexable(entry.path())
-            && let Ok(metadata) = entry.metadata()
-            && metadata.len() <= MAX_FILE_BYTES
-            && let Ok(relative) = entry.path().strip_prefix(root)
-        {
-            latest = relative.to_string_lossy().replace('\\', "/");
-            files.insert(
-                latest.clone(),
-                Scanned {
-                    path: entry.into_path(),
-                    stamp: Stamp::of(&metadata),
-                },
-            );
+    scan::walk_project(root, |found, latest| {
+        if last_draw.elapsed() < Duration::from_millis(60) {
+            return Ok(true);
         }
-        if last_draw.elapsed() >= Duration::from_millis(60) {
-            if cancel_requested()? {
-                return Ok(None);
-            }
-            terminal.draw(|frame| draw_scanning(frame, root, files.len(), &latest))?;
-            last_draw = Instant::now();
+        if cancel_requested()? {
+            return Ok(false);
         }
-    }
-    Ok(Some(files))
+        terminal.draw(|frame| draw_scanning(frame, root, found, latest))?;
+        last_draw = Instant::now();
+        Ok(true)
+    })
 }
 
 fn cancel_requested() -> Result<bool, Box<dyn Error>> {
@@ -587,14 +556,6 @@ fn cancel_requested() -> Result<bool, Box<dyn Error>> {
         }
     }
     Ok(cancel)
-}
-
-fn should_descend(dir_name: &str) -> bool {
-    !dir_name.starts_with('.')
-        && !matches!(
-            dir_name,
-            "build" | "target" | "node_modules" | "vendor" | "venv" | "__pycache__"
-        )
 }
 
 fn indexing_layout(frame: &mut Frame, root: &Path) -> [Rect; 3] {
@@ -670,24 +631,6 @@ fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize,
         format!("Indexing {current}")
     };
     draw_detail(frame, area[2], &detail);
-}
-
-fn is_indexable(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if matches!(
-        name,
-        "Makefile" | "GNUmakefile" | "Dockerfile" | "Justfile" | ".gitignore" | "CMakeLists.txt"
-    ) {
-        return true;
-    }
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            INDEX_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
-        })
 }
 
 fn run_tui(app: &mut App, index: &LuxIndex) -> Result<Exit, Box<dyn Error>> {
@@ -1255,23 +1198,6 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol().to_owned())
             .collect()
-    }
-
-    #[test]
-    fn hidden_and_build_directories_are_not_indexed() {
-        for skipped in [
-            ".git",
-            ".claude",
-            ".venv",
-            "target",
-            "node_modules",
-            "build",
-        ] {
-            assert!(!should_descend(skipped), "{skipped} should be skipped");
-        }
-        for kept in ["src", "docs", "tests"] {
-            assert!(should_descend(kept), "{kept} should be indexed");
-        }
     }
 
     fn marked(text: &str) -> String {
