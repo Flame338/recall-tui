@@ -65,7 +65,7 @@ pub fn cli(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(windows)]
-mod host {
+pub(crate) mod host {
     use std::{
         collections::{HashMap, HashSet},
         env,
@@ -85,10 +85,10 @@ mod host {
     };
 
     use windows_sys::Win32::{
-        Foundation::CloseHandle,
+        Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
         System::Threading::{
             CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW,
-            DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
+            DETACHED_PROCESS, GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW,
         },
     };
 
@@ -544,12 +544,20 @@ mod host {
             SpawnError(format!("cannot copy the exe to {}: {error}", bin.display()))
         })?;
         sweep(&bin, &copy);
-        spawn_detached(&copy, args, &bin)
+        let child = spawn_detached(&copy, args, &bin)
             .map_err(|error| SpawnError(format!("cannot run {}: {error}", copy.display())))?;
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if answers(pipe) {
                 return Ok(());
+            }
+            // A child that already exited will never open the pipe, so every
+            // launch would otherwise wait out the full timeout for nothing.
+            if let Some(code) = child.exit_code() {
+                return Err(SpawnError(format!(
+                    "{} exited with code {code} before it answered",
+                    copy.display()
+                )));
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -608,7 +616,25 @@ mod host {
         }
     }
 
-    fn spawn_detached(exe: &Path, args: &[&str], dir: &Path) -> io::Result<()> {
+    /// The process handle of a daemon just started. It lets `ensure` see a child
+    /// that died instead of waiting for it.
+    struct Child(HANDLE);
+
+    impl Child {
+        fn exit_code(&self) -> Option<u32> {
+            let mut code = 0;
+            let alive = unsafe { GetExitCodeProcess(self.0, &mut code) } != 0;
+            (alive && code != STILL_ACTIVE as u32).then_some(code)
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn spawn_detached(exe: &Path, args: &[&str], dir: &Path) -> io::Result<Child> {
         let wide = |text: &OsStr| text.encode_wide().chain([0]).collect::<Vec<u16>>();
         let mut line = Vec::new();
         for part in iter::once(exe.as_os_str()).chain(args.iter().map(OsStr::new)) {
@@ -648,11 +674,8 @@ mod host {
                 )
             };
             if made != 0 {
-                unsafe {
-                    CloseHandle(info.hProcess);
-                    CloseHandle(info.hThread);
-                }
-                return Ok(());
+                unsafe { CloseHandle(info.hThread) };
+                return Ok(Child(info.hProcess));
             }
             error = io::Error::last_os_error();
         }
@@ -1119,6 +1142,50 @@ mod host {
                 ],
             )
             .unwrap();
+        }
+
+        /// Runs in a child process: starts a "daemon" that exits at once.
+        #[test]
+        #[ignore = "a helper process for ensure_running_gives_up_when_the_daemon_exits"]
+        fn ensure_with_a_daemon_that_exits() {
+            if env::var(CHILD).as_deref() != Ok("2") {
+                return;
+            }
+            let begun = Instant::now();
+            let error = ensure(&PipeName::from_env(), &["no_test_has_this_name"]).unwrap_err();
+            assert!(error.0.contains("exited with code"), "{error:?}");
+            assert!(
+                begun.elapsed() < Duration::from_millis(2500),
+                "waited {:?} for a child that was already gone",
+                begun.elapsed()
+            );
+        }
+
+        #[test]
+        fn ensure_running_gives_up_when_the_daemon_exits() {
+            let suffix = format!("test-{}-exits", std::process::id());
+            let local = env::temp_dir().join(format!("recall-exits-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&local);
+            fs::create_dir_all(&local).unwrap();
+            let helper = Command::new(env::current_exe().unwrap())
+                .args([
+                    "daemon::host::tests::ensure_with_a_daemon_that_exits",
+                    "--exact",
+                    "--ignored",
+                    "--quiet",
+                ])
+                .env("RECALL_PIPE_SUFFIX", &suffix)
+                .env("LOCALAPPDATA", &local)
+                .env(CHILD, "2")
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .unwrap();
+            let _ = fs::remove_dir_all(&local);
+            assert!(
+                helper.status.success(),
+                "{}",
+                String::from_utf8_lossy(&helper.stdout)
+            );
         }
 
         /// Runs in the detached copy: the daemon process itself.

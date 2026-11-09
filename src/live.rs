@@ -1350,4 +1350,59 @@ mod tests {
         let reopened = project.rig(Some(&project.cache));
         assert!(found(&reopened.live, "alpha").is_empty());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_follows_edits_through_a_real_daemon_and_the_real_watcher() {
+        use crate::{daemon::host, ipc::{self, PipeName}};
+        let project = Project::new("daemon-e2e");
+        project.write("docs/one.md", "alpha bravo");
+        project.write("docs/two.md", "charlie delta");
+        let suffix = format!("live-e2e-{}", process::id());
+        let name = PipeName::with_suffix(Some(&suffix));
+        let daemon = {
+            let config = host::Config::production(PipeName::with_suffix(Some(&suffix)));
+            thread::spawn(move || host::serve(config).map_err(|error| error.to_string()))
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while ipc::ping(&name).is_err() {
+            assert!(Instant::now() < until, "the daemon never answered");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (root, build) = (project.root.clone(), ipc::build_id().to_owned());
+        let mut live = Live::build(&root, &lux::library_path(), None, |have| {
+            let link = ipc::connect_to(&name, &build, &root, have).expect("connect");
+            Some(Feed { link, via: Via::Daemon, engine: None })
+        })
+        .expect("build libluxcore");
+        assert!(live.settle(|_| Ok(true)).unwrap());
+        assert_eq!(found(&live, "alpha"), ["docs/one.md"]);
+
+        let converge = |live: &mut Live, token: &str, expect: &[&str]| {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                live.tick();
+                if found(live, token) == expect {
+                    return;
+                }
+                assert!(Instant::now() < end, "{token} never became {expect:?}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        project.write("docs/three.md", "zulu unique-token-qwerty");
+        converge(&mut live, "qwerty", &["docs/three.md"]);
+        project.write("docs/three.md", "zulu replaced-token-asdfgh");
+        converge(&mut live, "asdfgh", &["docs/three.md"]);
+        converge(&mut live, "qwerty", &[]);
+        project.remove("docs/two.md");
+        converge(&mut live, "charlie", &[]);
+        project.write("docs/.gitignore", "three.md
+");
+        converge(&mut live, "asdfgh", &[]);
+        assert_eq!(live.mode(), &Mode::Live { via: Via::Daemon });
+
+        drop(live);
+        ipc::stop(&name).expect("stop");
+        daemon.join().unwrap().unwrap();
+    }
 }
