@@ -48,7 +48,6 @@ pub type Manifest = BTreeMap<String, Entry>;
 #[derive(Clone, Copy, Debug)]
 pub enum Seen<'a> {
     All(&'a BTreeMap<String, Stamp>),
-    #[allow(dead_code)] // Built by the live watcher from a Delta.
     Changes(&'a [Change]),
 }
 
@@ -392,79 +391,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Summary {
-    pub indexed: usize,
-    pub reused: bool,
-    pub updated: usize,
-    pub removed: usize,
-    pub saved: bool,
-}
-
-pub fn sync(
-    index: &mut LuxIndex,
-    files: Option<&CacheFiles>,
-    fingerprint: &str,
-    root: &Path,
-    scanned: &BTreeMap<String, Stamp>,
-    mut progress: impl FnMut(usize, usize, &str) -> Result<bool, Box<dyn Error>>,
-) -> Result<Option<Summary>, Box<dyn Error>> {
-    let cached = files.and_then(|files| load(index, files, fingerprint));
-    let reused = cached.is_some();
-    let mut manifest = cached.map(|loaded| loaded.manifest).unwrap_or_default();
-    let plan = plan(&manifest, Seen::All(scanned));
-
-    for key in &plan.to_remove {
-        index.remove(key)?;
-        manifest.remove(key);
-    }
-    for key in &plan.to_forget {
-        manifest.remove(key);
-    }
-    let total = plan.to_read.len();
-    for (position, (key, stamp)) in plan.to_read.iter().enumerate() {
-        if !progress(position, total, key)? {
-            return Ok(None);
-        }
-        let path = root.join(key);
-        let was_indexed = manifest.get(key).is_some_and(|entry| entry.indexed);
-        let indexed = match fs::read_to_string(&path) {
-            Ok(body) => {
-                let title = path.file_name().unwrap_or_default().to_string_lossy();
-                index.add(key, &title, &body)?;
-                true
-            }
-            Err(_) => {
-                if was_indexed {
-                    index.remove(key)?;
-                }
-                false
-            }
-        };
-        manifest.insert(
-            key.clone(),
-            Entry {
-                stamp: *stamp,
-                indexed,
-            },
-        );
-    }
-
-    let changed = !reused || total > 0 || !plan.to_remove.is_empty() || !plan.to_forget.is_empty();
-    let saved = changed
-        && files.is_some_and(|files| save(index, files, fingerprint, None, &manifest).is_ok());
-    Ok(Some(Summary {
-        indexed: manifest.values().filter(|entry| entry.indexed).count(),
-        reused,
-        updated: total,
-        removed: plan.to_remove.len(),
-        saved,
-    }))
-}
-
 pub struct Loaded {
     pub manifest: Manifest,
-    #[allow(dead_code)] // Read once the live watcher resumes from it.
     pub cursor: Option<Cursor>,
 }
 
@@ -724,24 +652,35 @@ mod tests {
         }
     }
 
-    fn run(workspace: &Workspace, fingerprint: &str) -> (LuxIndex, Summary) {
+    fn run(workspace: &Workspace, fingerprint: &str) -> LuxIndex {
         run_in(workspace, &workspace.0.join("cache"), fingerprint)
     }
 
-    fn run_in(workspace: &Workspace, dir: &Path, fingerprint: &str) -> (LuxIndex, Summary) {
+    /// Indexes the workspace cold and saves the pair, as a first open does.
+    fn run_in(workspace: &Workspace, dir: &Path, fingerprint: &str) -> LuxIndex {
         let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+        let mut manifest = Manifest::new();
+        for (key, stamp) in workspace.scan() {
+            let body = fs::read_to_string(workspace.src().join(&key));
+            if let Ok(body) = &body {
+                index.add(&key, &key, body).unwrap();
+            }
+            manifest.insert(
+                key,
+                Entry {
+                    stamp,
+                    indexed: body.is_ok(),
+                },
+            );
+        }
         let files = cache_files(dir, &workspace.0);
-        let summary = sync(
-            &mut index,
-            Some(&files),
-            fingerprint,
-            &workspace.src(),
-            &workspace.scan(),
-            |_, _, _| Ok(true),
-        )
-        .unwrap()
-        .unwrap();
-        (index, summary)
+        save(&index, &files, fingerprint, None, &manifest).unwrap();
+        index
+    }
+
+    fn reusable(workspace: &Workspace, dir: &Path, fingerprint: &str) -> bool {
+        let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+        load(&mut index, &cache_files(dir, &workspace.0), fingerprint).is_some()
     }
 
     fn found(index: &LuxIndex, query: &str) -> Vec<String> {
@@ -754,56 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_index_is_reused_and_only_changed_files_are_reread() {
-        let workspace = Workspace::new("sync");
-        workspace.write("a.md", b"alpha unique words");
-        workspace.write("b.md", b"beta other words");
-        workspace.write("c.txt", &[0xff, 0xfe, 0x00, 0x9f]);
-
-        let (index, first) = run(&workspace, "fp");
-        assert_eq!(
-            first,
-            Summary {
-                indexed: 2,
-                reused: false,
-                updated: 3,
-                removed: 0,
-                saved: true
-            }
-        );
-        assert_eq!(found(&index, "alpha"), ["a.md"]);
-
-        let (index, second) = run(&workspace, "fp");
-        assert_eq!(
-            second,
-            Summary {
-                indexed: 2,
-                reused: true,
-                updated: 0,
-                removed: 0,
-                saved: false
-            }
-        );
-        assert_eq!(found(&index, "alpha"), ["a.md"]);
-
-        workspace.write("b.md", b"gamma replaced the old text entirely");
-        let (index, third) = run(&workspace, "fp");
-        assert_eq!((third.reused, third.updated, third.removed), (true, 1, 0));
-        assert_eq!(found(&index, "gamma"), ["b.md"]);
-        assert!(found(&index, "beta").is_empty());
-
-        fs::remove_file(workspace.0.join("src").join("a.md")).unwrap();
-        let (index, fourth) = run(&workspace, "fp");
-        assert_eq!((fourth.updated, fourth.removed, fourth.indexed), (0, 1, 1));
-        assert!(found(&index, "alpha").is_empty());
-
-        let (_, rebuilt) = run(&workspace, "different library");
-        assert!(!rebuilt.reused);
-        assert_eq!(rebuilt.updated, 2);
-    }
-
-    #[test]
-    fn a_synced_workspace_saves_its_root_in_the_manifest() {
+    fn a_saved_workspace_keeps_its_root_in_the_manifest() {
         let workspace = Workspace::new("root");
         workspace.write("a.md", b"alpha");
         run(&workspace, "fp");
@@ -855,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn listing_shows_the_root_file_count_and_size_of_a_synced_folder() {
+    fn listing_shows_the_root_file_count_and_size_of_a_saved_folder() {
         let home = Workspace::new("list-home");
         let dir = home.0.join("cache");
         let workspace = Workspace::new("list-one");
@@ -999,60 +889,40 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_entry_is_rebuilt_on_the_next_sync_and_reused_after() {
+    fn a_deleted_entry_is_gone_until_the_folder_is_saved_again() {
         let home = Workspace::new("delete-resync");
         let dir = home.0.join("cache");
         let workspace = Workspace::new("delete-resync-src");
         workspace.write("a.md", b"alpha");
-        assert!(!run_in(&workspace, &dir, "fp").1.reused);
-        assert!(run_in(&workspace, &dir, "fp").1.reused);
+        assert!(!reusable(&workspace, &dir, "fp"));
+        run_in(&workspace, &dir, "fp");
+        assert!(reusable(&workspace, &dir, "fp"));
 
         delete_entry(&dir, &stem_of(&workspace, &dir)).unwrap();
         assert!(list_entries(&dir).is_empty());
+        assert!(!reusable(&workspace, &dir, "fp"));
 
-        let (index, rebuilt) = run_in(&workspace, &dir, "fp");
-        assert!(!rebuilt.reused);
+        let index = run_in(&workspace, &dir, "fp");
         assert_eq!(found(&index, "alpha"), ["a.md"]);
-        assert!(run_in(&workspace, &dir, "fp").1.reused);
+        assert!(reusable(&workspace, &dir, "fp"));
     }
 
     #[test]
     fn a_lux_replaced_after_its_manifest_was_written_means_a_cold_start() {
         let workspace = Workspace::new("torn");
         workspace.write("a.md", b"alpha");
-        let (index, _) = run(&workspace, "fp");
+        let dir = workspace.0.join("cache");
+        let index = run(&workspace, "fp");
+        assert!(reusable(&workspace, &dir, "fp"));
         index.save(&workspace.files().index).unwrap();
-
-        let (index, rebuilt) = run(&workspace, "fp");
-        assert!(!rebuilt.reused);
-        assert_eq!(found(&index, "alpha"), ["a.md"]);
-        assert!(run(&workspace, "fp").1.reused);
-    }
-
-    #[test]
-    fn a_vanished_unindexed_file_leaves_the_saved_manifest() {
-        let workspace = Workspace::new("forget");
-        workspace.write("a.md", b"alpha");
-        workspace.write("c.txt", &[0xff, 0xfe, 0x00, 0x9f]);
-        run(&workspace, "fp");
-        fs::remove_file(workspace.src().join("c.txt")).unwrap();
-
-        let (_, summary) = run(&workspace, "fp");
-        assert!(summary.saved);
-        let text = fs::read_to_string(workspace.files().manifest).unwrap();
-        let saved: Vec<String> = parse_manifest(&text)
-            .unwrap()
-            .manifest
-            .into_keys()
-            .collect();
-        assert_eq!(saved, ["a.md"]);
+        assert!(!reusable(&workspace, &dir, "fp"));
     }
 
     #[test]
     fn a_saved_cursor_comes_back_with_its_index() {
         let workspace = Workspace::new("cursor");
         workspace.write("a.md", b"alpha");
-        let (index, _) = run(&workspace, "fp");
+        let index = run(&workspace, "fp");
         let files = workspace.files();
         let cursor = Cursor {
             epoch: Epoch(7),
@@ -1067,24 +937,5 @@ mod tests {
         assert_eq!(loaded.manifest, manifest);
         assert_eq!(found(&restored, "alpha"), ["a.md"]);
         assert!(load(&mut restored, &files, "other library").is_none());
-    }
-
-    #[test]
-    fn cancelling_stops_before_saving() {
-        let workspace = Workspace::new("cancel");
-        workspace.write("a.md", b"alpha");
-        let mut index = LuxIndex::load(&lux::library_path()).unwrap();
-        let files = workspace.files();
-        let outcome = sync(
-            &mut index,
-            Some(&files),
-            "fp",
-            &workspace.src(),
-            &workspace.scan(),
-            |_, _, _| Ok(false),
-        )
-        .unwrap();
-        assert!(outcome.is_none());
-        assert!(!files.manifest.exists());
     }
 }
