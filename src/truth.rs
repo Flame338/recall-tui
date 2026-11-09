@@ -71,7 +71,7 @@ impl Scope {
     /// Whether a file key belongs to this scope.
     pub fn covers(&self, key: &str) -> bool {
         match self {
-            Scope::Shallow(dir) => same(parent_of(key), dir.as_str()),
+            Scope::Shallow(dir) => same(parent_of(key).as_bytes(), dir.as_str().as_bytes()),
             Scope::Deep(path) => within(key, path.as_str()),
         }
     }
@@ -82,15 +82,6 @@ impl Scope {
             Scope::Shallow(target) => within(target.as_str(), dir),
             Scope::Deep(path) => within(path.as_str(), dir) || within(dir, path.as_str()),
         }
-    }
-}
-
-/// Windows paths ignore case, so a scope must match a key whatever its case.
-fn same(a: &str, b: &str) -> bool {
-    if cfg!(windows) {
-        a.eq_ignore_ascii_case(b)
-    } else {
-        a == b
     }
 }
 
@@ -109,11 +100,12 @@ fn within(key: &str, dir: &str) -> bool {
     }
     let (key, dir) = (key.as_bytes(), dir.as_bytes());
     key.len() >= dir.len()
-        && same_bytes(&key[..dir.len()], dir)
+        && same(&key[..dir.len()], dir)
         && (key.len() == dir.len() || key[dir.len()] == b'/')
 }
 
-fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+/// Windows paths ignore case, so a scope must match a key whatever its case.
+fn same(a: &[u8], b: &[u8]) -> bool {
     if cfg!(windows) {
         a.eq_ignore_ascii_case(b)
     } else {
