@@ -8,9 +8,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::lux::LuxIndex;
+use crate::{
+    lux::LuxIndex,
+    truth::{Change, Cursor, Epoch, Gen},
+};
 
-const FORMAT: &str = "recall-cache 2";
+const FORMAT: &str = "recall-cache 3";
 const RULES_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,29 +44,91 @@ pub struct Entry {
 
 pub type Manifest = BTreeMap<String, Entry>;
 
-#[derive(Debug, PartialEq, Eq)]
+/// What an engine reports about the files: all of them, or only what changed.
+#[derive(Clone, Copy, Debug)]
+pub enum Seen<'a> {
+    All(&'a BTreeMap<String, Stamp>),
+    #[allow(dead_code)] // Built by the live watcher from a Delta.
+    Changes(&'a [Change]),
+}
+
+/// How to bring a manifest and its index in line with what was seen.
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    pub to_read: Vec<String>,
+    /// Read and index these, then record the stamp.
+    pub to_read: Vec<(String, Stamp)>,
+    /// Indexed files that are gone. Remove them from the index and the manifest.
     pub to_remove: Vec<String>,
+    /// Unindexed files that are gone. Drop them from the manifest only.
+    pub to_forget: Vec<String>,
 }
 
-pub fn plan(cached: &Manifest, scanned: &BTreeMap<String, Stamp>) -> Plan {
-    let to_read = scanned
-        .iter()
-        .filter(|(key, stamp)| cached.get(*key).is_none_or(|entry| entry.stamp != **stamp))
-        .map(|(key, _)| key.clone())
-        .collect();
-    let to_remove = cached
-        .iter()
-        .filter(|(key, entry)| entry.indexed && !scanned.contains_key(*key))
-        .map(|(key, _)| key.clone())
-        .collect();
-    Plan { to_read, to_remove }
+impl Plan {
+    fn present(&mut self, cached: &Manifest, key: &str, stamp: Stamp) {
+        if cached.get(key).is_none_or(|entry| entry.stamp != stamp) {
+            self.to_read.push((key.to_owned(), stamp));
+        }
+    }
+
+    fn vanished(&mut self, cached: &Manifest, key: &str) {
+        match cached.get(key) {
+            Some(entry) if entry.indexed => self.to_remove.push(key.to_owned()),
+            Some(_) => self.to_forget.push(key.to_owned()),
+            None => {}
+        }
+    }
 }
 
-pub fn serialize(fingerprint: &str, root: &Path, manifest: &Manifest) -> String {
-    let root = root.to_string_lossy().replace(['\n', '\r'], " ");
-    let mut text = format!("{FORMAT}\n{fingerprint}\nroot {root}\n");
+pub fn plan(cached: &Manifest, seen: Seen) -> Plan {
+    let mut plan = Plan::default();
+    match seen {
+        Seen::All(files) => {
+            for (key, stamp) in files {
+                plan.present(cached, key, *stamp);
+            }
+            for key in cached.keys().filter(|key| !files.contains_key(*key)) {
+                plan.vanished(cached, key);
+            }
+        }
+        Seen::Changes(changes) => {
+            for change in changes {
+                match change {
+                    Change::Upsert(key, stamp) => plan.present(cached, key, *stamp),
+                    Change::Remove(key) => plan.vanished(cached, key),
+                }
+            }
+        }
+    }
+    plan
+}
+
+/// What a manifest file says about itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub fingerprint: String,
+    pub root: String,
+    /// The stat of the `.lux` saved with this manifest. Another process may
+    /// replace the `.lux` between our two renames, and a mismatch shows it.
+    pub index: Stamp,
+    /// Where in an engine's history this manifest is current.
+    pub cursor: Option<Cursor>,
+}
+
+pub fn serialize(header: &Header, manifest: &Manifest) -> String {
+    let Header {
+        fingerprint,
+        root,
+        index,
+        cursor,
+    } = header;
+    let root = root.replace(['\n', '\r'], " ");
+    let cursor = cursor.map_or("-".to_owned(), |cursor| {
+        format!("{:016x} {}", cursor.epoch.0, cursor.generation.0)
+    });
+    let mut text = format!(
+        "{FORMAT}\n{fingerprint}\nroot {root}\nindex {} {}\ncursor {cursor}\n",
+        index.size, index.modified
+    );
     for (key, entry) in manifest {
         text.push_str(&format!(
             "{}\t{}\t{}\t{key}\n",
@@ -77,9 +142,28 @@ pub fn serialize(fingerprint: &str, root: &Path, manifest: &Manifest) -> String 
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Parsed {
-    pub fingerprint: String,
-    pub root: String,
+    pub header: Header,
     pub manifest: Manifest,
+}
+
+fn parse_index(line: &str) -> Option<Stamp> {
+    let (size, modified) = line.strip_prefix("index ")?.split_once(' ')?;
+    Some(Stamp {
+        size: size.parse().ok()?,
+        modified: modified.parse().ok()?,
+    })
+}
+
+fn parse_cursor(line: &str) -> Option<Option<Cursor>> {
+    let value = line.strip_prefix("cursor ")?;
+    if value == "-" {
+        return Some(None);
+    }
+    let (epoch, generation) = value.split_once(' ')?;
+    Some(Some(Cursor {
+        epoch: Epoch(u64::from_str_radix(epoch, 16).ok()?),
+        generation: Gen(generation.parse().ok()?),
+    }))
 }
 
 pub fn parse_manifest(text: &str) -> Option<Parsed> {
@@ -89,6 +173,8 @@ pub fn parse_manifest(text: &str) -> Option<Parsed> {
     }
     let fingerprint = lines.next()?.to_owned();
     let root = lines.next()?.strip_prefix("root ")?.to_owned();
+    let index = parse_index(lines.next()?)?;
+    let cursor = parse_cursor(lines.next()?)?;
     let mut manifest = Manifest::new();
     for line in lines {
         let mut fields = line.splitn(4, '\t');
@@ -109,15 +195,14 @@ pub fn parse_manifest(text: &str) -> Option<Parsed> {
         );
     }
     Some(Parsed {
-        fingerprint,
-        root,
+        header: Header {
+            fingerprint,
+            root,
+            index,
+            cursor,
+        },
         manifest,
     })
-}
-
-pub fn parse(text: &str, fingerprint: &str) -> Option<Manifest> {
-    let parsed = parse_manifest(text)?;
-    (parsed.fingerprint == fingerprint).then_some(parsed.manifest)
 }
 
 pub fn fingerprint(library: &Path) -> String {
@@ -238,7 +323,7 @@ pub fn list_entries(dir: &Path) -> Vec<CacheEntry> {
                         .filter(|entry| entry.indexed)
                         .count()
                 }),
-                root: parsed.map(|parsed| parsed.root),
+                root: parsed.map(|parsed| parsed.header.root),
                 bytes: slot.bytes,
                 modified: slot.modified,
             }
@@ -326,15 +411,18 @@ pub fn sync(
 ) -> Result<Option<Summary>, Box<dyn Error>> {
     let cached = files.and_then(|files| load(index, files, fingerprint));
     let reused = cached.is_some();
-    let mut manifest = cached.unwrap_or_default();
-    let plan = plan(&manifest, scanned);
+    let mut manifest = cached.map(|loaded| loaded.manifest).unwrap_or_default();
+    let plan = plan(&manifest, Seen::All(scanned));
 
     for key in &plan.to_remove {
         index.remove(key)?;
         manifest.remove(key);
     }
+    for key in &plan.to_forget {
+        manifest.remove(key);
+    }
     let total = plan.to_read.len();
-    for (position, key) in plan.to_read.iter().enumerate() {
+    for (position, (key, stamp)) in plan.to_read.iter().enumerate() {
         if !progress(position, total, key)? {
             return Ok(None);
         }
@@ -356,15 +444,15 @@ pub fn sync(
         manifest.insert(
             key.clone(),
             Entry {
-                stamp: scanned[key],
+                stamp: *stamp,
                 indexed,
             },
         );
     }
 
-    let changed = !reused || total > 0 || !plan.to_remove.is_empty();
-    let saved =
-        changed && files.is_some_and(|files| save(index, files, fingerprint, &manifest).is_ok());
+    let changed = !reused || total > 0 || !plan.to_remove.is_empty() || !plan.to_forget.is_empty();
+    let saved = changed
+        && files.is_some_and(|files| save(index, files, fingerprint, None, &manifest).is_ok());
     Ok(Some(Summary {
         indexed: manifest.values().filter(|entry| entry.indexed).count(),
         reused,
@@ -374,47 +462,81 @@ pub fn sync(
     }))
 }
 
-fn load(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Option<Manifest> {
-    let text = fs::read_to_string(&files.manifest).ok()?;
-    let manifest = parse(&text, fingerprint)?;
-    index.restore(&files.index).ok()?;
-    Some(manifest)
+pub struct Loaded {
+    pub manifest: Manifest,
+    #[allow(dead_code)] // Read once the live watcher resumes from it.
+    pub cursor: Option<Cursor>,
 }
 
-fn save(
+/// Restores a saved pair, or `None` when it is missing, from another library,
+/// or torn. A torn pair costs a cold start, never a wrong index.
+pub fn load(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Option<Loaded> {
+    let text = fs::read_to_string(&files.manifest).ok()?;
+    let Parsed { header, manifest } = parse_manifest(&text)?;
+    let paired = || stamp_of(&files.index).is_some_and(|stamp| stamp == header.index);
+    if header.fingerprint != fingerprint || !paired() {
+        return None;
+    }
+    index.restore(&files.index).ok()?;
+    // Another process may have replaced the .lux while it was being restored.
+    paired().then_some(Loaded {
+        manifest,
+        cursor: header.cursor,
+    })
+}
+
+/// Saves the `.lux` first, then a manifest that records which `.lux` it belongs to.
+pub fn save(
     index: &LuxIndex,
     files: &CacheFiles,
     fingerprint: &str,
+    cursor: Option<Cursor>,
     manifest: &Manifest,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(dir) = files.index.parent() {
         fs::create_dir_all(dir)?;
     }
-    write_atomic(&files.index, |path| index.save(path))?;
+    let saved = write_atomic(&files.index, |path| index.save(path))?;
+    let header = Header {
+        fingerprint: fingerprint.to_owned(),
+        root: files.root.to_string_lossy().into_owned(),
+        index: saved,
+        cursor,
+    };
     write_atomic(&files.manifest, |path| {
-        Ok(fs::write(
-            path,
-            serialize(fingerprint, &files.root, manifest),
-        )?)
-    })
+        Ok(fs::write(path, serialize(&header, manifest))?)
+    })?;
+    Ok(())
 }
 
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    fs::metadata(path).ok().map(|metadata| Stamp::of(&metadata))
+}
+
+/// Returns the stat of the written file. It is taken before the rename, so it
+/// names our bytes even if another process renames its own file in right after.
 fn write_atomic(
     target: &Path,
     write: impl FnOnce(&Path) -> Result<(), Box<dyn Error>>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Stamp, Box<dyn Error>> {
     let mut temp = target.as_os_str().to_owned();
     temp.push(format!(".{}.tmp", process::id()));
     let temp = PathBuf::from(temp);
-    if let Err(error) = write(&temp) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
+    let written = write(&temp).and_then(|()| {
+        stamp_of(&temp).ok_or_else(|| format!("{} vanished after writing", temp.display()).into())
+    });
+    let stamp = match written {
+        Ok(stamp) => stamp,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    };
     if let Err(error) = fs::rename(&temp, target) {
         let _ = fs::remove_file(&temp);
         return Err(error.into());
     }
-    Ok(())
+    Ok(stamp)
 }
 
 #[cfg(test)]
@@ -448,42 +570,60 @@ mod tests {
             .collect()
     }
 
+    fn header(root: &str, cursor: Option<Cursor>) -> Header {
+        Header {
+            fingerprint: "fp".into(),
+            root: root.into(),
+            index: stamp(70, 123_456_789),
+            cursor,
+        }
+    }
+
     #[test]
-    fn manifest_round_trips_and_rejects_other_fingerprints_and_garbage() {
+    fn manifest_round_trips_with_its_index_stat_and_cursor() {
         let manifest = cached(&[
             ("a/b c.md", stamp(5, 9), true),
             ("z.txt", stamp(1, 2), false),
         ]);
-        let text = serialize("fp", Path::new("F:/proj"), &manifest);
-        assert_eq!(parse(&text, "fp"), Some(manifest));
-        assert_eq!(parse(&text, "other"), None);
-        assert_eq!(parse("junk", "fp"), None);
-        assert_eq!(
-            parse("recall-cache 2\nfp\nroot F:/proj\nx\ty\n", "fp"),
-            None
-        );
+        let cursor = Cursor {
+            epoch: Epoch(u64::MAX - 3),
+            generation: Gen(41),
+        };
+        for header in [header("F:/my proj", Some(cursor)), header("F:/proj", None)] {
+            let parsed = parse_manifest(&serialize(&header, &manifest)).unwrap();
+            assert_eq!(parsed.header, header);
+            assert_eq!(parsed.manifest, manifest);
+        }
     }
 
     #[test]
-    fn the_manifest_remembers_its_root_and_old_formats_do_not_parse() {
-        let manifest = cached(&[("a.md", stamp(5, 9), true)]);
-        let text = serialize("fp", Path::new("F:/my proj"), &manifest);
-        let parsed = parse_manifest(&text).unwrap();
-        assert_eq!(parsed.fingerprint, "fp");
-        assert_eq!(parsed.root, "F:/my proj");
-        assert_eq!(parsed.manifest, manifest);
-        assert_eq!(parse_manifest("recall-cache 1\nfp\n5\t9\t1\ta.md\n"), None);
-        assert_eq!(parse_manifest("recall-cache 2\nfp\n5\t9\t1\ta.md\n"), None);
+    fn garbage_and_old_formats_do_not_parse() {
+        let text = serialize(&header("F:/proj", None), &Manifest::new());
+        assert!(parse_manifest(&text).is_some());
+        for bad in [
+            "junk".to_owned(),
+            "recall-cache 1\nfp\n5\t9\t1\ta.md\n".to_owned(),
+            "recall-cache 2\nfp\nroot F:/proj\n5\t9\t1\ta.md\n".to_owned(),
+            text.replace("index 70 ", "index x "),
+            text.replace("cursor -", "cursor 12"),
+            format!("{text}x\ty\n"),
+        ] {
+            assert_eq!(parse_manifest(&bad), None, "{bad:?}");
+        }
     }
 
     #[test]
     fn a_root_with_a_line_break_still_round_trips() {
-        let text = serialize("fp", Path::new("odd\nname"), &Manifest::new());
-        assert!(parse(&text, "fp").is_some());
+        let text = serialize(&header("odd\nname", None), &Manifest::new());
+        assert_eq!(parse_manifest(&text).unwrap().header.root, "odd name");
+    }
+
+    fn keys(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| (*key).to_owned()).collect()
     }
 
     #[test]
-    fn plan_reads_new_and_changed_files_and_removes_vanished_indexed_ones() {
+    fn plan_reads_new_and_changed_files_and_drops_every_vanished_one() {
         let old = cached(&[
             ("same", stamp(1, 1), true),
             ("changed", stamp(1, 1), true),
@@ -498,10 +638,38 @@ mod tests {
             ("skipped-same", stamp(1, 1)),
         ]);
         assert_eq!(
-            plan(&old, &now),
+            plan(&old, Seen::All(&now)),
             Plan {
-                to_read: vec!["changed".into(), "new".into()],
-                to_remove: vec!["gone".into()],
+                to_read: vec![("changed".into(), stamp(2, 1)), ("new".into(), stamp(1, 1))],
+                to_remove: keys(&["gone"]),
+                to_forget: keys(&["skipped-gone"]),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_of_changes_touches_only_the_named_keys() {
+        let old = cached(&[
+            ("same", stamp(1, 1), true),
+            ("changed", stamp(1, 1), true),
+            ("gone", stamp(1, 1), true),
+            ("skipped-gone", stamp(1, 1), false),
+            ("untouched", stamp(1, 1), true),
+        ]);
+        let changes = [
+            Change::Upsert("same".into(), stamp(1, 1)),
+            Change::Upsert("changed".into(), stamp(2, 1)),
+            Change::Upsert("new".into(), stamp(1, 1)),
+            Change::Remove("gone".into()),
+            Change::Remove("skipped-gone".into()),
+            Change::Remove("never-seen".into()),
+        ];
+        assert_eq!(
+            plan(&old, Seen::Changes(&changes)),
+            Plan {
+                to_read: vec![("changed".into(), stamp(2, 1)), ("new".into(), stamp(1, 1))],
+                to_remove: keys(&["gone"]),
+                to_forget: keys(&["skipped-gone"]),
             }
         );
     }
@@ -641,7 +809,7 @@ mod tests {
         run(&workspace, "fp");
         let text = fs::read_to_string(workspace.files().manifest).unwrap();
         let parsed = parse_manifest(&text).unwrap();
-        assert_eq!(parsed.root, workspace.0.to_string_lossy());
+        assert_eq!(parsed.header.root, workspace.0.to_string_lossy());
     }
 
     fn stem_of(workspace: &Workspace, dir: &Path) -> String {
@@ -680,7 +848,7 @@ mod tests {
                 .collect();
             fs::write(
                 dir.join(format!("{name}.manifest")),
-                serialize("fp", Path::new(root), &manifest),
+                serialize(&header(root, None), &manifest),
             )
             .unwrap();
         }
@@ -846,6 +1014,59 @@ mod tests {
         assert!(!rebuilt.reused);
         assert_eq!(found(&index, "alpha"), ["a.md"]);
         assert!(run_in(&workspace, &dir, "fp").1.reused);
+    }
+
+    #[test]
+    fn a_lux_replaced_after_its_manifest_was_written_means_a_cold_start() {
+        let workspace = Workspace::new("torn");
+        workspace.write("a.md", b"alpha");
+        let (index, _) = run(&workspace, "fp");
+        index.save(&workspace.files().index).unwrap();
+
+        let (index, rebuilt) = run(&workspace, "fp");
+        assert!(!rebuilt.reused);
+        assert_eq!(found(&index, "alpha"), ["a.md"]);
+        assert!(run(&workspace, "fp").1.reused);
+    }
+
+    #[test]
+    fn a_vanished_unindexed_file_leaves_the_saved_manifest() {
+        let workspace = Workspace::new("forget");
+        workspace.write("a.md", b"alpha");
+        workspace.write("c.txt", &[0xff, 0xfe, 0x00, 0x9f]);
+        run(&workspace, "fp");
+        fs::remove_file(workspace.src().join("c.txt")).unwrap();
+
+        let (_, summary) = run(&workspace, "fp");
+        assert!(summary.saved);
+        let text = fs::read_to_string(workspace.files().manifest).unwrap();
+        let saved: Vec<String> = parse_manifest(&text)
+            .unwrap()
+            .manifest
+            .into_keys()
+            .collect();
+        assert_eq!(saved, ["a.md"]);
+    }
+
+    #[test]
+    fn a_saved_cursor_comes_back_with_its_index() {
+        let workspace = Workspace::new("cursor");
+        workspace.write("a.md", b"alpha");
+        let (index, _) = run(&workspace, "fp");
+        let files = workspace.files();
+        let cursor = Cursor {
+            epoch: Epoch(7),
+            generation: Gen(3),
+        };
+        let manifest = cached(&[("a.md", stamp(5, 1), true)]);
+        save(&index, &files, "fp", Some(cursor), &manifest).unwrap();
+
+        let mut restored = LuxIndex::load(&lux::library_path()).unwrap();
+        let loaded = load(&mut restored, &files, "fp").unwrap();
+        assert_eq!(loaded.cursor, Some(cursor));
+        assert_eq!(loaded.manifest, manifest);
+        assert_eq!(found(&restored, "alpha"), ["a.md"]);
+        assert!(load(&mut restored, &files, "other library").is_none());
     }
 
     #[test]

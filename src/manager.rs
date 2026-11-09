@@ -415,7 +415,16 @@ mod tests {
                     })
                     .collect();
                 let path = self.0.join(format!("{name}.manifest"));
-                fs::write(&path, cache::serialize("fp", Path::new(root), &manifest)).unwrap();
+                let header = cache::Header {
+                    fingerprint: "fp".into(),
+                    root: root.into(),
+                    index: cache::Stamp {
+                        size: lux_bytes,
+                        modified: 1,
+                    },
+                    cursor: None,
+                };
+                fs::write(&path, cache::serialize(&header, &manifest)).unwrap();
                 touched.push(path);
             }
             let long_ago = SystemTime::now() - Duration::from_secs(age);
