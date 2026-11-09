@@ -32,8 +32,12 @@ use crate::{
     watch::Link,
 };
 
+#[cfg(all(windows, test))]
+pub(crate) use pipe::stalled_subscriber;
 #[cfg(windows)]
-pub(crate) use pipe::{Listener, Peer, PipeName, Stop, Writer, build_id, connect_to, listen, ping, status, stop};
+pub(crate) use pipe::{
+    Peer, PipeName, Stop, Writer, build_id, connect_to, listen, ping, status, stop,
+};
 
 #[derive(Debug)]
 pub enum ConnectError {
@@ -52,7 +56,9 @@ impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConnectError::Absent => write!(f, "no daemon is running"),
-            ConnectError::OtherBuild { daemon } => write!(f, "the daemon runs another build ({daemon})"),
+            ConnectError::OtherBuild { daemon } => {
+                write!(f, "the daemon runs another build ({daemon})")
+            }
             ConnectError::Unsupported => write!(f, "this platform has no daemon"),
             ConnectError::Io(error) => write!(f, "daemon pipe: {error}"),
         }
@@ -126,7 +132,10 @@ enum ToClient {
 }
 
 fn bad(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("malformed pipe message: {what}"))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("malformed pipe message: {what}"),
+    )
 }
 
 fn encode_request(message: &ToDaemon) -> io::Result<String> {
@@ -134,12 +143,15 @@ fn encode_request(message: &ToDaemon) -> io::Result<String> {
         ToDaemon::Hello { proto, build } => format!("HELLO\t{proto}\t{}\n", clean(build)),
         ToDaemon::Request(Request::Subscribe { root, have }) => {
             let (epoch, generation) = match have {
-                Some(cursor) => (format!("{:016x}", cursor.epoch.0), cursor.generation.0.to_string()),
+                Some(cursor) => (
+                    format!("{:016x}", cursor.epoch.0),
+                    cursor.generation.0.to_string(),
+                ),
                 None => ("-".to_owned(), "-".to_owned()),
             };
-            let root = root
-                .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the project root is not UTF-8"))?;
+            let root = root.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "the project root is not UTF-8")
+            })?;
             format!("SUBSCRIBE\t{}\t{epoch}\t{generation}\n", hex(root))
         }
         ToDaemon::Request(Request::Rescan) => "RESCAN\n".to_owned(),
@@ -183,10 +195,19 @@ fn decode_request(line: &str) -> io::Result<ToDaemon> {
 
 fn encode_reply(message: &ToClient) -> String {
     match message {
-        ToClient::Welcome { proto, daemon } => format!("WELCOME\t{proto}\t{}\t{}\n", clean(&daemon.build), daemon.pid),
+        ToClient::Welcome { proto, daemon } => format!(
+            "WELCOME\t{proto}\t{}\t{}\n",
+            clean(&daemon.build),
+            daemon.pid
+        ),
         ToClient::Update(Update::Scanning { found }) => format!("SCANNING\t{found}\n"),
         ToClient::Update(Update::Snapshot { at, files }) => {
-            let mut text = format!("SNAPSHOT\t{:016x}\t{}\t{}\n", at.epoch.0, at.generation.0, files.len());
+            let mut text = format!(
+                "SNAPSHOT\t{:016x}\t{}\t{}\n",
+                at.epoch.0,
+                at.generation.0,
+                files.len()
+            );
             for (key, stamp) in files {
                 text.push_str(&format!("F\t{}\t{}\t{key}\n", stamp.size, stamp.modified));
             }
@@ -202,7 +223,9 @@ fn encode_reply(message: &ToClient) -> String {
             );
             for change in changes {
                 text.push_str(&match change {
-                    Change::Upsert(key, stamp) => format!("U\t{}\t{}\t{key}\n", stamp.size, stamp.modified),
+                    Change::Upsert(key, stamp) => {
+                        format!("U\t{}\t{}\t{key}\n", stamp.size, stamp.modified)
+                    }
                     Change::Remove(key) => format!("R\t{key}\n"),
                 });
             }
@@ -231,7 +254,10 @@ fn encode_reply(message: &ToClient) -> String {
 }
 
 /// Decodes one reply. `more` yields the lines after `header`, `None` at the end of the stream.
-fn decode_reply(header: &str, more: &mut dyn FnMut() -> io::Result<Option<String>>) -> io::Result<ToClient> {
+fn decode_reply(
+    header: &str,
+    more: &mut dyn FnMut() -> io::Result<Option<String>>,
+) -> io::Result<ToClient> {
     let mut body = || more()?.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof));
     let update = match split_tag(header) {
         ("WELCOME", Some(rest)) => {
@@ -246,7 +272,9 @@ fn decode_reply(header: &str, more: &mut dyn FnMut() -> io::Result<Option<String
         }
         ("SCANNING", Some(rest)) => {
             let [found] = fields(rest)?;
-            Update::Scanning { found: number(found)? }
+            Update::Scanning {
+                found: number(found)?,
+            }
         }
         ("SNAPSHOT", Some(rest)) => {
             let [epoch, generation, count] = fields(rest)?;
@@ -298,7 +326,9 @@ fn decode_reply(header: &str, more: &mut dyn FnMut() -> io::Result<Option<String
             }
             Update::Delta { from, at, changes }
         }
-        ("MANUAL", Some(reason)) => Update::Manual { reason: text(reason)? },
+        ("MANUAL", Some(reason)) => Update::Manual {
+            reason: text(reason)?,
+        },
         ("GONE", None) => Update::Gone,
         ("ERR", Some(message)) => return Ok(ToClient::Err(text(message)?)),
         ("STATUS-REPLY", Some(rest)) => {
@@ -434,7 +464,9 @@ fn read_line(reader: &mut impl io::BufRead) -> io::Result<Option<String>> {
             io::ErrorKind::UnexpectedEof.into()
         });
     }
-    String::from_utf8(line).map(Some).map_err(|_| bad("not UTF-8"))
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|_| bad("not UTF-8"))
 }
 
 fn read_reply(reader: &mut impl io::BufRead) -> io::Result<Option<ToClient>> {
@@ -468,37 +500,39 @@ mod pipe {
 
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
-            ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-            INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+            CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
+            ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ,
+            GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
         },
         Security::{
-            ACL, ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid, GetLengthSid, GetTokenInformation,
-            InitializeAcl, InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-            SECURITY_MAX_SID_SIZE, SetSecurityDescriptorDacl, TOKEN_QUERY,
-            TOKEN_USER, TokenUser, WinLocalSystemSid,
+            ACL, ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid, GetLengthSid,
+            GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, PSID,
+            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE,
+            SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
         },
         Storage::FileSystem::{
-            CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-            PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
+            CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+            OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION,
+            SECURITY_SQOS_PRESENT, WriteFile,
         },
         System::{
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
-                PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-                PIPE_WAIT, WaitNamedPipeW,
+                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
+                GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
             },
             Threading::{
                 CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken,
-                PROCESS_QUERY_LIMITED_INFORMATION, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+                PROCESS_QUERY_LIMITED_INFORMATION, SetEvent, WaitForMultipleObjects,
+                WaitForSingleObject,
             },
         },
     };
 
     use super::{
-        ConnectError, Daemon, PROTO, ProjectStatus, Request, ToClient, ToDaemon, bad, decode_request,
-        encode_reply, encode_request, fnv1a, read_line, read_reply,
+        ConnectError, Daemon, PROTO, ProjectStatus, Request, ToClient, ToDaemon, bad,
+        decode_request, encode_reply, encode_request, fnv1a, read_line, read_reply,
     };
     use crate::{
         cache::Stamp,
@@ -591,7 +625,11 @@ mod pipe {
         }
 
         /// Runs one overlapped operation to completion or until `timeout`.
-        fn overlapped(&self, timeout: Option<Duration>, start: impl FnOnce(*mut OVERLAPPED) -> i32) -> io::Result<u32> {
+        fn overlapped(
+            &self,
+            timeout: Option<Duration>,
+            start: impl FnOnce(*mut OVERLAPPED) -> i32,
+        ) -> io::Result<u32> {
             let event = Event::new()?;
             let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
             overlapped.hEvent = event.raw();
@@ -619,7 +657,13 @@ mod pipe {
         fn read(&self, buffer: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
             let len = buffer.len().min(u32::MAX as usize) as u32;
             let read = self.overlapped(timeout, |overlapped| unsafe {
-                ReadFile(self.raw(), buffer.as_mut_ptr(), len, ptr::null_mut(), overlapped)
+                ReadFile(
+                    self.raw(),
+                    buffer.as_mut_ptr(),
+                    len,
+                    ptr::null_mut(),
+                    overlapped,
+                )
             });
             match read {
                 Ok(read) => Ok(read as usize),
@@ -700,13 +744,18 @@ mod pipe {
             let mut len = 0;
             unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut len) };
             let mut info = vec![0u64; (len as usize).div_ceil(8)];
-            if unsafe { GetTokenInformation(token.0, TokenUser, info.as_mut_ptr().cast(), len, &mut len) } == 0 {
+            if unsafe {
+                GetTokenInformation(token.0, TokenUser, info.as_mut_ptr().cast(), len, &mut len)
+            } == 0
+            {
                 return Err(io::Error::last_os_error());
             }
             let sid = unsafe { (*info.as_ptr().cast::<TOKEN_USER>()).User.Sid };
             let sid_len = unsafe { GetLengthSid(sid) } as usize;
             let mut copy = vec![0u64; sid_len.div_ceil(8)];
-            unsafe { ptr::copy_nonoverlapping(sid.cast::<u8>(), copy.as_mut_ptr().cast::<u8>(), sid_len) };
+            unsafe {
+                ptr::copy_nonoverlapping(sid.cast::<u8>(), copy.as_mut_ptr().cast::<u8>(), sid_len)
+            };
             Ok(Sid(copy))
         }
 
@@ -714,7 +763,12 @@ mod pipe {
             let mut sid = Sid(vec![0u64; (SECURITY_MAX_SID_SIZE as usize).div_ceil(8)]);
             let mut len = SECURITY_MAX_SID_SIZE;
             let made = unsafe {
-                CreateWellKnownSid(WinLocalSystemSid, ptr::null_mut(), sid.0.as_mut_ptr().cast(), &mut len)
+                CreateWellKnownSid(
+                    WinLocalSystemSid,
+                    ptr::null_mut(),
+                    sid.0.as_mut_ptr().cast(),
+                    &mut len,
+                )
             };
             if made == 0 {
                 return Err(io::Error::last_os_error());
@@ -765,7 +819,10 @@ mod pipe {
             let stamp = env::current_exe()
                 .and_then(fs::metadata)
                 .map(|metadata| Stamp::of(&metadata))
-                .unwrap_or(Stamp { size: 0, modified: 0 });
+                .unwrap_or(Stamp {
+                    size: 0,
+                    modified: 0,
+                });
             let mut bytes = stamp.size.to_le_bytes().to_vec();
             bytes.extend(stamp.modified.to_le_bytes());
             format!("{}-{:016x}", env!("CARGO_PKG_VERSION"), fnv1a(&bytes))
@@ -794,7 +851,11 @@ mod pipe {
             lpSecurityDescriptor: descriptor_ptr,
             bInheritHandle: 0,
         };
-        let first = if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
+        let first = if first {
+            FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            0
+        };
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
@@ -851,7 +912,8 @@ mod pipe {
                         ERROR_PIPE_CONNECTED => true,
                         ERROR_IO_PENDING => {
                             let handles = [event.raw(), stop.0.raw()];
-                            let woke = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+                            let woke =
+                                unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
                             let mut done = 0;
                             if woke != WAIT_OBJECT_0 {
                                 unsafe {
@@ -861,7 +923,9 @@ mod pipe {
                                 self.waiting = Some(pipe);
                                 return Ok(None);
                             }
-                            unsafe { GetOverlappedResult(pipe.raw(), &overlapped, &mut done, 1) != 0 }
+                            unsafe {
+                                GetOverlappedResult(pipe.raw(), &overlapped, &mut done, 1) != 0
+                            }
                         }
                         error => return Err(io::Error::from_raw_os_error(error as i32)),
                     }
@@ -930,15 +994,19 @@ mod pipe {
 
     impl Writer {
         pub(crate) fn update(&self, update: &Update) -> io::Result<()> {
-            self.0.send(&encode_reply(&ToClient::Update(update.clone())))
+            self.0
+                .send(&encode_reply(&ToClient::Update(update.clone())))
         }
 
         pub(crate) fn status(&self, projects: &[ProjectStatus]) -> io::Result<()> {
-            self.0.send(&encode_reply(&ToClient::Status(projects.to_vec())))
+            self.0
+                .send(&encode_reply(&ToClient::Status(projects.to_vec())))
         }
 
         pub(crate) fn error(&self, message: &str) {
-            let _ = self.0.send(&encode_reply(&ToClient::Err(message.to_owned())));
+            let _ = self
+                .0
+                .send(&encode_reply(&ToClient::Err(message.to_owned())));
         }
 
         /// Ends the connection. Pending reads and writes on it fail at once.
@@ -1011,7 +1079,8 @@ mod pipe {
 
     impl Conversation {
         fn ask(&self, request: Request) -> io::Result<()> {
-            self.pipe.send(&encode_request(&ToDaemon::Request(request))?)
+            self.pipe
+                .send(&encode_request(&ToDaemon::Request(request))?)
         }
     }
 
@@ -1023,8 +1092,17 @@ mod pipe {
         })?)?;
         let mut lines = reader(&pipe, Some(HANDSHAKE_TIMEOUT));
         match read_reply(&mut lines)? {
-            Some(ToClient::Welcome { proto: PROTO, daemon }) => Ok(Conversation { pipe, lines, daemon }),
-            Some(ToClient::Welcome { daemon, .. }) => Err(ConnectError::OtherBuild { daemon: daemon.build }),
+            Some(ToClient::Welcome {
+                proto: PROTO,
+                daemon,
+            }) => Ok(Conversation {
+                pipe,
+                lines,
+                daemon,
+            }),
+            Some(ToClient::Welcome { daemon, .. }) => Err(ConnectError::OtherBuild {
+                daemon: daemon.build,
+            }),
             Some(_) => Err(ConnectError::Io(bad("expected WELCOME"))),
             None => Err(ConnectError::Absent),
         }
@@ -1050,7 +1128,9 @@ mod pipe {
         }
         conversation.pipe.send(&subscribe)?;
         conversation.lines.get_mut().timeout = None;
-        let Conversation { pipe, mut lines, .. } = conversation;
+        let Conversation {
+            pipe, mut lines, ..
+        } = conversation;
 
         let (update_tx, update_rx) = mpsc::channel();
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -1110,6 +1190,33 @@ mod pipe {
         while let Ok(Some(_)) = read_reply(&mut conversation.lines) {}
         Ok(conversation.daemon)
     }
+
+    /// A client that subscribes and then never reads, for stall tests.
+    #[cfg(test)]
+    pub(crate) fn stalled_subscriber(
+        name: &PipeName,
+        build: &str,
+        root: &Path,
+    ) -> io::Result<fs::File> {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name.0)?;
+        for message in [
+            ToDaemon::Hello {
+                proto: PROTO,
+                build: build.to_owned(),
+            },
+            ToDaemon::Request(Request::Subscribe {
+                root: root.to_owned(),
+                have: None,
+            }),
+        ] {
+            file.write_all(encode_request(&message)?.as_bytes())?;
+        }
+        Ok(file)
+    }
 }
 
 #[cfg(test)]
@@ -1149,8 +1256,16 @@ mod tests {
         let encoded = encode_reply(&message);
         let mut more = lines_of(&encoded);
         let header = more().unwrap().unwrap();
-        assert_eq!(decode_reply(&header, &mut more).unwrap(), message, "{encoded:?}");
-        assert_eq!(more().unwrap(), None, "a reply consumes exactly its own lines");
+        assert_eq!(
+            decode_reply(&header, &mut more).unwrap(),
+            message,
+            "{encoded:?}"
+        );
+        assert_eq!(
+            more().unwrap(),
+            None,
+            "a reply consumes exactly its own lines"
+        );
     }
 
     #[test]
@@ -1160,7 +1275,10 @@ mod tests {
                 proto: PROTO,
                 build: "0.1.0-00ff00ff00ff00ff".to_owned(),
             },
-            ToDaemon::Request(Request::Subscribe { root: root(), have: None }),
+            ToDaemon::Request(Request::Subscribe {
+                root: root(),
+                have: None,
+            }),
             ToDaemon::Request(Request::Subscribe {
                 root: root(),
                 have: Some(cursor()),
@@ -1249,14 +1367,19 @@ mod tests {
         #[cfg(windows)]
         let root = {
             use std::os::windows::ffi::OsStringExt;
-            PathBuf::from(std::ffi::OsString::from_wide(&[b'C'.into(), b':'.into(), 0xD800]))
+            PathBuf::from(std::ffi::OsString::from_wide(&[
+                b'C'.into(),
+                b':'.into(),
+                0xD800,
+            ]))
         };
         #[cfg(unix)]
         let root = {
             use std::os::unix::ffi::OsStringExt;
             PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]))
         };
-        let error = encode_request(&ToDaemon::Request(Request::Subscribe { root, have: None })).unwrap_err();
+        let error = encode_request(&ToDaemon::Request(Request::Subscribe { root, have: None }))
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
