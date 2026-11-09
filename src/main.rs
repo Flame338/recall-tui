@@ -22,8 +22,10 @@ mod flow;
 mod lux;
 mod manager;
 mod scan;
+#[allow(dead_code)] // Parts serve the live watcher, which main does not run yet.
+mod truth;
 
-use cache::{Scanned, Summary};
+use cache::{Stamp, Summary};
 use flow::Screen;
 use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
 use manager::{IndexManager, Outcome};
@@ -508,6 +510,7 @@ fn index_repository(
         index,
         files.as_ref(),
         &fingerprint,
+        root,
         &scanned,
         |completed, total, current| {
             if last_draw.elapsed() < Duration::from_millis(60) {
@@ -526,9 +529,9 @@ fn index_repository(
 fn scan_files(
     terminal: &mut RecallTerminal,
     root: &Path,
-) -> Result<Option<BTreeMap<String, Scanned>>, Box<dyn Error>> {
+) -> Result<Option<BTreeMap<String, Stamp>>, Box<dyn Error>> {
     let mut last_draw = Instant::now() - Duration::from_secs(1);
-    scan::walk_project(root, |found, latest| {
+    let observed = scan::walk(root, &truth::Scope::ROOT, |found, latest| {
         if last_draw.elapsed() < Duration::from_millis(60) {
             return Ok(true);
         }
@@ -538,7 +541,8 @@ fn scan_files(
         terminal.draw(|frame| draw_scanning(frame, root, found, latest))?;
         last_draw = Instant::now();
         Ok(true)
-    })
+    })?;
+    Ok(observed.map(|observed| observed.found))
 }
 
 fn cancel_requested() -> Result<bool, Box<dyn Error>> {

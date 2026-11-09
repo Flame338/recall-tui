@@ -41,25 +41,16 @@ pub struct Entry {
 
 pub type Manifest = BTreeMap<String, Entry>;
 
-pub struct Scanned {
-    pub path: PathBuf,
-    pub stamp: Stamp,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
     pub to_read: Vec<String>,
     pub to_remove: Vec<String>,
 }
 
-pub fn plan(cached: &Manifest, scanned: &BTreeMap<String, Scanned>) -> Plan {
+pub fn plan(cached: &Manifest, scanned: &BTreeMap<String, Stamp>) -> Plan {
     let to_read = scanned
         .iter()
-        .filter(|(key, file)| {
-            cached
-                .get(*key)
-                .is_none_or(|entry| entry.stamp != file.stamp)
-        })
+        .filter(|(key, stamp)| cached.get(*key).is_none_or(|entry| entry.stamp != **stamp))
         .map(|(key, _)| key.clone())
         .collect();
     let to_remove = cached
@@ -329,7 +320,8 @@ pub fn sync(
     index: &mut LuxIndex,
     files: Option<&CacheFiles>,
     fingerprint: &str,
-    scanned: &BTreeMap<String, Scanned>,
+    root: &Path,
+    scanned: &BTreeMap<String, Stamp>,
     mut progress: impl FnMut(usize, usize, &str) -> Result<bool, Box<dyn Error>>,
 ) -> Result<Option<Summary>, Box<dyn Error>> {
     let cached = files.and_then(|files| load(index, files, fingerprint));
@@ -346,11 +338,11 @@ pub fn sync(
         if !progress(position, total, key)? {
             return Ok(None);
         }
-        let file = &scanned[key];
+        let path = root.join(key);
         let was_indexed = manifest.get(key).is_some_and(|entry| entry.indexed);
-        let indexed = match fs::read_to_string(&file.path) {
+        let indexed = match fs::read_to_string(&path) {
             Ok(body) => {
-                let title = file.path.file_name().unwrap_or_default().to_string_lossy();
+                let title = path.file_name().unwrap_or_default().to_string_lossy();
                 index.add(key, &title, &body)?;
                 true
             }
@@ -364,7 +356,7 @@ pub fn sync(
         manifest.insert(
             key.clone(),
             Entry {
-                stamp: file.stamp,
+                stamp: scanned[key],
                 indexed,
             },
         );
@@ -434,18 +426,10 @@ mod tests {
         Stamp { size, modified }
     }
 
-    fn scanned(entries: &[(&str, Stamp)]) -> BTreeMap<String, Scanned> {
+    fn scanned(entries: &[(&str, Stamp)]) -> BTreeMap<String, Stamp> {
         entries
             .iter()
-            .map(|(key, stamp)| {
-                (
-                    (*key).to_owned(),
-                    Scanned {
-                        path: PathBuf::from(key),
-                        stamp: *stamp,
-                    },
-                )
-            })
+            .map(|(key, stamp)| ((*key).to_owned(), *stamp))
             .collect()
     }
 
@@ -546,20 +530,17 @@ mod tests {
             fs::write(self.0.join("src").join(name), bytes).unwrap();
         }
 
-        fn scan(&self) -> BTreeMap<String, Scanned> {
-            fs::read_dir(self.0.join("src"))
+        fn src(&self) -> PathBuf {
+            self.0.join("src")
+        }
+
+        fn scan(&self) -> BTreeMap<String, Stamp> {
+            fs::read_dir(self.src())
                 .unwrap()
                 .map(|entry| {
                     let entry = entry.unwrap();
                     let key = entry.file_name().to_string_lossy().into_owned();
-                    let stamp = Stamp::of(&entry.metadata().unwrap());
-                    (
-                        key,
-                        Scanned {
-                            path: entry.path(),
-                            stamp,
-                        },
-                    )
+                    (key, Stamp::of(&entry.metadata().unwrap()))
                 })
                 .collect()
         }
@@ -586,6 +567,7 @@ mod tests {
             &mut index,
             Some(&files),
             fingerprint,
+            &workspace.src(),
             &workspace.scan(),
             |_, _, _| Ok(true),
         )
@@ -876,6 +858,7 @@ mod tests {
             &mut index,
             Some(&files),
             "fp",
+            &workspace.src(),
             &workspace.scan(),
             |_, _, _| Ok(false),
         )
