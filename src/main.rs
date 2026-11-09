@@ -23,6 +23,7 @@ mod manager;
 
 use cache::{Scanned, Stamp, Summary};
 use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
+use manager::{IndexManager, Outcome};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -49,6 +50,7 @@ struct App {
     root: PathBuf,
     status: String,
     show_help: bool,
+    manager: Option<IndexManager>,
     preview_for: Option<(String, String)>,
     preview: Vec<Line<'static>>,
 }
@@ -103,6 +105,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         root,
         status: format!("{} · F1 help", describe_startup(&summary)),
         show_help: false,
+        manager: None,
         preview_for: None,
         preview: Vec::new(),
     };
@@ -143,6 +146,7 @@ fn choose_root(start: PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
         status: "Choose a folder to index".into(),
     };
     picker.refresh();
+    let mut manager: Option<IndexManager> = None;
 
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
@@ -152,13 +156,26 @@ fn choose_root(start: PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     loop {
-        terminal.draw(|frame| draw_directory_picker(frame, &picker))?;
+        terminal.draw(|frame| {
+            draw_directory_picker(frame, &picker);
+            draw_manager(frame, manager.as_ref());
+        })?;
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('q' | 'Q'))
                 {
                     return Ok(None);
+                }
+                if let Some(open) = manager.as_mut() {
+                    if open.handle_key(key) == Outcome::Close {
+                        manager = None;
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::F(2) {
+                    manager = Some(IndexManager::open(cache::default_dir(), None));
+                    continue;
                 }
                 if let Some(path_input) = picker.path_input.as_mut() {
                     match key.code {
@@ -226,7 +243,7 @@ fn choose_root(start: PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
                     _ => {}
                 }
             }
-            Event::Mouse(mouse) => match mouse.kind {
+            Event::Mouse(mouse) if manager.is_none() => match mouse.kind {
                 MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(3),
                 MouseEventKind::ScrollDown => {
                     picker.selected =
@@ -375,7 +392,7 @@ fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
-                "↑/↓ browse  Enter open  .. / Backspace up  S index here  P type path  Esc quit",
+                "↑/↓ browse  Enter open  .. / Backspace up  S index here  P type path  F2 indexes  Esc quit",
                 Style::default().fg(Color::DarkGray),
             )),
         ]),
@@ -632,6 +649,20 @@ fn event_loop(
                 {
                     break;
                 }
+                if let Some(open) = app.manager.as_mut() {
+                    if open.handle_key(key) == Outcome::Close {
+                        app.manager = None;
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::F(2) {
+                    app.show_help = false;
+                    app.manager = Some(IndexManager::open(
+                        cache::default_dir(),
+                        Some(app.root.clone()),
+                    ));
+                    continue;
+                }
                 if key.code == KeyCode::F(1) {
                     app.show_help = !app.show_help;
                     continue;
@@ -681,6 +712,7 @@ fn event_loop(
                     _ => {}
                 }
             }
+            Event::Mouse(_) if app.manager.is_some() => {}
             Event::Mouse(mouse) if !app.hits.is_empty() => match mouse.kind {
                 MouseEventKind::ScrollUp => app.selected = app.selected.saturating_sub(3),
                 MouseEventKind::ScrollDown => {
@@ -901,14 +933,14 @@ fn draw(frame: &mut Frame, app: &App) {
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
-                "↑/↓ move  PgUp/PgDn jump  Enter open  Esc clear  Ctrl-W erase word  F1 help  Ctrl-Q quit",
+                "↑/↓ move  PgUp/PgDn jump  Enter open  Esc clear  Ctrl-W erase word  F1 help  F2 indexes  Ctrl-Q quit",
                 Style::default().fg(Color::DarkGray),
             )),
         ])
     };
     frame.render_widget(footer, sections[2]);
     if app.show_help {
-        let area = centered_rect(80, 62, frame.area());
+        let area = centered_rect(80, 70, frame.area());
         frame.render_widget(Clear, area);
         let help = Paragraph::new(vec![
             Line::from(Span::styled(
@@ -927,6 +959,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Line::from("Enter      Open selected file"),
             Line::from("Esc        Clear search"),
             Line::from("Ctrl-W     Delete last word    Ctrl-U clear all"),
+            Line::from("F2         Saved indexes: see and delete them"),
             Line::from("F1         Close this panel    Ctrl-Q quit"),
         ])
         .wrap(Wrap { trim: true })
@@ -937,6 +970,13 @@ fn draw(frame: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(Color::Cyan)),
         );
         frame.render_widget(help, area);
+    }
+    draw_manager(frame, app.manager.as_ref());
+}
+
+fn draw_manager(frame: &mut Frame, manager: Option<&IndexManager>) {
+    if let Some(manager) = manager {
+        manager.draw(frame, centered_rect(80, 70, frame.area()));
     }
 }
 
