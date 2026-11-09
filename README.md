@@ -38,6 +38,6 @@ Type words, a phrase, or a code symbol. Results update as you type. Use the arro
 - `F1`: show key help
 - `Ctrl-Q`: quit
 
-Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. The index is rebuilt at startup; the C API does not expose LuxCore persistence yet.
+Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. Recall saves the index and a file manifest under `%LOCALAPPDATA%Recall` (or `~/.cache/recall`), one pair per folder. At the next launch it loads the saved index and re-reads only the files whose size or modification time changed, and drops deleted ones. A different LuxCore library file or a change to the scan rules rebuilds the index from scratch. Delete that folder to force a full rebuild.
 
 While scanning, Recall counts the files it finds. During indexing it shows a progress bar, the completed file count, and the file currently being read. Press `Esc` or `Ctrl-Q` in either phase to cancel and quit. The scanner indexes common source and text formats, including C/C++, Rust, Python, JavaScript/TypeScript, Markdown, JSON, TOML, YAML, HTML, and SQL. It skips hidden folders (such as `.git` and `.claude`), build output, package directories, and files over 512 KiB. Binary or non-UTF-8 files are skipped.

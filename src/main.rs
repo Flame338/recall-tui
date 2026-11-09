@@ -1,12 +1,11 @@
 use std::{
+    collections::BTreeMap,
     env,
     error::Error,
-    ffi::{c_char, c_void},
     fs,
     io::{self, stdout},
     path::{Path, PathBuf},
     process::Command,
-    ptr,
     time::{Duration, Instant},
 };
 
@@ -18,7 +17,11 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use libloading::Library;
+mod cache;
+mod lux;
+
+use cache::{Scanned, Stamp, Summary};
+use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -36,260 +39,6 @@ const INDEX_EXTENSIONS: &[&str] = &[
 ];
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_RESULTS: usize = 40;
-const DEFAULT_LIBRARY: &str = r"F:\LuxCore\build\debug\libluxcore.dll";
-const MARK_START: char = '\u{E000}';
-const MARK_END: char = '\u{E001}';
-
-// These signatures mirror the stable, flat C API in luxcore_c.h.
-type IndexCreate = unsafe extern "C" fn(*mut *mut c_void) -> i32;
-type IndexFree = unsafe extern "C" fn(*mut c_void);
-type IndexAdd = unsafe extern "C" fn(
-    *mut c_void,
-    *const c_char,
-    usize,
-    *const c_char,
-    usize,
-    *const c_char,
-    usize,
-) -> i32;
-type IndexSearch =
-    unsafe extern "C" fn(*const c_void, *const c_char, usize, usize, *mut *mut c_void) -> i32;
-type IndexStored = unsafe extern "C" fn(
-    *const c_void,
-    *const c_char,
-    usize,
-    *const c_char,
-    usize,
-    *mut *mut c_void,
-) -> i32;
-#[repr(C)]
-struct SnippetOptions {
-    length: usize,
-    start_marker: *const c_char,
-    start_marker_length: usize,
-    end_marker: *const c_char,
-    end_marker_length: usize,
-    ellipsis: *const c_char,
-    ellipsis_length: usize,
-}
-type IndexSnippet = unsafe extern "C" fn(
-    *const c_void,
-    *const c_char,
-    usize,
-    *const c_char,
-    usize,
-    *const c_char,
-    usize,
-    *const SnippetOptions,
-    *mut *mut c_void,
-) -> i32;
-type HitsCount = unsafe extern "C" fn(*const c_void) -> usize;
-type HitsKey = unsafe extern "C" fn(*const c_void, usize, *mut usize) -> *const c_char;
-type HitsScore = unsafe extern "C" fn(*const c_void, usize) -> f64;
-type HitsFree = unsafe extern "C" fn(*mut c_void);
-type TextData = unsafe extern "C" fn(*const c_void) -> *const c_char;
-type TextLength = unsafe extern "C" fn(*const c_void) -> usize;
-type TextFree = unsafe extern "C" fn(*mut c_void);
-
-struct LuxFns {
-    create: IndexCreate,
-    free: IndexFree,
-    add: IndexAdd,
-    search: IndexSearch,
-    stored: IndexStored,
-    snippet: IndexSnippet,
-    hits_count: HitsCount,
-    hits_key: HitsKey,
-    hits_score: HitsScore,
-    hits_free: HitsFree,
-    text_data: TextData,
-    text_length: TextLength,
-    text_free: TextFree,
-}
-
-struct LuxIndex {
-    raw: *mut c_void,
-    _library: Library,
-    fns: LuxFns,
-}
-
-impl LuxIndex {
-    fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
-        // The library is retained for the lifetime of every function pointer and index handle.
-        let library = unsafe { Library::new(path)? };
-        let fns = unsafe {
-            LuxFns {
-                create: *library.get(b"lux_index_create\0")?,
-                free: *library.get(b"lux_index_free\0")?,
-                add: *library.get(b"lux_index_add\0")?,
-                search: *library.get(b"lux_index_search\0")?,
-                stored: *library.get(b"lux_index_stored\0")?,
-                snippet: *library.get(b"lux_index_snippet\0")?,
-                hits_count: *library.get(b"lux_hits_count\0")?,
-                hits_key: *library.get(b"lux_hits_key\0")?,
-                hits_score: *library.get(b"lux_hits_score\0")?,
-                hits_free: *library.get(b"lux_hits_free\0")?,
-                text_data: *library.get(b"lux_text_data\0")?,
-                text_length: *library.get(b"lux_text_length\0")?,
-                text_free: *library.get(b"lux_text_free\0")?,
-            }
-        };
-        let mut raw = ptr::null_mut();
-        let status = unsafe { (fns.create)(&mut raw) };
-        check_status(status, "creating the LuxCore index")?;
-        if raw.is_null() {
-            return Err("LuxCore returned a null index".into());
-        }
-        Ok(Self {
-            raw,
-            _library: library,
-            fns,
-        })
-    }
-
-    fn add(&mut self, key: &str, title: &str, body: &str) -> Result<(), Box<dyn Error>> {
-        let status = unsafe {
-            (self.fns.add)(
-                self.raw,
-                key.as_ptr().cast(),
-                key.len(),
-                title.as_ptr().cast(),
-                title.len(),
-                body.as_ptr().cast(),
-                body.len(),
-            )
-        };
-        check_status(status, "adding a file")
-    }
-
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>, Box<dyn Error>> {
-        let mut hits = ptr::null_mut();
-        let status = unsafe {
-            (self.fns.search)(
-                self.raw,
-                query.as_ptr().cast(),
-                query.len(),
-                limit,
-                &mut hits,
-            )
-        };
-        check_status(status, "searching")?;
-        if hits.is_null() {
-            return Err("LuxCore returned a null result handle".into());
-        }
-        let count = unsafe { (self.fns.hits_count)(hits) };
-        let mut result = Vec::with_capacity(count);
-        for position in 0..count {
-            let mut key_len = 0;
-            let key = unsafe { (self.fns.hits_key)(hits, position, &mut key_len) };
-            if key.is_null() {
-                unsafe { (self.fns.hits_free)(hits) };
-                return Err("LuxCore returned a null result key".into());
-            }
-            let key = unsafe { std::slice::from_raw_parts(key.cast::<u8>(), key_len) };
-            let key = String::from_utf8_lossy(key).into_owned();
-            let score = unsafe { (self.fns.hits_score)(hits, position) };
-            result.push(Hit { key, score });
-        }
-        unsafe { (self.fns.hits_free)(hits) };
-        Ok(result)
-    }
-
-    fn stored(&self, key: &str, field: &str) -> Result<String, Box<dyn Error>> {
-        let mut text = ptr::null_mut();
-        let status = unsafe {
-            (self.fns.stored)(
-                self.raw,
-                key.as_ptr().cast(),
-                key.len(),
-                field.as_ptr().cast(),
-                field.len(),
-                &mut text,
-            )
-        };
-        check_status(status, "reading a stored field")?;
-        self.take_text(text)
-    }
-
-    fn snippet(
-        &self,
-        key: &str,
-        field: &str,
-        query: &str,
-        length: usize,
-    ) -> Result<String, Box<dyn Error>> {
-        let mut start = [0u8; 4];
-        let mut end = [0u8; 4];
-        let start = MARK_START.encode_utf8(&mut start);
-        let end = MARK_END.encode_utf8(&mut end);
-        let options = SnippetOptions {
-            length,
-            start_marker: start.as_ptr().cast(),
-            start_marker_length: start.len(),
-            end_marker: end.as_ptr().cast(),
-            end_marker_length: end.len(),
-            ellipsis: start.as_ptr().cast(),
-            ellipsis_length: 0,
-        };
-        let mut text = ptr::null_mut();
-        let status = unsafe {
-            (self.fns.snippet)(
-                self.raw,
-                key.as_ptr().cast(),
-                key.len(),
-                field.as_ptr().cast(),
-                field.len(),
-                query.as_ptr().cast(),
-                query.len(),
-                &options,
-                &mut text,
-            )
-        };
-        check_status(status, "building a snippet")?;
-        self.take_text(text)
-    }
-
-    fn take_text(&self, text: *mut c_void) -> Result<String, Box<dyn Error>> {
-        if text.is_null() {
-            return Err("LuxCore returned a null text handle".into());
-        }
-        let length = unsafe { (self.fns.text_length)(text) };
-        let data = unsafe { (self.fns.text_data)(text) };
-        let value = if length == 0 {
-            String::new()
-        } else if data.is_null() {
-            unsafe { (self.fns.text_free)(text) };
-            return Err("LuxCore returned null text data".into());
-        } else {
-            let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) };
-            String::from_utf8_lossy(bytes).into_owned()
-        };
-        unsafe { (self.fns.text_free)(text) };
-        Ok(value)
-    }
-}
-
-impl Drop for LuxIndex {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { (self.fns.free)(self.raw) };
-            self.raw = ptr::null_mut();
-        }
-    }
-}
-
-fn check_status(status: i32, action: &str) -> Result<(), Box<dyn Error>> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(format!("LuxCore error {status} while {action}").into())
-    }
-}
-
-struct Hit {
-    key: String,
-    score: f64,
-}
 
 struct App {
     query: String,
@@ -341,7 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut index = LuxIndex::load(&library_path)?;
-    let Some(total_files) = index_repository(&mut index, &root)? else {
+    let Some(summary) = index_repository(&mut index, &root, &library_path)? else {
         return Ok(());
     };
 
@@ -349,9 +98,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         query: String::new(),
         hits: Vec::new(),
         selected: 0,
-        total_files,
+        total_files: summary.indexed,
         root,
-        status: "Search words or symbols · F1 help".into(),
+        status: format!("{} · F1 help", describe_startup(&summary)),
         show_help: false,
         preview_for: None,
         preview: Vec::new(),
@@ -635,7 +384,30 @@ fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
 
 type RecallTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<Option<usize>, Box<dyn Error>> {
+fn describe_startup(summary: &Summary) -> String {
+    let files = summary.indexed;
+    if !summary.reused {
+        let cache = if summary.saved {
+            "cached for next time"
+        } else {
+            "cache unavailable"
+        };
+        format!("Indexed {files} files · {cache}")
+    } else if summary.updated == 0 && summary.removed == 0 {
+        format!("Loaded {files} files from cache")
+    } else {
+        format!(
+            "Cache refreshed: {} changed, {} removed · {files} files",
+            summary.updated, summary.removed
+        )
+    }
+}
+
+fn index_repository(
+    index: &mut LuxIndex,
+    root: &Path,
+    library: &Path,
+) -> Result<Option<Summary>, Box<dyn Error>> {
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
     let mut out = stdout();
@@ -643,45 +415,37 @@ fn index_repository(index: &mut LuxIndex, root: &Path) -> Result<Option<usize>, 
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let Some(files) = scan_files(&mut terminal, root)? else {
+    let Some(scanned) = scan_files(&mut terminal, root)? else {
         return Ok(None);
     };
-
-    let mut indexed = 0;
-    let total = files.len();
+    let files = cache::default_dir().map(|dir| cache::cache_files(&dir, root));
+    let fingerprint = cache::fingerprint(library);
     let mut last_draw = Instant::now() - Duration::from_secs(1);
-    let mut current_file = String::new();
-    terminal.draw(|frame| draw_indexing(frame, root, 0, total, &current_file))?;
-    for (position, path) in files.iter().enumerate() {
-        current_file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if let Ok(body) = fs::read_to_string(path) {
-            let relative = path.strip_prefix(root)?;
-            let key = relative.to_string_lossy().replace('\\', "/");
-            let title = path.file_name().unwrap_or_default().to_string_lossy();
-            index.add(&key, &title, &body)?;
-            indexed += 1;
-        }
-        let completed = position + 1;
-        if last_draw.elapsed() >= Duration::from_millis(60) || completed == total {
-            if cancel_requested()? {
-                return Ok(None);
+    cache::sync(
+        index,
+        files.as_ref(),
+        &fingerprint,
+        &scanned,
+        |completed, total, current| {
+            if last_draw.elapsed() < Duration::from_millis(60) {
+                return Ok(true);
             }
-            terminal.draw(|frame| draw_indexing(frame, root, completed, total, &current_file))?;
+            if cancel_requested()? {
+                return Ok(false);
+            }
+            terminal.draw(|frame| draw_indexing(frame, root, completed, total, current))?;
             last_draw = Instant::now();
-        }
-    }
-    Ok(Some(indexed))
+            Ok(true)
+        },
+    )
 }
 
 fn scan_files(
     terminal: &mut RecallTerminal,
     root: &Path,
-) -> Result<Option<Vec<PathBuf>>, Box<dyn Error>> {
-    let mut files = Vec::new();
+) -> Result<Option<BTreeMap<String, Scanned>>, Box<dyn Error>> {
+    let mut files = BTreeMap::new();
+    let mut latest = String::new();
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let walker = WalkDir::new(root)
         .follow_links(false)
@@ -695,20 +459,23 @@ fn scan_files(
     for entry in walker.filter_map(Result::ok) {
         if entry.file_type().is_file()
             && is_indexable(entry.path())
-            && matches!(entry.metadata(), Ok(metadata) if metadata.len() <= MAX_FILE_BYTES)
+            && let Ok(metadata) = entry.metadata()
+            && metadata.len() <= MAX_FILE_BYTES
+            && let Ok(relative) = entry.path().strip_prefix(root)
         {
-            files.push(entry.into_path());
+            latest = relative.to_string_lossy().replace('\\', "/");
+            files.insert(
+                latest.clone(),
+                Scanned {
+                    path: entry.into_path(),
+                    stamp: Stamp::of(&metadata),
+                },
+            );
         }
         if last_draw.elapsed() >= Duration::from_millis(60) {
             if cancel_requested()? {
                 return Ok(None);
             }
-            let latest = files.last().map_or_else(String::new, |path| {
-                path.strip_prefix(root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            });
             terminal.draw(|frame| draw_scanning(frame, root, files.len(), &latest))?;
             last_draw = Instant::now();
         }
@@ -1152,7 +919,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Line::from(""),
             Line::from("Search by words, filenames, or exact code symbols."),
             Line::from("BM25 ranks results and tolerates typos."),
-            Line::from("Readable text files are indexed again each launch."),
+            Line::from("The index is cached; only changed files are re-read."),
             Line::from(""),
             Line::from("Type       Search as you go"),
             Line::from("↑ / ↓      Move through results (mouse wheel works too)"),
@@ -1394,10 +1161,8 @@ mod tests {
 
     #[test]
     fn luxcore_snippets_mark_prefix_completions_and_keep_line_numbers() {
-        let library = env::var_os("LUXCORE_LIB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY));
-        let mut index = LuxIndex::load(&library).expect("build libluxcore with `make shared`");
+        let mut index =
+            LuxIndex::load(&lux::library_path()).expect("build libluxcore with `make shared`");
         index
             .add(
                 "note.md",
