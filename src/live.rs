@@ -432,7 +432,7 @@ impl Live {
         self.last_feed = Instant::now();
         match update {
             Update::Scanning { found } => {
-                if !self.synced {
+                if !self.synced && matches!(self.mode, Mode::Connecting | Mode::Scanning { .. }) {
                     self.mode = Mode::Scanning { found };
                 }
             }
@@ -1163,6 +1163,7 @@ mod tests {
         rig.send(Update::Manual {
             reason: "no watcher".into(),
         });
+        rig.send(Update::Scanning { found: 1 });
         rig.send(snapshot(&project.walk(), 1));
         rig.live.drain(Duration::ZERO);
         assert_eq!(rig.live.status(), "○ manual (Ctrl-R), updating 1");

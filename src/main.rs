@@ -1278,6 +1278,44 @@ mod tests {
     }
 
     #[test]
+    fn the_status_bar_shows_the_live_state() {
+        let mut app = app_with_help(false);
+        app.live = "● live, updating 3".into();
+        let text = screen_text(&app, 100, 24);
+        assert!(text.contains("● live, updating 3"), "screen was {text}");
+    }
+
+    #[test]
+    fn a_live_change_keeps_the_selected_file_selected_wherever_it_moves() {
+        let dir = picker_dir("live-change");
+        fs::write(dir.join("a.md"), "zebra one").unwrap();
+        fs::write(dir.join("b.md"), "zebra two").unwrap();
+        let mut live = Live::detached(&dir, &lux::library_path()).unwrap();
+        assert!(live.settle(|_| Ok(true)).unwrap());
+        let mut app = App::new(dir.clone(), live.indexed_files(), "ready".into());
+        app.query = "zebra".into();
+        refresh_hits(&mut app, live.index());
+        assert_eq!(app.hits.len(), 2);
+        app.selected = 1;
+        let selected = app.hits[1].key.clone();
+
+        fs::write(dir.join("c.md"), "zebra zebra zebra zebra zebra").unwrap();
+        live.rescan();
+        let tick = live.tick();
+        assert_eq!(tick.changed, ["c.md"]);
+        on_live_change(&mut app, &live, &tick.changed);
+
+        assert_eq!(app.total_files, 3);
+        assert_eq!(app.hits.len(), 3);
+        assert_eq!(app.hits[app.selected].key, selected);
+        assert_eq!(
+            app.preview_for.as_ref().map(|(key, _)| key.clone()),
+            Some(selected)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn preview_never_writes_control_characters_to_cells() {
         let body = "\twhile (lo < hi) {\n\t\tlo = 1;\x1b[31m\x08\x07\u{7f}\n\u{85}x lo\r\n";
         for symbol in rendered_symbols(body) {
