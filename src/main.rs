@@ -19,6 +19,7 @@ use crossterm::{
 };
 mod cache;
 mod lux;
+mod manager;
 
 use cache::{Scanned, Stamp, Summary};
 use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
