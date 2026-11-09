@@ -1,12 +1,10 @@
 use std::{
-    collections::BTreeMap,
     env,
     error::Error,
     fs,
     io::{self, stdout},
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -17,34 +15,30 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-// The allows go once main runs the live watcher.
 mod cache;
-#[allow(dead_code)]
 mod daemon;
 mod flow;
-#[allow(dead_code)]
 mod ipc;
-#[allow(dead_code)]
 mod live;
 mod lux;
 mod manager;
+mod opening;
 mod scan;
-#[allow(dead_code)]
 mod truth;
-#[allow(dead_code)]
 mod watch;
 
-use cache::{Stamp, Summary};
 use flow::Screen;
+use live::Live;
 use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
 use manager::{IndexManager, Outcome};
+use opening::open_project;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 const MAX_RESULTS: usize = 40;
@@ -60,6 +54,7 @@ struct App {
     manager: Option<IndexManager>,
     preview_for: Option<(String, String)>,
     preview: Vec<Line<'static>>,
+    live: String,
 }
 
 impl App {
@@ -75,12 +70,13 @@ impl App {
             manager: None,
             preview_for: None,
             preview: Vec::new(),
+            live: String::new(),
         }
     }
 }
 
 struct Session {
-    index: LuxIndex,
+    live: Live,
     app: App,
 }
 
@@ -110,6 +106,9 @@ enum PickerEntry {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::args_os().nth(1).is_some_and(|arg| arg == "daemon") {
+        return daemon_command(&env::args().skip(2).collect::<Vec<_>>());
+    }
     let (root, library_path) = parse_args()?;
     if !library_path.is_file() {
         return Err(format!(
@@ -129,8 +128,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         let event = run_screen(&screen, &mut session, &library_path)?;
         match flow::next(&screen, event, session.is_some()) {
             Some(next) => screen = next,
-            None => return Ok(()),
+            None => {
+                session.into_iter().for_each(|ended| ended.live.close());
+                return Ok(());
+            }
         }
+    }
+}
+
+// MERGE: replace the body with `daemon::cli(args)` once the daemon module lands it.
+fn daemon_command(args: &[String]) -> Result<(), Box<dyn Error>> {
+    match args.first().map(String::as_str) {
+        Some("run") => daemon::run(),
+        _ => Err("recall daemon status and stop are not wired into this build".into()),
     }
 }
 
@@ -147,7 +157,10 @@ fn run_screen(
         },
         Screen::Open { root } => match open_project(root.clone(), library_path) {
             Ok(Some(opened)) => {
-                *session = Some(opened);
+                session
+                    .replace(opened)
+                    .into_iter()
+                    .for_each(|old| old.live.close());
                 flow::Event::Opened
             }
             Ok(None) => flow::Event::OpenCancelled,
@@ -157,7 +170,7 @@ fn run_screen(
             let Some(current) = session.as_mut() else {
                 return Ok(flow::Event::SearchQuit);
             };
-            match run_tui(&mut current.app, &current.index)? {
+            match run_tui(&mut current.app, &mut current.live)? {
                 Exit::Quit => flow::Event::SearchQuit,
                 Exit::SwitchProject => flow::Event::SearchSwitch {
                     start: flow::picker_start(&current.app.root),
@@ -165,20 +178,6 @@ fn run_screen(
             }
         }
     })
-}
-
-fn open_project(root: PathBuf, library_path: &Path) -> Result<Option<Session>, Box<dyn Error>> {
-    let root = root.canonicalize()?;
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()).into());
-    }
-    let mut index = LuxIndex::load(library_path)?;
-    let Some(summary) = index_repository(&mut index, &root, library_path)? else {
-        return Ok(None);
-    };
-    let status = format!("{} · F1 help", describe_startup(&summary));
-    let app = App::new(root, summary.indexed, status);
-    Ok(Some(Session { index, app }))
 }
 
 fn recover_open_failure(
@@ -478,179 +477,14 @@ fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
 
 type RecallTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-fn describe_startup(summary: &Summary) -> String {
-    let files = summary.indexed;
-    if !summary.reused {
-        let cache = if summary.saved {
-            "cached for next time"
-        } else {
-            "cache unavailable"
-        };
-        format!("Indexed {files} files · {cache}")
-    } else if summary.updated == 0 && summary.removed == 0 {
-        format!("Loaded {files} files from cache")
-    } else {
-        format!(
-            "Cache refreshed: {} changed, {} removed · {files} files",
-            summary.updated, summary.removed
-        )
-    }
-}
-
-fn index_repository(
-    index: &mut LuxIndex,
-    root: &Path,
-    library: &Path,
-) -> Result<Option<Summary>, Box<dyn Error>> {
+fn run_tui(app: &mut App, live: &mut Live) -> Result<Exit, Box<dyn Error>> {
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
-
-    let Some(scanned) = scan_files(&mut terminal, root)? else {
-        return Ok(None);
-    };
-    let files = cache::default_dir().map(|dir| cache::cache_files(&dir, root));
-    let fingerprint = cache::fingerprint(library);
-    let mut last_draw = Instant::now() - Duration::from_secs(1);
-    cache::sync(
-        index,
-        files.as_ref(),
-        &fingerprint,
-        root,
-        &scanned,
-        |completed, total, current| {
-            if last_draw.elapsed() < Duration::from_millis(60) {
-                return Ok(true);
-            }
-            if cancel_requested()? {
-                return Ok(false);
-            }
-            terminal.draw(|frame| draw_indexing(frame, root, completed, total, current))?;
-            last_draw = Instant::now();
-            Ok(true)
-        },
-    )
-}
-
-fn scan_files(
-    terminal: &mut RecallTerminal,
-    root: &Path,
-) -> Result<Option<BTreeMap<String, Stamp>>, Box<dyn Error>> {
-    let mut last_draw = Instant::now() - Duration::from_secs(1);
-    let observed = scan::walk(root, &truth::Scope::ROOT, |found, latest| {
-        if last_draw.elapsed() < Duration::from_millis(60) {
-            return Ok(true);
-        }
-        if cancel_requested()? {
-            return Ok(false);
-        }
-        terminal.draw(|frame| draw_scanning(frame, root, found, latest))?;
-        last_draw = Instant::now();
-        Ok(true)
-    })?;
-    Ok(observed.map(|observed| observed.found))
-}
-
-fn cancel_requested() -> Result<bool, Box<dyn Error>> {
-    let mut cancel = false;
-    while event::poll(Duration::ZERO)? {
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            cancel |= key.code == KeyCode::Esc
-                || ctrl && matches!(key.code, KeyCode::Char('q' | 'Q' | 'c' | 'C'));
-        }
-    }
-    Ok(cancel)
-}
-
-fn indexing_layout(frame: &mut Frame, root: &Path) -> [Rect; 3] {
-    let area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Min(3),
-        ])
-        .split(frame.area());
-    let title = Paragraph::new(format!("Preparing search for {}", compact_path(root, 64))).block(
-        Block::default()
-            .title(" Recall · Indexing ")
-            .borders(Borders::ALL),
-    );
-    frame.render_widget(title, area[0]);
-    [area[0], area[1], area[2]]
-}
-
-fn draw_detail(frame: &mut Frame, area: Rect, detail: &str) {
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(sanitize_for_display(detail)),
-            Line::from(""),
-            Line::from("Esc cancels"),
-        ])
-        .style(Style::default().fg(Color::DarkGray))
-        .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn draw_scanning(frame: &mut Frame, root: &Path, found: usize, latest: &str) {
-    let area = indexing_layout(frame, root);
-    frame.render_widget(
-        Paragraph::new(format!("{found} files found so far")).block(
-            Block::default()
-                .title(" Scanning folders ")
-                .borders(Borders::ALL),
-        ),
-        area[1],
-    );
-    let detail = if latest.is_empty() {
-        "Looking for files…".to_owned()
-    } else {
-        format!("Found {latest}")
-    };
-    draw_detail(frame, area[2], &detail);
-}
-
-fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize, current: &str) {
-    let area = indexing_layout(frame, root);
-    let ratio = if total == 0 {
-        1.0
-    } else {
-        (completed as f64 / total as f64).clamp(0.0, 1.0)
-    };
-    let gauge = Gauge::default()
-        .block(Block::default().title(" Progress ").borders(Borders::ALL))
-        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-        .ratio(ratio)
-        .label(if total == 0 {
-            "No matching files".to_owned()
-        } else {
-            format!("{:.0}% · {completed} / {total} files", ratio * 100.0)
-        });
-    frame.render_widget(gauge, area[1]);
-
-    let detail = if current.is_empty() {
-        "Starting index…".to_owned()
-    } else {
-        format!("Indexing {current}")
-    };
-    draw_detail(frame, area[2], &detail);
-}
-
-fn run_tui(app: &mut App, index: &LuxIndex) -> Result<Exit, Box<dyn Error>> {
-    enable_raw_mode()?;
-    let _cleanup = TerminalCleanup;
-    let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(out);
-    let mut terminal = Terminal::new(backend)?;
-    event_loop(&mut terminal, app, index)
+    event_loop(&mut terminal, app, live)
 }
 
 struct TerminalCleanup;
@@ -665,16 +499,42 @@ impl Drop for TerminalCleanup {
 fn event_loop(
     terminal: &mut RecallTerminal,
     app: &mut App,
-    index: &LuxIndex,
+    live: &mut Live,
 ) -> Result<Exit, Box<dyn Error>> {
+    let mut redraw = true;
     loop {
-        terminal.draw(|frame| draw(frame, app))?;
+        let label = live.status();
+        if label != app.live {
+            app.live = label;
+            redraw = true;
+        }
+        if redraw {
+            terminal.draw(|frame| draw(frame, app))?;
+            redraw = false;
+        }
+        if !event::poll(live.poll_wait())? {
+            let tick = live.tick();
+            if !tick.changed.is_empty() {
+                on_live_change(app, live, &tick.changed);
+                redraw = true;
+            }
+            continue;
+        }
+        redraw = true;
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('q' | 'Q'))
-                {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                if ctrl && matches!(key.code, KeyCode::Char('q' | 'Q')) {
                     return Ok(Exit::Quit);
+                }
+                if ctrl && matches!(key.code, KeyCode::Char('r' | 'R')) {
+                    live.rescan();
+                    app.status = if *live.mode() == live::Mode::Gone {
+                        "The project folder is gone".into()
+                    } else {
+                        "Rescanning the project…".into()
+                    };
+                    continue;
                 }
                 if let Some(open) = app.manager.as_mut() {
                     if open.handle_key(key) == Outcome::Close {
@@ -703,27 +563,27 @@ fn event_loop(
                 match key.code {
                     KeyCode::Esc => {
                         app.query.clear();
-                        refresh_hits(app, index);
+                        refresh_hits(app, live.index());
                         app.status = "Search cleared".into();
                     }
                     KeyCode::Backspace => {
                         app.query.pop();
-                        refresh_hits(app, index);
+                        refresh_hits(app, live.index());
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.query.clear();
-                        refresh_hits(app, index);
+                        refresh_hits(app, live.index());
                     }
                     KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         remove_last_word(&mut app.query);
-                        refresh_hits(app, index);
+                        refresh_hits(app, live.index());
                     }
                     KeyCode::Char('o' | 'O') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(Exit::SwitchProject);
                     }
                     KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.query.push(ch);
-                        refresh_hits(app, index);
+                        refresh_hits(app, live.index());
                     }
                     KeyCode::Up | KeyCode::PageUp => {
                         app.selected = app
@@ -752,7 +612,7 @@ fn event_loop(
             },
             _ => {}
         }
-        sync_preview(app, index);
+        sync_preview(app, live.index());
     }
 }
 
@@ -764,7 +624,22 @@ fn remove_last_word(query: &mut String) {
     query.truncate(start);
 }
 
+/// Re-runs the query after the index changed and keeps the selected file
+/// selected, wherever it moved to.
+fn on_live_change(app: &mut App, live: &Live, changed: &[String]) {
+    app.total_files = live.indexed_files();
+    let keep = app.hits.get(app.selected).map(|hit| hit.key.clone());
+    if keep.as_ref().is_some_and(|key| changed.contains(key)) {
+        app.preview_for = None;
+    }
+    run_query(app, live.index(), keep.as_deref());
+}
+
 fn refresh_hits(app: &mut App, index: &LuxIndex) {
+    run_query(app, index, None);
+}
+
+fn run_query(app: &mut App, index: &LuxIndex, keep: Option<&str>) {
     if app.query.trim().is_empty() {
         app.hits.clear();
         app.selected = 0;
@@ -777,7 +652,10 @@ fn refresh_hits(app: &mut App, index: &LuxIndex) {
         Ok(hits) => {
             let found = hits.len();
             app.hits = hits;
-            app.selected = app.selected.min(app.hits.len().saturating_sub(1));
+            let moved_to = keep.and_then(|key| app.hits.iter().position(|hit| hit.key == key));
+            app.selected = moved_to
+                .unwrap_or(app.selected)
+                .min(app.hits.len().saturating_sub(1));
             sync_preview(app, index);
             app.status = format!(
                 "{found} results · {} indexed · Enter opens selected file",
@@ -958,7 +836,7 @@ fn draw(frame: &mut Frame, app: &App) {
     } else {
         Paragraph::new(vec![
             Line::from(Span::styled(
-                &app.status,
+                format!("{} · {}", app.status, app.live),
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
@@ -980,8 +858,7 @@ fn draw(frame: &mut Frame, app: &App) {
             )),
             Line::from(""),
             Line::from("Search by words, filenames, or exact code symbols."),
-            Line::from("BM25 ranks results and tolerates typos."),
-            Line::from("The index is cached; only changed files are re-read."),
+            Line::from("BM25 ranks results, tolerates typos, and stays current as files change."),
             Line::from(""),
             Line::from("Type       Search as you go"),
             Line::from("↑ / ↓      Move through results (mouse wheel works too)"),
@@ -990,6 +867,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Line::from("Esc        Clear search"),
             Line::from("Ctrl-W     Delete last word    Ctrl-U clear all"),
             Line::from("Ctrl-O     Switch to another project"),
+            Line::from("Ctrl-R     Rescan the project now"),
             Line::from("F2         Saved indexes: see and delete them"),
             Line::from("F1         Close this panel    Ctrl-Q quit"),
         ])
@@ -1161,9 +1039,9 @@ mod tests {
     use ratatui::{buffer::Buffer, widgets::Widget};
 
     fn session_for(root: &str) -> Session {
-        let index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+        let live = Live::detached(Path::new(root), &lux::library_path()).expect("build libluxcore");
         Session {
-            index,
+            live,
             app: App::new(PathBuf::from(root), 0, "ready".into()),
         }
     }
@@ -1356,6 +1234,7 @@ mod tests {
             manager: None,
             preview_for: None,
             preview: Vec::new(),
+            live: String::new(),
         }
     }
 
@@ -1396,6 +1275,44 @@ mod tests {
         ] {
             assert!(text.contains(expected), "help is missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_live_state() {
+        let mut app = app_with_help(false);
+        app.live = "● live, updating 3".into();
+        let text = screen_text(&app, 100, 24);
+        assert!(text.contains("● live, updating 3"), "screen was {text}");
+    }
+
+    #[test]
+    fn a_live_change_keeps_the_selected_file_selected_wherever_it_moves() {
+        let dir = picker_dir("live-change");
+        fs::write(dir.join("a.md"), "zebra one").unwrap();
+        fs::write(dir.join("b.md"), "zebra two").unwrap();
+        let mut live = Live::detached(&dir, &lux::library_path()).unwrap();
+        assert!(live.settle(|_| Ok(true)).unwrap());
+        let mut app = App::new(dir.clone(), live.indexed_files(), "ready".into());
+        app.query = "zebra".into();
+        refresh_hits(&mut app, live.index());
+        assert_eq!(app.hits.len(), 2);
+        app.selected = 1;
+        let selected = app.hits[1].key.clone();
+
+        fs::write(dir.join("c.md"), "zebra zebra zebra zebra zebra").unwrap();
+        live.rescan();
+        let tick = live.tick();
+        assert_eq!(tick.changed, ["c.md"]);
+        on_live_change(&mut app, &live, &tick.changed);
+
+        assert_eq!(app.total_files, 3);
+        assert_eq!(app.hits.len(), 3);
+        assert_eq!(app.hits[app.selected].key, selected);
+        assert_eq!(
+            app.preview_for.as_ref().map(|(key, _)| key.clone()),
+            Some(selected)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

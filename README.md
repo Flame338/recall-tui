@@ -35,12 +35,25 @@ Type words, a phrase, or a code symbol. Results update as you type. Use the arro
 - `Ctrl-W`: delete the last query word
 - `Ctrl-U`: clear the whole query
 - `Page Up` / `Page Down`: move through results faster
+- `Ctrl-R`: rescan the project now
 - `Ctrl-O`: switch to another project; the folder picker opens in the parent of the current project, and `Esc` there returns to your search untouched
 - `F1`: show key help
 - `F2`: manage saved indexes
 - `Ctrl-Q`: quit
 
-Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. Recall saves the index and a file manifest under `%LOCALAPPDATA%\Recall` (or `~/.cache/recall`), one pair per folder: a `.lux` index and a `.manifest` that records the folder path and a stamp for each file. At the next launch it loads the saved index and re-reads only the files whose size or modification time changed, and drops deleted ones. A different LuxCore library file, a change to the scan rules, or an index saved by an older version of Recall rebuilds the index from scratch.
+Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. Recall saves the index and a file manifest under `%LOCALAPPDATA%\Recall` (or `~/.cache/recall`), one pair per folder: a `.lux` index and a `.manifest` that records the folder path and a stamp for each file. At the next launch it loads the saved index and catches up on what changed (see Live updates). A different LuxCore library file, a change to the scan rules, or an index saved by an older version of Recall rebuilds the index from scratch.
+
+## Live updates
+
+Recall keeps the index current while it runs. On Windows it watches the project folder with `ReadDirectoryChangesW` and re-reads only the files that changed, so a file you save becomes searchable shortly after. The status bar shows `● live` when changes are flowing, `● live, updating N` while a burst such as a `git checkout` is absorbed, `scanning N` during the first scan, and `○ manual (Ctrl-R)` where watching is not possible (non-Windows systems, network paths). `Ctrl-R` rescans the project in any mode, which also picks up changes the watcher cannot see, such as a `.gitignore` above the project folder.
+
+The watcher runs in a small background daemon, started the first time you open a project. It keeps watching after you quit, so the next launch only catches up on what changed meanwhile, and several terminals share one watcher. The daemon is not started at logon, so after a reboot the first open of each project scans once.
+
+- `recall daemon status`: list the projects the daemon watches
+- `recall daemon stop`: stop the daemon
+- `RECALL_DAEMON=0`: skip the daemon and watch inside the Recall process itself, for debugging
+
+The index is saved when you quit, and in the background after a quiet stretch with enough changes. A project folder named `daemon` needs a path such as `.\daemon` to open.
 
 Press `F2` on the folder picker or the search screen to manage saved indexes. The list shows each folder with its file count, size, and age, and marks the folder you have open with `●`. Indexes saved by an older version show as `(unknown folder)` until they are rebuilt.
 
