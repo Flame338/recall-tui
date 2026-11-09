@@ -17,13 +17,22 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+// The allows go once main runs the live watcher.
 mod cache;
+#[allow(dead_code)]
+mod daemon;
 mod flow;
+#[allow(dead_code)]
+mod ipc;
+#[allow(dead_code)]
+mod live;
 mod lux;
 mod manager;
 mod scan;
-#[allow(dead_code)] // Parts serve the live watcher, which main does not run yet.
+#[allow(dead_code)]
 mod truth;
+#[allow(dead_code)]
+mod watch;
 
 use cache::{Stamp, Summary};
 use flow::Screen;

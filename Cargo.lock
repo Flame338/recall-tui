@@ -409,6 +409,7 @@ dependencies = [
  "ignore",
  "libloading",
  "ratatui",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
