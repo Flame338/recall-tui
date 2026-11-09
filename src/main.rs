@@ -55,6 +55,11 @@ struct App {
     preview: Vec<Line<'static>>,
 }
 
+struct Session {
+    index: LuxIndex,
+    app: App,
+}
+
 struct DirectoryPicker {
     current: PathBuf,
     entries: Vec<PickerEntry>,
@@ -87,17 +92,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             root
         }
     };
+    let Some(mut session) = open_project(root, &library_path)? else {
+        return Ok(());
+    };
+    run_tui(&mut session.app, &session.index)?;
+    Ok(())
+}
+
+fn open_project(root: PathBuf, library_path: &Path) -> Result<Option<Session>, Box<dyn Error>> {
     let root = root.canonicalize()?;
     if !root.is_dir() {
         return Err(format!("Not a directory: {}", root.display()).into());
     }
-
-    let mut index = LuxIndex::load(&library_path)?;
-    let Some(summary) = index_repository(&mut index, &root, &library_path)? else {
-        return Ok(());
+    let mut index = LuxIndex::load(library_path)?;
+    let Some(summary) = index_repository(&mut index, &root, library_path)? else {
+        return Ok(None);
     };
-
-    let mut app = App {
+    let app = App {
         query: String::new(),
         hits: Vec::new(),
         selected: 0,
@@ -109,8 +120,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         preview_for: None,
         preview: Vec::new(),
     };
-    run_tui(&mut app, &index)?;
-    Ok(())
+    Ok(Some(Session { index, app }))
 }
 
 fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
