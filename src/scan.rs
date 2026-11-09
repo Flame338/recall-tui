@@ -38,7 +38,12 @@ pub fn walk(
         .build();
     let mut found = BTreeMap::new();
     let mut latest = String::new();
-    for entry in walker.filter_map(Result::ok) {
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if walk_error_is_fatal(&error, root) => return Err(error.into()),
+            Err(_) => continue,
+        };
         if !tick(found.len(), &latest)? {
             return Ok(None);
         }
@@ -63,6 +68,17 @@ pub fn walk(
         scope: scope.clone(),
         found,
     }))
+}
+
+/// A folder that cannot be read right now must fail the walk. Skipping it would
+/// make every file under it look deleted. Permission errors are stable, so they
+/// count as absent, and so does a file that vanished mid-walk.
+fn walk_error_is_fatal(error: &ignore::Error, root: &Path) -> bool {
+    match error.io_error().map(std::io::Error::kind) {
+        Some(std::io::ErrorKind::PermissionDenied) | None => false,
+        Some(std::io::ErrorKind::NotFound) => !root.exists(),
+        Some(_) => true,
+    }
 }
 
 fn key_of(root: &Path, path: &Path) -> Option<String> {
@@ -199,6 +215,13 @@ mod tests {
         project.write("Makefile", "all:");
         project.write("ok.md", "indexed");
         assert_eq!(project.scan(), ["Makefile", "ok.md"]);
+    }
+
+    #[test]
+    fn a_missing_root_fails_the_walk_instead_of_looking_empty() {
+        let project = Project::new("missing-root");
+        let gone = project.0.join("gone");
+        assert!(walk(&gone, &Scope::ROOT, |_, _| Ok(true)).is_err());
     }
 
     #[test]

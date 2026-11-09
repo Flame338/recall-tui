@@ -232,6 +232,10 @@ impl Actor {
                 Some(Ok(observed)) => {
                     self.truth.apply(observed);
                 }
+                Some(Err(_)) if !root.exists() => {
+                    self.broadcast(Update::Gone);
+                    return Flow::Stop;
+                }
                 Some(Err(_)) => {
                     failed = true;
                     self.dirty.overflow(Instant::now());
@@ -985,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn a_root_that_cannot_be_watched_is_manual_but_still_scanned() {
+    fn a_missing_root_is_manual_and_then_gone_not_an_empty_project() {
         let project = Project::new("manual");
         let missing = project.root.join("not-yet");
         let engine = Engine::spawn(EngineConfig {
@@ -994,14 +998,14 @@ mod tests {
             buffer_bytes: 4096,
         });
         let (_cmd, rx) = engine.subscribe(None);
-        let first = rx.recv_timeout(SOON).unwrap();
-        assert!(matches!(first, Update::Manual { .. }), "{first:?}");
+        // The engine may end before it registers this subscriber, so the
+        // channel can close without a Gone. It must never report an empty project.
         let deadline = Instant::now() + SOON;
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Update::Snapshot { .. }) => break,
-                Ok(Update::Scanning { .. }) => continue,
-                other => panic!("expected a snapshot, got {other:?}"),
+                Ok(Update::Manual { .. } | Update::Scanning { .. }) => continue,
+                Ok(Update::Gone) | Err(RecvTimeoutError::Disconnected) => break,
+                other => panic!("expected the project to be gone, got {other:?}"),
             }
         }
     }

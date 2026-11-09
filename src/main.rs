@@ -136,12 +136,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-// MERGE: replace the body with `daemon::cli(args)` once the daemon module lands it.
 fn daemon_command(args: &[String]) -> Result<(), Box<dyn Error>> {
-    match args.first().map(String::as_str) {
-        Some("run") => daemon::run(),
-        _ => Err("recall daemon status and stop are not wired into this build".into()),
-    }
+    daemon::cli(args)
 }
 
 fn run_screen(
