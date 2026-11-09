@@ -327,7 +327,13 @@ fn choose_root(start: PathBuf) -> Result<Choice, Box<dyn Error>> {
 impl DirectoryPicker {
     fn refresh(&mut self) {
         self.entries.clear();
-        self.selected = 0;
+        if let Some(parent) = self
+            .current
+            .parent()
+            .filter(|parent| *parent != self.current)
+        {
+            self.entries.push(PickerEntry::Parent(parent.to_path_buf()));
+        }
         match fs::read_dir(&self.current) {
             Ok(entries) => {
                 let mut folders: Vec<PathBuf> = entries
@@ -346,13 +352,6 @@ impl DirectoryPicker {
                         .to_string_lossy()
                         .to_lowercase()
                 });
-                if let Some(parent) = self
-                    .current
-                    .parent()
-                    .filter(|parent| *parent != &self.current)
-                {
-                    self.entries.push(PickerEntry::Parent(parent.to_path_buf()));
-                }
                 self.entries
                     .extend(folders.into_iter().map(PickerEntry::Folder));
                 #[cfg(windows)]
@@ -364,10 +363,6 @@ impl DirectoryPicker {
                         }
                     }
                 }
-                if !self.entries.is_empty() {
-                    self.selected =
-                        usize::from(matches!(self.entries.first(), Some(PickerEntry::Parent(_))));
-                }
                 self.status = format!(
                     "{} locations · press S to index this folder",
                     self.entries.len()
@@ -375,6 +370,8 @@ impl DirectoryPicker {
             }
             Err(error) => self.status = format!("Cannot read this folder: {error}"),
         }
+        let starts_with_parent = matches!(self.entries.first(), Some(PickerEntry::Parent(_)));
+        self.selected = usize::from(starts_with_parent && self.entries.len() > 1);
     }
 }
 
@@ -1172,6 +1169,70 @@ mod tests {
             status.contains("F:/gone") && status.contains("folder vanished"),
             "status was {status:?}"
         );
+    }
+
+    fn picker_in(path: PathBuf) -> DirectoryPicker {
+        let mut picker = DirectoryPicker {
+            current: path,
+            entries: Vec::new(),
+            selected: 0,
+            path_input: None,
+            status: String::new(),
+        };
+        picker.refresh();
+        picker
+    }
+
+    fn picker_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("recall-picker-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_empty_folder_selects_the_parent_so_enter_walks_out() {
+        let dir = picker_dir("empty");
+        let picker = picker_in(dir.clone());
+        assert!(
+            matches!(
+                picker.entries.get(picker.selected),
+                Some(PickerEntry::Parent(parent)) if Some(parent.as_path()) == dir.parent()
+            ),
+            "selected {} of {} entries",
+            picker.selected,
+            picker.entries.len()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_with_subfolders_starts_on_the_first_subfolder() {
+        let dir = picker_dir("children");
+        fs::create_dir_all(dir.join("beta")).unwrap();
+        fs::create_dir_all(dir.join("alpha")).unwrap();
+        let picker = picker_in(dir.clone());
+        assert!(matches!(
+            picker.entries.get(picker.selected),
+            Some(PickerEntry::Folder(path)) if path.ends_with("alpha")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_folder_still_offers_the_parent() {
+        let dir = picker_dir("unreadable");
+        let picker = picker_in(dir.join("does-not-exist"));
+        assert!(
+            picker.status.starts_with("Cannot read this folder"),
+            "status was {:?}",
+            picker.status
+        );
+        assert!(matches!(
+            picker.entries.get(picker.selected),
+            Some(PickerEntry::Parent(parent)) if *parent == dir
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
