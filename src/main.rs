@@ -57,6 +57,23 @@ struct App {
     preview: Vec<Line<'static>>,
 }
 
+impl App {
+    fn new(root: PathBuf, total_files: usize, status: String) -> Self {
+        Self {
+            query: String::new(),
+            hits: Vec::new(),
+            selected: 0,
+            total_files,
+            root,
+            status,
+            show_help: false,
+            manager: None,
+            preview_for: None,
+            preview: Vec::new(),
+        }
+    }
+}
+
 struct Session {
     index: LuxIndex,
     app: App,
@@ -123,12 +140,13 @@ fn run_screen(
             Choice::Back => flow::Event::Back,
             Choice::Quit => flow::Event::Quit,
         },
-        Screen::Open { root } => match open_project(root.clone(), library_path)? {
-            Some(opened) => {
+        Screen::Open { root } => match open_project(root.clone(), library_path) {
+            Ok(Some(opened)) => {
                 *session = Some(opened);
                 flow::Event::Opened
             }
-            None => flow::Event::OpenCancelled,
+            Ok(None) => flow::Event::OpenCancelled,
+            Err(error) => recover_open_failure(session, root, error)?,
         },
         Screen::Search => {
             let Some(current) = session.as_mut() else {
@@ -153,19 +171,21 @@ fn open_project(root: PathBuf, library_path: &Path) -> Result<Option<Session>, B
     let Some(summary) = index_repository(&mut index, &root, library_path)? else {
         return Ok(None);
     };
-    let app = App {
-        query: String::new(),
-        hits: Vec::new(),
-        selected: 0,
-        total_files: summary.indexed,
-        root,
-        status: format!("{} · F1 help", describe_startup(&summary)),
-        show_help: false,
-        manager: None,
-        preview_for: None,
-        preview: Vec::new(),
-    };
+    let status = format!("{} · F1 help", describe_startup(&summary));
+    let app = App::new(root, summary.indexed, status);
     Ok(Some(Session { index, app }))
+}
+
+fn recover_open_failure(
+    session: &mut Option<Session>,
+    root: &Path,
+    error: Box<dyn Error>,
+) -> Result<flow::Event, Box<dyn Error>> {
+    let Some(previous) = session.as_mut() else {
+        return Err(error);
+    };
+    previous.app.status = format!("Could not open {}: {error}", compact_path(root, 48));
+    Ok(flow::Event::OpenCancelled)
 }
 
 fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
@@ -1186,6 +1206,43 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use ratatui::{buffer::Buffer, widgets::Widget};
+
+    fn session_for(root: &str) -> Session {
+        let index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+        Session {
+            index,
+            app: App::new(PathBuf::from(root), 0, "ready".into()),
+        }
+    }
+
+    #[test]
+    fn a_failed_open_returns_to_the_previous_search_and_says_why() {
+        let mut session = Some(session_for("F:/old"));
+        let event =
+            recover_open_failure(&mut session, Path::new("F:/gone"), "folder vanished".into())
+                .unwrap();
+        assert_eq!(event, flow::Event::OpenCancelled);
+        let current = session.unwrap();
+        assert_eq!(current.app.root, PathBuf::from("F:/old"));
+        let status = current.app.status;
+        assert!(
+            status.contains("F:/gone") && status.contains("folder vanished"),
+            "status was {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_open_is_still_an_error() {
+        let mut session = None;
+        let outcome = recover_open_failure(&mut session, Path::new("F:/gone"), "boom".into());
+        assert_eq!(outcome.unwrap_err().to_string(), "boom");
+    }
+
+    #[test]
+    fn opening_a_missing_folder_is_an_error_not_a_panic() {
+        let missing = env::temp_dir().join("recall-missing-folder-xyz");
+        assert!(open_project(missing, &lux::library_path()).is_err());
+    }
 
     fn rendered_symbols(text: &str) -> Vec<String> {
         let area = Rect::new(0, 0, 40, 6);
