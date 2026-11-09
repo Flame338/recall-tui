@@ -10,7 +10,7 @@ use std::{
 
 use crate::lux::LuxIndex;
 
-const FORMAT: &str = "recall-cache 1";
+const FORMAT: &str = "recall-cache 2";
 const RULES_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,8 +70,9 @@ pub fn plan(cached: &Manifest, scanned: &BTreeMap<String, Scanned>) -> Plan {
     Plan { to_read, to_remove }
 }
 
-pub fn serialize(fingerprint: &str, manifest: &Manifest) -> String {
-    let mut text = format!("{FORMAT}\n{fingerprint}\n");
+pub fn serialize(fingerprint: &str, root: &Path, manifest: &Manifest) -> String {
+    let root = root.to_string_lossy().replace(['\n', '\r'], " ");
+    let mut text = format!("{FORMAT}\n{fingerprint}\nroot {root}\n");
     for (key, entry) in manifest {
         text.push_str(&format!(
             "{}\t{}\t{}\t{key}\n",
@@ -83,11 +84,20 @@ pub fn serialize(fingerprint: &str, manifest: &Manifest) -> String {
     text
 }
 
-pub fn parse(text: &str, fingerprint: &str) -> Option<Manifest> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Parsed {
+    pub fingerprint: String,
+    pub root: String,
+    pub manifest: Manifest,
+}
+
+pub fn parse_manifest(text: &str) -> Option<Parsed> {
     let mut lines = text.lines();
-    if lines.next()? != FORMAT || lines.next()? != fingerprint {
+    if lines.next()? != FORMAT {
         return None;
     }
+    let fingerprint = lines.next()?.to_owned();
+    let root = lines.next()?.strip_prefix("root ")?.to_owned();
     let mut manifest = Manifest::new();
     for line in lines {
         let mut fields = line.splitn(4, '\t');
@@ -107,7 +117,16 @@ pub fn parse(text: &str, fingerprint: &str) -> Option<Manifest> {
             },
         );
     }
-    Some(manifest)
+    Some(Parsed {
+        fingerprint,
+        root,
+        manifest,
+    })
+}
+
+pub fn parse(text: &str, fingerprint: &str) -> Option<Manifest> {
+    let parsed = parse_manifest(text)?;
+    (parsed.fingerprint == fingerprint).then_some(parsed.manifest)
 }
 
 pub fn fingerprint(library: &Path) -> String {
@@ -122,6 +141,7 @@ pub fn fingerprint(library: &Path) -> String {
 }
 
 pub struct CacheFiles {
+    pub root: PathBuf,
     pub index: PathBuf,
     pub manifest: PathBuf,
 }
@@ -129,6 +149,7 @@ pub struct CacheFiles {
 pub fn cache_files(dir: &Path, root: &Path) -> CacheFiles {
     let name = format!("{:016x}", fnv1a(root.to_string_lossy().as_bytes()));
     CacheFiles {
+        root: root.to_path_buf(),
         index: dir.join(format!("{name}.lux")),
         manifest: dir.join(format!("{name}.manifest")),
     }
@@ -235,7 +256,10 @@ fn save(
     }
     write_atomic(&files.index, |path| index.save(path))?;
     write_atomic(&files.manifest, |path| {
-        Ok(fs::write(path, serialize(fingerprint, manifest))?)
+        Ok(fs::write(
+            path,
+            serialize(fingerprint, &files.root, manifest),
+        )?)
     })
 }
 
@@ -302,11 +326,32 @@ mod tests {
             ("a/b c.md", stamp(5, 9), true),
             ("z.txt", stamp(1, 2), false),
         ]);
-        let text = serialize("fp", &manifest);
+        let text = serialize("fp", Path::new("F:/proj"), &manifest);
         assert_eq!(parse(&text, "fp"), Some(manifest));
         assert_eq!(parse(&text, "other"), None);
         assert_eq!(parse("junk", "fp"), None);
-        assert_eq!(parse("recall-cache 1\nfp\nx\ty\n", "fp"), None);
+        assert_eq!(
+            parse("recall-cache 2\nfp\nroot F:/proj\nx\ty\n", "fp"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_manifest_remembers_its_root_and_old_formats_do_not_parse() {
+        let manifest = cached(&[("a.md", stamp(5, 9), true)]);
+        let text = serialize("fp", Path::new("F:/my proj"), &manifest);
+        let parsed = parse_manifest(&text).unwrap();
+        assert_eq!(parsed.fingerprint, "fp");
+        assert_eq!(parsed.root, "F:/my proj");
+        assert_eq!(parsed.manifest, manifest);
+        assert_eq!(parse_manifest("recall-cache 1\nfp\n5\t9\t1\ta.md\n"), None);
+        assert_eq!(parse_manifest("recall-cache 2\nfp\n5\t9\t1\ta.md\n"), None);
+    }
+
+    #[test]
+    fn a_root_with_a_line_break_still_round_trips() {
+        let text = serialize("fp", Path::new("odd\nname"), &Manifest::new());
+        assert!(parse(&text, "fp").is_some());
     }
 
     #[test]
@@ -340,6 +385,7 @@ mod tests {
         let b = cache_files(dir, Path::new("F:/two"));
         assert_ne!(a.index, b.index);
         assert_eq!(a.index, cache_files(dir, Path::new("F:/one")).index);
+        assert_eq!(a.root, Path::new("F:/one"));
     }
 
     struct Workspace(PathBuf);
@@ -456,6 +502,16 @@ mod tests {
         let (_, rebuilt) = run(&workspace, "different library");
         assert!(!rebuilt.reused);
         assert_eq!(rebuilt.updated, 2);
+    }
+
+    #[test]
+    fn a_synced_workspace_saves_its_root_in_the_manifest() {
+        let workspace = Workspace::new("root");
+        workspace.write("a.md", b"alpha");
+        run(&workspace, "fp");
+        let text = fs::read_to_string(workspace.files().manifest).unwrap();
+        let parsed = parse_manifest(&text).unwrap();
+        assert_eq!(parsed.root, workspace.0.to_string_lossy());
     }
 
     #[test]
