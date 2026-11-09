@@ -2,10 +2,10 @@ use std::{
     collections::BTreeMap,
     env,
     error::Error,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process,
-    time::UNIX_EPOCH,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::lux::LuxIndex;
@@ -152,6 +152,150 @@ pub fn cache_files(dir: &Path, root: &Path) -> CacheFiles {
         root: root.to_path_buf(),
         index: dir.join(format!("{name}.lux")),
         manifest: dir.join(format!("{name}.manifest")),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub name: String,
+    pub root: Option<String>,
+    pub files: usize,
+    pub bytes: u64,
+    pub modified: Option<SystemTime>,
+}
+
+#[derive(Default)]
+struct Found {
+    bytes: u64,
+    modified: Option<SystemTime>,
+    manifest: Option<PathBuf>,
+}
+
+fn is_entry_name(name: &str) -> bool {
+    name.len() == 16
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_cache_file(name: &str) -> bool {
+    [".lux", ".manifest", ".tmp"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+struct CacheFile {
+    name: String,
+    metadata: fs::Metadata,
+    path: PathBuf,
+}
+
+fn cache_files_in(dir: &Path) -> Result<Vec<CacheFile>, Box<dyn Error>> {
+    let reader = match fs::read_dir(dir) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in reader {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if let (true, Some(name)) = (metadata.is_file(), entry.file_name().to_str())
+            && is_cache_file(name)
+        {
+            files.push(CacheFile {
+                name: name.to_owned(),
+                metadata,
+                path: entry.path(),
+            });
+        }
+    }
+    Ok(files)
+}
+
+pub fn list_entries(dir: &Path) -> Vec<CacheEntry> {
+    let mut found: BTreeMap<String, Found> = BTreeMap::new();
+    for file in cache_files_in(dir).unwrap_or_default() {
+        let (stem, is_manifest) = match file.name.rsplit_once('.') {
+            Some((stem, "lux")) => (stem, false),
+            Some((stem, "manifest")) => (stem, true),
+            _ => continue,
+        };
+        if !is_entry_name(stem) {
+            continue;
+        }
+        let slot = found.entry(stem.to_owned()).or_default();
+        slot.bytes += file.metadata.len();
+        slot.modified = slot.modified.max(file.metadata.modified().ok());
+        if is_manifest {
+            slot.manifest = Some(file.path);
+        }
+    }
+    let mut entries: Vec<CacheEntry> = found
+        .into_iter()
+        .map(|(name, slot)| {
+            let parsed = slot
+                .manifest
+                .and_then(|path| fs::read_to_string(path).ok())
+                .and_then(|text| parse_manifest(&text));
+            CacheEntry {
+                name,
+                files: parsed.as_ref().map_or(0, |parsed| {
+                    parsed
+                        .manifest
+                        .values()
+                        .filter(|entry| entry.indexed)
+                        .count()
+                }),
+                root: parsed.map(|parsed| parsed.root),
+                bytes: slot.bytes,
+                modified: slot.modified,
+            }
+        })
+        .collect();
+    entries.sort_by_cached_key(|entry| {
+        (
+            entry.root.is_none(),
+            entry.root.as_deref().unwrap_or_default().to_lowercase(),
+            entry.name.clone(),
+        )
+    });
+    entries
+}
+
+pub fn delete_entry(dir: &Path, name: &str) -> Result<usize, Box<dyn Error>> {
+    if !is_entry_name(name) {
+        return Err(format!("{name:?} is not a saved index name").into());
+    }
+    let prefix = format!("{name}.");
+    let mut removed = 0;
+    for file in cache_files_in(dir)? {
+        let ours = file
+            .name
+            .strip_prefix(&prefix)
+            .is_some_and(|rest| matches!(rest, "lux" | "manifest") || rest.ends_with(".tmp"));
+        if ours && remove_if_present(&file.path)? {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+pub fn delete_all(dir: &Path) -> Result<usize, Box<dyn Error>> {
+    let mut removed = 0;
+    for file in cache_files_in(dir)? {
+        if remove_if_present(&file.path)? {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_if_present(path: &Path) -> Result<bool, Box<dyn Error>> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -432,8 +576,12 @@ mod tests {
     }
 
     fn run(workspace: &Workspace, fingerprint: &str) -> (LuxIndex, Summary) {
+        run_in(workspace, &workspace.0.join("cache"), fingerprint)
+    }
+
+    fn run_in(workspace: &Workspace, dir: &Path, fingerprint: &str) -> (LuxIndex, Summary) {
         let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
-        let files = workspace.files();
+        let files = cache_files(dir, &workspace.0);
         let summary = sync(
             &mut index,
             Some(&files),
@@ -512,6 +660,210 @@ mod tests {
         let text = fs::read_to_string(workspace.files().manifest).unwrap();
         let parsed = parse_manifest(&text).unwrap();
         assert_eq!(parsed.root, workspace.0.to_string_lossy());
+    }
+
+    fn stem_of(workspace: &Workspace, dir: &Path) -> String {
+        let files = cache_files(dir, &workspace.0);
+        files
+            .index
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn fake_entry(dir: &Path, name: &str, root: Option<&str>, indexed: usize) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(format!("{name}.lux")), vec![7u8; 100]).unwrap();
+        if let Some(root) = root {
+            let manifest: Manifest = (0..indexed)
+                .map(|n| {
+                    (
+                        format!("f{n}.md"),
+                        Entry {
+                            stamp: stamp(1, 1),
+                            indexed: true,
+                        },
+                    )
+                })
+                .collect();
+            fs::write(
+                dir.join(format!("{name}.manifest")),
+                serialize("fp", Path::new(root), &manifest),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn listing_shows_the_root_file_count_and_size_of_a_synced_folder() {
+        let home = Workspace::new("list-home");
+        let dir = home.0.join("cache");
+        let workspace = Workspace::new("list-one");
+        workspace.write("a.md", b"alpha");
+        workspace.write("b.md", b"beta");
+        workspace.write("c.txt", &[0xff, 0xfe, 0x00, 0x9f]);
+        run_in(&workspace, &dir, "fp");
+
+        let entries = list_entries(&dir);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.name, stem_of(&workspace, &dir));
+        assert_eq!(entry.root.as_deref(), workspace.0.to_str());
+        assert_eq!(entry.files, 2);
+        let on_disk: u64 = fs::read_dir(&dir)
+            .unwrap()
+            .map(|file| file.unwrap().metadata().unwrap().len())
+            .sum();
+        assert_eq!(entry.bytes, on_disk);
+        assert!(entry.modified.is_some());
+    }
+
+    #[test]
+    fn listing_handles_orphans_garbage_and_sorts_by_folder() {
+        let home = Workspace::new("list-sort");
+        let dir = home.0.join("cache");
+        fake_entry(&dir, "0000000000000003", Some("F:/beta"), 2);
+        fake_entry(&dir, "0000000000000001", Some("F:/Alpha"), 5);
+        fake_entry(&dir, "0000000000000002", None, 0);
+        fake_entry(&dir, "0000000000000004", Some("F:/gamma"), 1);
+        fs::write(dir.join("0000000000000004.manifest"), "garbage").unwrap();
+        fs::write(dir.join("notes.txt"), "mine").unwrap();
+        fs::write(dir.join("notahexname.lux"), "x").unwrap();
+
+        let entries = list_entries(&dir);
+        let seen: Vec<(&str, Option<&str>, usize)> = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.root.as_deref(), entry.files))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("0000000000000001", Some("F:/Alpha"), 5),
+                ("0000000000000003", Some("F:/beta"), 2),
+                ("0000000000000002", None, 0),
+                ("0000000000000004", None, 0),
+            ]
+        );
+        assert!(entries[2].modified.is_some());
+    }
+
+    #[test]
+    fn listing_a_missing_folder_is_empty() {
+        let home = Workspace::new("list-missing");
+        assert!(list_entries(&home.0.join("nope")).is_empty());
+    }
+
+    #[test]
+    fn deleting_an_entry_removes_only_its_files() {
+        let home = Workspace::new("delete-one");
+        let dir = home.0.join("cache");
+        fake_entry(&dir, "00000000000000aa", Some("F:/one"), 1);
+        fake_entry(&dir, "00000000000000bb", Some("F:/two"), 1);
+        fs::write(dir.join("00000000000000aa.lux.123.tmp"), "half").unwrap();
+        fs::write(dir.join("00000000000000aa.manifest.123.tmp"), "half").unwrap();
+        fs::write(dir.join("00000000000000bb.lux.9.tmp"), "half").unwrap();
+        fs::write(dir.join("keep.txt"), "mine").unwrap();
+        fs::create_dir(dir.join("00000000000000aa.lux.d")).unwrap();
+
+        assert_eq!(delete_entry(&dir, "00000000000000aa").unwrap(), 4);
+        assert_eq!(
+            names_in(&dir),
+            [
+                "00000000000000aa.lux.d",
+                "00000000000000bb.lux",
+                "00000000000000bb.lux.9.tmp",
+                "00000000000000bb.manifest",
+                "keep.txt",
+            ]
+        );
+        assert_eq!(list_entries(&dir).len(), 1);
+    }
+
+    #[test]
+    fn deleting_an_entry_refuses_names_that_could_escape_the_folder() {
+        let home = Workspace::new("delete-guard");
+        let dir = home.0.join("cache");
+        fake_entry(&dir, "00000000000000aa", Some("F:/one"), 1);
+        fs::write(home.0.join("x.lux"), "outside").unwrap();
+        let before = names_in(&dir);
+        for bad in [
+            "..\\x",
+            "../x",
+            "..",
+            "",
+            "00000000000000a",
+            "00000000000000aaa",
+            "00000000000000AA",
+            "0000000000000zzz",
+            "00000000000000aa/",
+        ] {
+            assert!(
+                delete_entry(&dir, bad).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+        assert_eq!(names_in(&dir), before);
+        assert!(home.0.join("x.lux").exists());
+    }
+
+    #[test]
+    fn deleting_an_entry_twice_is_fine() {
+        let home = Workspace::new("delete-twice");
+        let dir = home.0.join("cache");
+        fake_entry(&dir, "00000000000000aa", Some("F:/one"), 1);
+        assert_eq!(delete_entry(&dir, "00000000000000aa").unwrap(), 2);
+        assert_eq!(delete_entry(&dir, "00000000000000aa").unwrap(), 0);
+        assert_eq!(
+            delete_entry(&dir.join("gone"), "00000000000000aa").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn deleting_all_removes_cache_files_and_nothing_else() {
+        let home = Workspace::new("delete-all");
+        let dir = home.0.join("cache");
+        fake_entry(&dir, "00000000000000aa", Some("F:/one"), 1);
+        fake_entry(&dir, "00000000000000bb", None, 0);
+        fs::write(dir.join("00000000000000aa.lux.77.tmp"), "half").unwrap();
+        fs::write(dir.join("keep.txt"), "mine").unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub").join("deep.lux"), "nested").unwrap();
+
+        assert_eq!(delete_all(&dir).unwrap(), 4);
+        assert_eq!(names_in(&dir), ["keep.txt", "sub"]);
+        assert!(dir.join("sub").join("deep.lux").exists());
+        assert_eq!(delete_all(&dir).unwrap(), 0);
+        assert_eq!(delete_all(&dir.join("gone")).unwrap(), 0);
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn a_deleted_entry_is_rebuilt_on_the_next_sync_and_reused_after() {
+        let home = Workspace::new("delete-resync");
+        let dir = home.0.join("cache");
+        let workspace = Workspace::new("delete-resync-src");
+        workspace.write("a.md", b"alpha");
+        assert!(!run_in(&workspace, &dir, "fp").1.reused);
+        assert!(run_in(&workspace, &dir, "fp").1.reused);
+
+        delete_entry(&dir, &stem_of(&workspace, &dir)).unwrap();
+        assert!(list_entries(&dir).is_empty());
+
+        let (index, rebuilt) = run_in(&workspace, &dir, "fp");
+        assert!(!rebuilt.reused);
+        assert_eq!(found(&index, "alpha"), ["a.md"]);
+        assert!(run_in(&workspace, &dir, "fp").1.reused);
     }
 
     #[test]
