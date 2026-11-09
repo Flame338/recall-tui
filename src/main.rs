@@ -18,10 +18,12 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 mod cache;
+mod flow;
 mod lux;
 mod manager;
 
 use cache::{Scanned, Stamp, Summary};
+use flow::Screen;
 use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
 use manager::{IndexManager, Outcome};
 use ratatui::{
@@ -68,6 +70,11 @@ struct DirectoryPicker {
     status: String,
 }
 
+enum Exit {
+    Quit,
+    SwitchProject,
+}
+
 enum Choice {
     Folder(PathBuf),
     Back,
@@ -89,20 +96,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let root = match root {
-        Some(root) => root,
-        None => {
-            let Choice::Folder(root) = choose_root(env::current_dir()?)? else {
-                return Ok(());
-            };
-            root
+    let mut screen = match root {
+        Some(root) => Screen::Open { root },
+        None => Screen::Pick {
+            start: env::current_dir()?,
+        },
+    };
+    let mut session: Option<Session> = None;
+    loop {
+        let event = run_screen(&screen, &mut session, &library_path)?;
+        match flow::next(&screen, event, session.is_some()) {
+            Some(next) => screen = next,
+            None => return Ok(()),
         }
-    };
-    let Some(mut session) = open_project(root, &library_path)? else {
-        return Ok(());
-    };
-    run_tui(&mut session.app, &session.index)?;
-    Ok(())
+    }
+}
+
+fn run_screen(
+    screen: &Screen,
+    session: &mut Option<Session>,
+    library_path: &Path,
+) -> Result<flow::Event, Box<dyn Error>> {
+    Ok(match screen {
+        Screen::Pick { start } => match choose_root(start.clone())? {
+            Choice::Folder(root) => flow::Event::Picked(root),
+            Choice::Back => flow::Event::Back,
+            Choice::Quit => flow::Event::Quit,
+        },
+        Screen::Open { root } => match open_project(root.clone(), library_path)? {
+            Some(opened) => {
+                *session = Some(opened);
+                flow::Event::Opened
+            }
+            None => flow::Event::OpenCancelled,
+        },
+        Screen::Search => {
+            let Some(current) = session.as_mut() else {
+                return Ok(flow::Event::SearchQuit);
+            };
+            match run_tui(&mut current.app, &current.index)? {
+                Exit::Quit => flow::Event::SearchQuit,
+                Exit::SwitchProject => flow::Event::SearchSwitch {
+                    start: flow::picker_start(&current.app.root),
+                },
+            }
+        }
+    })
 }
 
 fn open_project(root: PathBuf, library_path: &Path) -> Result<Option<Session>, Box<dyn Error>> {
@@ -631,7 +670,7 @@ fn is_indexable(path: &Path) -> bool {
         })
 }
 
-fn run_tui(app: &mut App, index: &LuxIndex) -> Result<(), Box<dyn Error>> {
+fn run_tui(app: &mut App, index: &LuxIndex) -> Result<Exit, Box<dyn Error>> {
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
     let mut out = stdout();
@@ -654,7 +693,7 @@ fn event_loop(
     terminal: &mut RecallTerminal,
     app: &mut App,
     index: &LuxIndex,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Exit, Box<dyn Error>> {
     loop {
         terminal.draw(|frame| draw(frame, app))?;
         match event::read()? {
@@ -662,7 +701,7 @@ fn event_loop(
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('q' | 'Q'))
                 {
-                    break;
+                    return Ok(Exit::Quit);
                 }
                 if let Some(open) = app.manager.as_mut() {
                     if open.handle_key(key) == Outcome::Close {
@@ -706,6 +745,9 @@ fn event_loop(
                         remove_last_word(&mut app.query);
                         refresh_hits(app, index);
                     }
+                    KeyCode::Char('o' | 'O') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(Exit::SwitchProject);
+                    }
                     KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.query.push(ch);
                         refresh_hits(app, index);
@@ -739,7 +781,6 @@ fn event_loop(
         }
         sync_preview(app, index);
     }
-    Ok(())
 }
 
 fn remove_last_word(query: &mut String) {
