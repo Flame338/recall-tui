@@ -19,7 +19,7 @@ $env:LUXCORE_LIB = 'F:\LuxCore\build\release\libluxcore.dll'
 cargo run --release
 ```
 
-Without a repository argument, Recall opens a folder picker at the current directory. Use the arrows to choose a folder and Enter to browse it; choose `..` or press Backspace to go up. At a Windows drive root, other available drives are listed. Press `S` to index the folder currently shown, or `P` to type or edit a path directly (`Ctrl-A` clears it). You can also pass a repository path to skip the picker:
+Without a repository argument, Recall opens a folder picker at the current directory. Use the arrows to choose a folder and Enter to browse it; choose `..` or press Backspace to go up. At a Windows drive root, other available drives are listed. Press `S` to index the folder currently shown, or `P` to type or edit a path directly (`Ctrl-A` clears it). `Esc` or `Q` goes back, which quits when no project is open yet, and `Ctrl-Q` always quits. You can also pass a repository path to skip the picker:
 
 ```powershell
 cargo run --release -- 'F:\path\to\project'
@@ -35,6 +35,7 @@ Type words, a phrase, or a code symbol. Results update as you type. Use the arro
 - `Ctrl-W`: delete the last query word
 - `Ctrl-U`: clear the whole query
 - `Page Up` / `Page Down`: move through results faster
+- `Ctrl-O`: switch to another project; the folder picker opens in the parent of the current project, and `Esc` there returns to your search untouched
 - `F1`: show key help
 - `F2`: manage saved indexes
 - `Ctrl-Q`: quit
@@ -50,4 +51,4 @@ Press `F2` on the folder picker or the search screen to manage saved indexes. Th
 
 A deleted index is rebuilt the next time you index that folder. Deleting the folder you have open does not affect the running search.
 
-While scanning, Recall counts the files it finds. During indexing it shows a progress bar, the completed file count, and the file currently being read. Press `Esc` or `Ctrl-Q` in either phase to cancel and quit. The scanner indexes common source and text formats, including C/C++, Rust, Python, JavaScript/TypeScript, Markdown, JSON, TOML, YAML, HTML, and SQL. It skips hidden folders (such as `.git` and `.claude`), build output, package directories, and files over 512 KiB. Binary or non-UTF-8 files are skipped.
+While scanning, Recall counts the files it finds. During indexing it shows a progress bar, the completed file count, and the file currently being read. Press `Esc`, `Ctrl-C` or `Ctrl-Q` in either phase to cancel. If you were switching from another project, Recall returns to that search with its query and results as you left them. Otherwise it quits. The scanner indexes common source and text formats, including C/C++, Rust, Python, JavaScript/TypeScript, Markdown, JSON, TOML, YAML, HTML, and SQL. It skips hidden folders (such as `.git` and `.claude`), build output, package directories, and files over 512 KiB. Binary or non-UTF-8 files are skipped.
