@@ -68,6 +68,12 @@ struct DirectoryPicker {
     status: String,
 }
 
+enum Choice {
+    Folder(PathBuf),
+    Back,
+    Quit,
+}
+
 enum PickerEntry {
     Parent(PathBuf),
     Folder(PathBuf),
@@ -86,7 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = match root {
         Some(root) => root,
         None => {
-            let Some(root) = choose_root(env::current_dir()?)? else {
+            let Choice::Folder(root) = choose_root(env::current_dir()?)? else {
                 return Ok(());
             };
             root
@@ -147,7 +153,7 @@ fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
     Ok((root, library))
 }
 
-fn choose_root(start: PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
+fn choose_root(start: PathBuf) -> Result<Choice, Box<dyn Error>> {
     let mut picker = DirectoryPicker {
         current: start,
         entries: Vec::new(),
@@ -175,7 +181,7 @@ fn choose_root(start: PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('q' | 'Q'))
                 {
-                    return Ok(None);
+                    return Ok(Choice::Quit);
                 }
                 if let Some(open) = manager.as_mut() {
                     if open.handle_key(key) == Outcome::Close {
@@ -218,14 +224,13 @@ fn choose_root(start: PathBuf) -> Result<Option<PathBuf>, Box<dyn Error>> {
                     continue;
                 }
                 match key.code {
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Char('q' | 'Q') => return Ok(None),
+                    KeyCode::Esc | KeyCode::Char('q' | 'Q') => return Ok(Choice::Back),
                     KeyCode::Char('p' | 'P') => {
                         picker.path_input = Some(picker.current.to_string_lossy().into_owned());
                         picker.status = "Edit the folder path, then press Enter".into();
                     }
                     KeyCode::Char('s' | 'S' | ' ') => {
-                        return Ok(Some(picker.current.clone()));
+                        return Ok(Choice::Folder(picker.current.clone()));
                     }
                     KeyCode::Backspace | KeyCode::Left => {
                         if let Some(parent) = picker.current.parent() {
@@ -402,7 +407,7 @@ fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
-                "↑/↓ browse  Enter open  .. / Backspace up  S index here  P type path  F2 indexes  Esc quit",
+                "↑/↓ browse  Enter open  .. / Backspace up  S index here  P type path  F2 indexes  Esc back",
                 Style::default().fg(Color::DarkGray),
             )),
         ]),
