@@ -989,14 +989,14 @@ fn draw(frame: &mut Frame, app: &App) {
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
-                "↑/↓ move  PgUp/PgDn jump  Enter open  Esc clear  Ctrl-W erase word  F1 help  F2 indexes  Ctrl-Q quit",
+                "↑/↓ move  Enter open  Esc clear  Ctrl-O project  F2 indexes  F1 help  Ctrl-Q quit",
                 Style::default().fg(Color::DarkGray),
             )),
         ])
     };
     frame.render_widget(footer, sections[2]);
     if app.show_help {
-        let area = centered_rect(80, 70, frame.area());
+        let area = centered_rect(80, 80, frame.area());
         frame.render_widget(Clear, area);
         let help = Paragraph::new(vec![
             Line::from(Span::styled(
@@ -1012,9 +1012,11 @@ fn draw(frame: &mut Frame, app: &App) {
             Line::from(""),
             Line::from("Type       Search as you go"),
             Line::from("↑ / ↓      Move through results (mouse wheel works too)"),
+            Line::from("PgUp / PgDn  Jump through results faster"),
             Line::from("Enter      Open selected file"),
             Line::from("Esc        Clear search"),
             Line::from("Ctrl-W     Delete last word    Ctrl-U clear all"),
+            Line::from("Ctrl-O     Switch to another project"),
             Line::from("F2         Saved indexes: see and delete them"),
             Line::from("F1         Close this panel    Ctrl-Q quit"),
         ])
@@ -1283,6 +1285,60 @@ mod tests {
         assert_eq!(sanitize_for_display("ab\tx"), "ab  x");
         assert_eq!(sanitize_for_display("\u{FEFF}a\u{FE0F}\u{200D}b\x1b"), "ab");
         assert_eq!(sanitize_for_display("naïve → ✓"), "naïve → ✓");
+    }
+
+    fn app_with_help(show_help: bool) -> App {
+        App {
+            query: String::new(),
+            hits: Vec::new(),
+            selected: 0,
+            total_files: 0,
+            root: PathBuf::from("root"),
+            status: String::new(),
+            show_help,
+            manager: None,
+            preview_for: None,
+            preview: Vec::new(),
+        }
+    }
+
+    fn screen_text(app: &App, width: u16, height: u16) -> String {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn footer_hint_fits_a_100_column_terminal() {
+        let text = screen_text(&app_with_help(false), 100, 24);
+        let hint = text
+            .lines()
+            .find(|line| line.contains("Ctrl-O project"))
+            .expect("footer hint should list Ctrl-O");
+        assert!(hint.contains("Ctrl-Q quit"), "hint truncated: {hint:?}");
+    }
+
+    #[test]
+    fn help_popup_lists_every_key_on_a_short_terminal() {
+        let text = screen_text(&app_with_help(true), 100, 22);
+        for expected in [
+            "PgUp / PgDn",
+            "Ctrl-W",
+            "Ctrl-U",
+            "Ctrl-O",
+            "Switch to another project",
+            "Saved indexes",
+            "Close this panel",
+        ] {
+            assert!(text.contains(expected), "help is missing {expected:?}");
+        }
     }
 
     #[test]
