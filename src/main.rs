@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fs,
     io::{self, stdout},
+    mem,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -50,8 +51,7 @@ struct App {
     total_files: usize,
     root: PathBuf,
     status: String,
-    show_help: bool,
-    manager: Option<IndexManager>,
+    overlay: Overlay,
     preview_for: Option<(String, String)>,
     preview: Vec<Line<'static>>,
     live: String,
@@ -66,12 +66,21 @@ impl App {
             total_files,
             root,
             status,
-            show_help: false,
-            manager: None,
+            overlay: Overlay::None,
             preview_for: None,
             preview: Vec::new(),
             live: String::new(),
         }
+    }
+
+    fn go(&mut self, step: Move) {
+        let last = self.hits.len().saturating_sub(1);
+        self.selected = match step {
+            Move::Up(by) => self.selected.saturating_sub(by),
+            Move::Down(by) => (self.selected + by).min(last),
+            Move::Home => 0,
+            Move::End => last,
+        };
     }
 }
 
@@ -80,12 +89,69 @@ struct Session {
     app: App,
 }
 
+#[derive(Default)]
+enum Overlay {
+    #[default]
+    None,
+    Help,
+    Manager(IndexManager),
+}
+
+enum Action {
+    Idle,
+    Quit,
+    Rescan,
+    SwitchProject,
+    Edit(Edit),
+    Move(Move),
+    OpenFile,
+}
+
+enum Edit {
+    Cancel,
+    Backspace,
+    Wipe,
+    DropWord,
+    Type(char),
+}
+
+#[derive(Clone, Copy)]
+enum Move {
+    Up(usize),
+    Down(usize),
+    Home,
+    End,
+}
+
 struct DirectoryPicker {
     current: PathBuf,
     entries: Vec<PickerEntry>,
     selected: usize,
-    path_input: Option<String>,
+    mode: PickerMode,
     status: String,
+}
+
+enum PickerMode {
+    Browsing,
+    Typing(String),
+    Manager {
+        manager: IndexManager,
+        covering: Covered,
+    },
+}
+
+enum Covered {
+    Browsing,
+    Typing(String),
+}
+
+impl From<Covered> for PickerMode {
+    fn from(covered: Covered) -> Self {
+        match covered {
+            Covered::Browsing => PickerMode::Browsing,
+            Covered::Typing(text) => PickerMode::Typing(text),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -215,15 +281,7 @@ fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
 }
 
 fn choose_root(start: PathBuf) -> Result<Choice, Box<dyn Error>> {
-    let mut picker = DirectoryPicker {
-        current: start,
-        entries: Vec::new(),
-        selected: 0,
-        path_input: None,
-        status: "Choose a folder to index".into(),
-    };
-    picker.refresh();
-    let mut manager: Option<IndexManager> = None;
+    let mut picker = DirectoryPicker::new(start);
 
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
@@ -233,12 +291,8 @@ fn choose_root(start: PathBuf) -> Result<Choice, Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     loop {
-        terminal.draw(|frame| {
-            draw_directory_picker(frame, &picker);
-            draw_manager(frame, manager.as_ref());
-        })?;
-        if let Some(choice) = picker_event(&mut picker, &mut manager, event::read()?, &open_manager)
-        {
+        terminal.draw(|frame| draw_directory_picker(frame, &picker))?;
+        if let Some(choice) = picker_event(&mut picker, event::read()?, &open_manager) {
             return Ok(choice);
         }
     }
@@ -250,105 +304,161 @@ fn open_manager(root: Option<PathBuf>) -> IndexManager {
 
 type Opener<'a> = &'a dyn Fn(Option<PathBuf>) -> IndexManager;
 
-fn picker_event(
-    picker: &mut DirectoryPicker,
-    manager: &mut Option<IndexManager>,
-    event: Event,
-    open: Opener,
-) -> Option<Choice> {
+fn picker_event(picker: &mut DirectoryPicker, event: Event, open: Opener) -> Option<Choice> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => {
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('q' | 'Q'))
-            {
-                return Some(Choice::Quit);
-            }
-            if let Some(shown) = manager.as_mut() {
-                if shown.handle_key(key) == Outcome::Close {
-                    *manager = None;
-                }
-                return None;
-            }
-            if key.code == KeyCode::F(2) {
-                *manager = Some(open(None));
-                return None;
-            }
-            if let Some(path_input) = picker.path_input.as_mut() {
-                match key.code {
-                    KeyCode::Esc => picker.path_input = None,
-                    KeyCode::Enter => {
-                        let path = PathBuf::from(path_input.trim());
-                        match path.canonicalize() {
-                            Ok(path) if path.is_dir() => {
-                                picker.current = path;
-                                picker.path_input = None;
-                                picker.refresh();
-                            }
-                            Ok(_) => picker.status = "That path is not a folder".into(),
-                            Err(error) => picker.status = format!("Cannot open that path: {error}"),
-                        }
-                    }
-                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        path_input.clear();
-                    }
-                    KeyCode::Backspace => {
-                        path_input.pop();
-                    }
-                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        path_input.push(ch);
-                    }
+        Event::Key(key) if key.kind == KeyEventKind::Press => picker.key(key, open),
+        Event::Mouse(mouse) => {
+            if !matches!(picker.mode, PickerMode::Manager { .. }) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => picker.go(Move::Up(3)),
+                    MouseEventKind::ScrollDown => picker.go(Move::Down(3)),
                     _ => {}
                 }
-                return None;
             }
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q' | 'Q') => return Some(Choice::Back),
-                KeyCode::Char('p' | 'P') => {
-                    picker.path_input = Some(picker.current.to_string_lossy().into_owned());
-                    picker.status = "Edit the folder path, then press Enter".into();
-                }
-                KeyCode::Char('s' | 'S' | ' ') => {
-                    return Some(Choice::Folder(picker.current.clone()));
-                }
-                KeyCode::Backspace | KeyCode::Left => {
-                    if let Some(parent) = picker.current.parent() {
-                        picker.current = parent.to_path_buf();
-                        picker.refresh();
-                    }
-                }
-                KeyCode::Up => {
-                    picker.selected = picker.selected.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    picker.selected =
-                        (picker.selected + 1).min(picker.entries.len().saturating_sub(1));
-                }
-                KeyCode::Enter => {
-                    if let Some(entry) = picker.entries.get(picker.selected) {
-                        picker.current = match entry {
-                            PickerEntry::Parent(path)
-                            | PickerEntry::Folder(path)
-                            | PickerEntry::Drive(path) => path.clone(),
-                        };
-                        picker.refresh();
-                    }
-                }
-                _ => {}
-            }
+            None
         }
-        Event::Mouse(mouse) if manager.is_none() => match mouse.kind {
-            MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(3),
-            MouseEventKind::ScrollDown => {
-                picker.selected = (picker.selected + 3).min(picker.entries.len().saturating_sub(1));
-            }
-            _ => {}
-        },
-        _ => {}
+        _ => None,
     }
-    None
 }
 
 impl DirectoryPicker {
+    fn new(current: PathBuf) -> Self {
+        let mut picker = Self {
+            current,
+            entries: Vec::new(),
+            selected: 0,
+            mode: PickerMode::Browsing,
+            status: "Choose a folder to index".into(),
+        };
+        picker.refresh();
+        picker
+    }
+
+    fn typed_path(&self) -> Option<&str> {
+        match &self.mode {
+            PickerMode::Typing(text)
+            | PickerMode::Manager {
+                covering: Covered::Typing(text),
+                ..
+            } => Some(text),
+            PickerMode::Browsing
+            | PickerMode::Manager {
+                covering: Covered::Browsing,
+                ..
+            } => None,
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent, open: Opener) -> Option<Choice> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let mode = mem::replace(&mut self.mode, PickerMode::Browsing);
+        let (mode, choice) = match (mode, key.code) {
+            (mode, KeyCode::Char('q' | 'Q')) if ctrl => (mode, Some(Choice::Quit)),
+            (
+                PickerMode::Manager {
+                    mut manager,
+                    covering,
+                },
+                _,
+            ) => {
+                let mode = match manager.handle_key(key) {
+                    Outcome::Close => covering.into(),
+                    Outcome::Stay => PickerMode::Manager { manager, covering },
+                };
+                (mode, None)
+            }
+            (PickerMode::Browsing, KeyCode::F(2)) => (
+                PickerMode::Manager {
+                    manager: open(None),
+                    covering: Covered::Browsing,
+                },
+                None,
+            ),
+            (PickerMode::Typing(text), KeyCode::F(2)) => (
+                PickerMode::Manager {
+                    manager: open(None),
+                    covering: Covered::Typing(text),
+                },
+                None,
+            ),
+            (PickerMode::Typing(text), _) => (self.type_path(text, key), None),
+            (PickerMode::Browsing, _) => self.browse(key),
+        };
+        self.mode = mode;
+        choice
+    }
+
+    fn type_path(&mut self, mut text: String, key: KeyEvent) -> PickerMode {
+        match key.code {
+            KeyCode::Esc => return PickerMode::Browsing,
+            KeyCode::Enter => match PathBuf::from(text.trim()).canonicalize() {
+                Ok(path) if path.is_dir() => {
+                    self.current = path;
+                    self.refresh();
+                    return PickerMode::Browsing;
+                }
+                Ok(_) => self.status = "That path is not a folder".into(),
+                Err(error) => self.status = format!("Cannot open that path: {error}"),
+            },
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => text.clear(),
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => text.push(ch),
+            _ => {}
+        }
+        PickerMode::Typing(text)
+    }
+
+    fn browse(&mut self, key: KeyEvent) -> (PickerMode, Option<Choice>) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                return (PickerMode::Browsing, Some(Choice::Back));
+            }
+            KeyCode::Char('p' | 'P') => {
+                self.status = "Edit the folder path, then press Enter".into();
+                let text = self.current.to_string_lossy().into_owned();
+                return (PickerMode::Typing(text), None);
+            }
+            KeyCode::Char('s' | 'S' | ' ') => {
+                return (
+                    PickerMode::Browsing,
+                    Some(Choice::Folder(self.current.clone())),
+                );
+            }
+            KeyCode::Backspace | KeyCode::Left => {
+                if let Some(parent) = self.current.parent() {
+                    self.current = parent.to_path_buf();
+                    self.refresh();
+                }
+            }
+            KeyCode::Up => self.go(Move::Up(1)),
+            KeyCode::Down => self.go(Move::Down(1)),
+            KeyCode::Enter => {
+                if let Some(entry) = self.entries.get(self.selected) {
+                    self.current = match entry {
+                        PickerEntry::Parent(path)
+                        | PickerEntry::Folder(path)
+                        | PickerEntry::Drive(path) => path.clone(),
+                    };
+                    self.refresh();
+                }
+            }
+            _ => {}
+        }
+        (PickerMode::Browsing, None)
+    }
+
+    fn go(&mut self, step: Move) {
+        let last = self.entries.len().saturating_sub(1);
+        self.selected = match step {
+            Move::Up(by) => self.selected.saturating_sub(by),
+            Move::Down(by) => (self.selected + by).min(last),
+            Move::Home => 0,
+            Move::End => last,
+        };
+    }
+
     fn refresh(&mut self) {
         self.entries.clear();
         if let Some(parent) = self
@@ -408,14 +518,12 @@ fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
             Constraint::Length(2),
         ])
         .split(frame.area());
-    let path = picker
-        .path_input
-        .as_deref()
-        .unwrap_or_else(|| picker.current.to_str().unwrap_or(""));
-    let path_label = if picker.path_input.is_some() {
-        format!(" Folder path (editing) · {path}▏ ")
-    } else {
-        format!(" Current folder · {path} ")
+    let path_label = match picker.typed_path() {
+        Some(typed) => format!(" Folder path (editing) · {typed}▏ "),
+        None => format!(
+            " Current folder · {} ",
+            picker.current.to_str().unwrap_or("")
+        ),
     };
     let header = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -487,6 +595,9 @@ fn draw_directory_picker(frame: &mut Frame, picker: &DirectoryPicker) {
         ]),
         sections[2],
     );
+    if let PickerMode::Manager { manager, .. } = &picker.mode {
+        draw_manager(frame, manager);
+    }
 }
 
 type RecallTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -543,15 +654,20 @@ fn event_loop(
 
 fn handle_event(app: &mut App, live: &mut Live, event: Event, open: Opener) -> Option<Exit> {
     let exit = match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, live, key, open),
-        Event::Mouse(_) if app.manager.is_some() => None,
-        Event::Mouse(mouse) if !app.hits.is_empty() => {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => app.selected = app.selected.saturating_sub(3),
-                MouseEventKind::ScrollDown => {
-                    app.selected = (app.selected + 3).min(app.hits.len() - 1)
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            let (overlay, action) = route(mem::take(&mut app.overlay), key, || {
+                open(Some(app.root.clone()))
+            });
+            app.overlay = overlay;
+            apply(app, live, action)
+        }
+        Event::Mouse(mouse) => {
+            if !matches!(app.overlay, Overlay::Manager(_)) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => app.go(Move::Up(3)),
+                    MouseEventKind::ScrollDown => app.go(Move::Down(3)),
+                    _ => {}
                 }
-                _ => {}
             }
             None
         }
@@ -561,79 +677,80 @@ fn handle_event(app: &mut App, live: &mut Live, event: Event, open: Opener) -> O
     exit
 }
 
-fn handle_key(app: &mut App, live: &mut Live, key: KeyEvent, open: Opener) -> Option<Exit> {
+fn route(
+    overlay: Overlay,
+    key: KeyEvent,
+    open: impl FnOnce() -> IndexManager,
+) -> (Overlay, Action) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if ctrl && matches!(key.code, KeyCode::Char('q' | 'Q')) {
-        return Some(Exit::Quit);
-    }
-    if ctrl && matches!(key.code, KeyCode::Char('r' | 'R')) {
-        live.rescan();
-        app.status = if *live.mode() == live::Mode::Gone {
-            "The project folder is gone".into()
-        } else {
-            "Rescanning the project…".into()
-        };
-        return None;
-    }
-    if let Some(manager) = app.manager.as_mut() {
-        if manager.handle_key(key) == Outcome::Close {
-            app.manager = None;
+    match (overlay, key.code) {
+        (overlay, KeyCode::Char('q' | 'Q')) if ctrl => (overlay, Action::Quit),
+        (overlay, KeyCode::Char('r' | 'R')) if ctrl => (overlay, Action::Rescan),
+        (Overlay::Manager(mut manager), _) => {
+            let overlay = match manager.handle_key(key) {
+                Outcome::Close => Overlay::None,
+                Outcome::Stay => Overlay::Manager(manager),
+            };
+            (overlay, Action::Idle)
         }
-        return None;
-    }
-    if key.code == KeyCode::F(2) {
-        app.show_help = false;
-        app.manager = Some(open(Some(app.root.clone())));
-        return None;
-    }
-    if key.code == KeyCode::F(1) {
-        app.show_help = !app.show_help;
-        return None;
-    }
-    if app.show_help {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?')) {
-            app.show_help = false;
+        (Overlay::None | Overlay::Help, KeyCode::F(2)) => (Overlay::Manager(open()), Action::Idle),
+        (Overlay::None, KeyCode::F(1)) => (Overlay::Help, Action::Idle),
+        (Overlay::Help, KeyCode::F(1) | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?')) => {
+            (Overlay::None, Action::Idle)
         }
-        return None;
+        (Overlay::Help, _) => (Overlay::Help, Action::Idle),
+        (Overlay::None, code) => (Overlay::None, search_action(code, ctrl)),
     }
-    match key.code {
-        KeyCode::Esc => {
-            app.query.clear();
+}
+
+fn search_action(code: KeyCode, ctrl: bool) -> Action {
+    match code {
+        KeyCode::Esc => Action::Edit(Edit::Cancel),
+        KeyCode::Backspace => Action::Edit(Edit::Backspace),
+        KeyCode::Char('u') if ctrl => Action::Edit(Edit::Wipe),
+        KeyCode::Char('w') if ctrl => Action::Edit(Edit::DropWord),
+        KeyCode::Char('o' | 'O') if ctrl => Action::SwitchProject,
+        KeyCode::Char(ch) if !ctrl => Action::Edit(Edit::Type(ch)),
+        KeyCode::Up => Action::Move(Move::Up(1)),
+        KeyCode::PageUp => Action::Move(Move::Up(8)),
+        KeyCode::Down => Action::Move(Move::Down(1)),
+        KeyCode::PageDown => Action::Move(Move::Down(8)),
+        KeyCode::Home => Action::Move(Move::Home),
+        KeyCode::End => Action::Move(Move::End),
+        KeyCode::Enter => Action::OpenFile,
+        _ => Action::Idle,
+    }
+}
+
+fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
+    match action {
+        Action::Idle => {}
+        Action::Quit => return Some(Exit::Quit),
+        Action::SwitchProject => return Some(Exit::SwitchProject),
+        Action::Rescan => {
+            live.rescan();
+            app.status = if *live.mode() == live::Mode::Gone {
+                "The project folder is gone".into()
+            } else {
+                "Rescanning the project…".into()
+            };
+        }
+        Action::Edit(edit) => {
+            match edit {
+                Edit::Cancel | Edit::Wipe => app.query.clear(),
+                Edit::Backspace => {
+                    app.query.pop();
+                }
+                Edit::DropWord => remove_last_word(&mut app.query),
+                Edit::Type(ch) => app.query.push(ch),
+            }
             refresh_hits(app, live.index());
-            app.status = "Search cleared".into();
-        }
-        KeyCode::Backspace => {
-            app.query.pop();
-            refresh_hits(app, live.index());
-        }
-        KeyCode::Char('u') if ctrl => {
-            app.query.clear();
-            refresh_hits(app, live.index());
-        }
-        KeyCode::Char('w') if ctrl => {
-            remove_last_word(&mut app.query);
-            refresh_hits(app, live.index());
-        }
-        KeyCode::Char('o' | 'O') if ctrl => return Some(Exit::SwitchProject),
-        KeyCode::Char(ch) if !ctrl => {
-            app.query.push(ch);
-            refresh_hits(app, live.index());
-        }
-        KeyCode::Up | KeyCode::PageUp => {
-            app.selected =
-                app.selected
-                    .saturating_sub(if key.code == KeyCode::PageUp { 8 } else { 1 });
-        }
-        KeyCode::Down | KeyCode::PageDown => {
-            if !app.hits.is_empty() {
-                let step = if key.code == KeyCode::PageDown { 8 } else { 1 };
-                app.selected = (app.selected + step).min(app.hits.len() - 1);
+            if matches!(edit, Edit::Cancel) {
+                app.status = "Search cleared".into();
             }
         }
-        KeyCode::Home => app.selected = 0,
-        KeyCode::End => app.selected = app.hits.len().saturating_sub(1),
-        KeyCode::Enter => open_selected(app),
-        _ => {}
+        Action::Move(step) => app.go(step),
+        Action::OpenFile => open_selected(app),
     }
     None
 }
@@ -851,7 +968,7 @@ fn draw(frame: &mut Frame, app: &App) {
         content[1],
     );
 
-    let footer = if app.show_help {
+    let footer = if matches!(app.overlay, Overlay::Help) {
         Paragraph::new("F1 close help · Ctrl-Q quit")
     } else {
         Paragraph::new(vec![
@@ -866,7 +983,15 @@ fn draw(frame: &mut Frame, app: &App) {
         ])
     };
     frame.render_widget(footer, sections[2]);
-    if app.show_help {
+    match &app.overlay {
+        Overlay::None => {}
+        Overlay::Help => draw_help(frame),
+        Overlay::Manager(manager) => draw_manager(frame, manager),
+    }
+}
+
+fn draw_help(frame: &mut Frame) {
+    {
         let area = centered_rect(80, 80, frame.area());
         frame.render_widget(Clear, area);
         let help = Paragraph::new(vec![
@@ -900,13 +1025,10 @@ fn draw(frame: &mut Frame, app: &App) {
         );
         frame.render_widget(help, area);
     }
-    draw_manager(frame, app.manager.as_ref());
 }
 
-fn draw_manager(frame: &mut Frame, manager: Option<&IndexManager>) {
-    if let Some(manager) = manager {
-        manager.draw(frame, centered_rect(80, 70, frame.area()));
-    }
+fn draw_manager(frame: &mut Frame, manager: &IndexManager) {
+    manager.draw(frame, centered_rect(80, 70, frame.area()));
 }
 
 fn preview_lines(marked: &str) -> Vec<Line<'static>> {
@@ -1083,15 +1205,7 @@ mod tests {
     }
 
     fn picker_in(path: PathBuf) -> DirectoryPicker {
-        let mut picker = DirectoryPicker {
-            current: path,
-            entries: Vec::new(),
-            selected: 0,
-            path_input: None,
-            status: String::new(),
-        };
-        picker.refresh();
-        picker
+        DirectoryPicker::new(path)
     }
 
     fn picker_dir(name: &str) -> PathBuf {
@@ -1250,8 +1364,11 @@ mod tests {
             total_files: 0,
             root: PathBuf::from("root"),
             status: String::new(),
-            show_help,
-            manager: None,
+            overlay: if show_help {
+                Overlay::Help
+            } else {
+                Overlay::None
+            },
             preview_for: None,
             preview: Vec::new(),
             live: String::new(),
@@ -1365,12 +1482,10 @@ mod tests {
     }
 
     fn shown(app: &App) -> Shown {
-        if app.manager.is_some() {
-            Shown::Manager
-        } else if app.show_help {
-            Shown::Help
-        } else {
-            Shown::Nothing
+        match app.overlay {
+            Overlay::None => Shown::Nothing,
+            Overlay::Help => Shown::Help,
+            Overlay::Manager(_) => Shown::Manager,
         }
     }
 
@@ -1492,10 +1607,8 @@ mod tests {
         rig.show(Shown::Help);
         assert_eq!(rig.press(plain(KeyCode::F(2))), None);
         assert_eq!(shown(&rig.app), Shown::Manager);
-        assert!(!rig.app.show_help);
         assert_eq!(rig.press(plain(KeyCode::F(2))), None);
         assert_eq!(shown(&rig.app), Shown::Nothing);
-        assert!(!rig.app.show_help);
     }
 
     #[test]
@@ -1791,265 +1904,233 @@ mod tests {
         assert_eq!(shown(&rig.app), Shown::Help);
     }
 
-    fn picker_rig(name: &str) -> (DirectoryPicker, Option<IndexManager>, PathBuf) {
+    fn picker_rig(name: &str) -> (DirectoryPicker, PathBuf) {
         let dir = picker_dir(name);
         fs::create_dir_all(dir.join("alpha")).unwrap();
         fs::create_dir_all(dir.join("beta")).unwrap();
         fs::write(dir.join("file.txt"), "x").unwrap();
-        (picker_in(dir.clone()), None, dir)
+        (picker_in(dir.clone()), dir)
     }
 
-    fn pick(
-        picker: &mut DirectoryPicker,
-        manager: &mut Option<IndexManager>,
-        event: Event,
-    ) -> Option<Choice> {
-        picker_event(picker, manager, event, &no_disk)
+    fn pick(picker: &mut DirectoryPicker, event: Event) -> Option<Choice> {
+        picker_event(picker, event, &no_disk)
     }
 
-    fn pressed(
-        picker: &mut DirectoryPicker,
-        manager: &mut Option<IndexManager>,
-        key: KeyEvent,
-    ) -> Option<Choice> {
-        pick(picker, manager, Event::Key(key))
+    fn pressed(picker: &mut DirectoryPicker, key: KeyEvent) -> Option<Choice> {
+        pick(picker, Event::Key(key))
     }
 
-    fn picker_mode(picker: &DirectoryPicker, manager: &Option<IndexManager>) -> &'static str {
-        match (manager.is_some(), picker.path_input.is_some()) {
-            (true, _) => "manager",
-            (false, true) => "typing",
-            (false, false) => "browsing",
+    fn picker_mode(picker: &DirectoryPicker) -> &'static str {
+        match picker.mode {
+            PickerMode::Browsing => "browsing",
+            PickerMode::Typing(_) => "typing",
+            PickerMode::Manager { .. } => "manager",
         }
     }
 
     #[test]
     fn the_picker_quits_on_ctrl_q_from_every_mode() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-quit");
-        assert_eq!(
-            pressed(&mut picker, &mut manager, ctrl('q')),
-            Some(Choice::Quit)
-        );
-        pressed(&mut picker, &mut manager, ch('p'));
-        assert_eq!(picker_mode(&picker, &manager), "typing");
-        assert_eq!(
-            pressed(&mut picker, &mut manager, ctrl('q')),
-            Some(Choice::Quit)
-        );
-        pressed(&mut picker, &mut manager, plain(KeyCode::F(2)));
-        assert_eq!(picker_mode(&picker, &manager), "manager");
-        assert_eq!(
-            pressed(&mut picker, &mut manager, ctrl('Q')),
-            Some(Choice::Quit)
-        );
+        let (mut picker, dir) = picker_rig("pin-picker-quit");
+        assert_eq!(pressed(&mut picker, ctrl('q')), Some(Choice::Quit));
+        pressed(&mut picker, ch('p'));
+        assert_eq!(picker_mode(&picker), "typing");
+        assert_eq!(pressed(&mut picker, ctrl('q')), Some(Choice::Quit));
+        pressed(&mut picker, plain(KeyCode::F(2)));
+        assert_eq!(picker_mode(&picker), "manager");
+        assert_eq!(pressed(&mut picker, ctrl('Q')), Some(Choice::Quit));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn esc_and_q_go_back_from_browsing_and_s_or_space_pick_the_folder() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-browse");
+        let (mut picker, dir) = picker_rig("pin-picker-browse");
         for key in [plain(KeyCode::Esc), ch('q'), ch('Q')] {
-            assert_eq!(pressed(&mut picker, &mut manager, key), Some(Choice::Back));
+            assert_eq!(pressed(&mut picker, key), Some(Choice::Back));
         }
         for key in [ch('s'), ch('S'), ch(' ')] {
-            assert_eq!(
-                pressed(&mut picker, &mut manager, key),
-                Some(Choice::Folder(dir.clone()))
-            );
+            assert_eq!(pressed(&mut picker, key), Some(Choice::Folder(dir.clone())));
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn browsing_letters_ignore_modifiers_so_ctrl_s_picks_and_ctrl_p_edits() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-ctrl-letters");
+        let (mut picker, dir) = picker_rig("pin-picker-ctrl-letters");
         assert_eq!(
-            pressed(&mut picker, &mut manager, ctrl('s')),
+            pressed(&mut picker, ctrl('s')),
             Some(Choice::Folder(dir.clone()))
         );
-        assert_eq!(pressed(&mut picker, &mut manager, ctrl('p')), None);
-        assert_eq!(picker_mode(&picker, &manager), "typing");
+        assert_eq!(pressed(&mut picker, ctrl('p')), None);
+        assert_eq!(picker_mode(&picker), "typing");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_picker_moves_enters_folders_and_walks_up() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-move");
+        let (mut picker, dir) = picker_rig("pin-picker-move");
         assert_eq!(picker.selected, 1);
-        pressed(&mut picker, &mut manager, plain(KeyCode::Down));
+        pressed(&mut picker, plain(KeyCode::Down));
         assert_eq!(picker.selected, 2);
-        pressed(&mut picker, &mut manager, plain(KeyCode::Down));
+        pressed(&mut picker, plain(KeyCode::Down));
         assert_eq!(picker.selected, 2);
-        pressed(&mut picker, &mut manager, plain(KeyCode::Up));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Up));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Up));
+        pressed(&mut picker, plain(KeyCode::Up));
+        pressed(&mut picker, plain(KeyCode::Up));
+        pressed(&mut picker, plain(KeyCode::Up));
         assert_eq!(picker.selected, 0);
-        pressed(&mut picker, &mut manager, plain(KeyCode::Down));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Enter));
+        pressed(&mut picker, plain(KeyCode::Down));
+        pressed(&mut picker, plain(KeyCode::Enter));
         assert_eq!(picker.current, dir.join("alpha"));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Left));
+        pressed(&mut picker, plain(KeyCode::Left));
         assert_eq!(picker.current, dir);
-        pressed(&mut picker, &mut manager, plain(KeyCode::Down));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Enter));
+        pressed(&mut picker, plain(KeyCode::Down));
+        pressed(&mut picker, plain(KeyCode::Enter));
         assert_eq!(picker.current, dir.join("beta"));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Backspace));
+        pressed(&mut picker, plain(KeyCode::Backspace));
         assert_eq!(picker.current, dir);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_picker_wheel_moves_by_three_and_clamps() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-wheel");
-        pick(&mut picker, &mut manager, wheel(MouseEventKind::ScrollDown));
+        let (mut picker, dir) = picker_rig("pin-picker-wheel");
+        pick(&mut picker, wheel(MouseEventKind::ScrollDown));
         assert_eq!(picker.selected, 2);
-        pick(&mut picker, &mut manager, wheel(MouseEventKind::ScrollUp));
+        pick(&mut picker, wheel(MouseEventKind::ScrollUp));
         assert_eq!(picker.selected, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_picker_wheel_is_ignored_under_the_manager_but_not_while_typing() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-wheel-modes");
-        pressed(&mut picker, &mut manager, ch('p'));
-        pick(&mut picker, &mut manager, wheel(MouseEventKind::ScrollDown));
+        let (mut picker, dir) = picker_rig("pin-picker-wheel-modes");
+        pressed(&mut picker, ch('p'));
+        pick(&mut picker, wheel(MouseEventKind::ScrollDown));
         assert_eq!(picker.selected, 2);
-        pick(&mut picker, &mut manager, wheel(MouseEventKind::ScrollUp));
-        pressed(&mut picker, &mut manager, plain(KeyCode::F(2)));
-        pick(&mut picker, &mut manager, wheel(MouseEventKind::ScrollDown));
+        pick(&mut picker, wheel(MouseEventKind::ScrollUp));
+        pressed(&mut picker, plain(KeyCode::F(2)));
+        pick(&mut picker, wheel(MouseEventKind::ScrollDown));
         assert_eq!(picker.selected, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn p_starts_editing_the_current_path_and_keys_edit_it() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-edit");
-        assert_eq!(pressed(&mut picker, &mut manager, ch('P')), None);
-        assert_eq!(
-            picker.path_input.as_deref(),
-            Some(dir.to_string_lossy().as_ref())
-        );
+        let (mut picker, dir) = picker_rig("pin-picker-edit");
+        assert_eq!(pressed(&mut picker, ch('P')), None);
+        assert_eq!(picker.typed_path(), Some(dir.to_string_lossy().as_ref()));
         assert_eq!(picker.status, "Edit the folder path, then press Enter");
-        pressed(&mut picker, &mut manager, plain(KeyCode::Backspace));
-        pressed(&mut picker, &mut manager, ch('q'));
-        pressed(&mut picker, &mut manager, ch('s'));
+        pressed(&mut picker, plain(KeyCode::Backspace));
+        pressed(&mut picker, ch('q'));
+        pressed(&mut picker, ch('s'));
         let full = dir.to_string_lossy();
         let typed = format!("{}qs", &full[..full.len() - 1]);
-        assert_eq!(picker.path_input.as_deref(), Some(typed.as_str()));
-        pressed(&mut picker, &mut manager, ctrl('a'));
-        assert_eq!(picker.path_input.as_deref(), Some(""));
-        pressed(&mut picker, &mut manager, ctrl('x'));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Tab));
-        assert_eq!(picker.path_input.as_deref(), Some(""));
-        assert_eq!(picker_mode(&picker, &manager), "typing");
+        assert_eq!(picker.typed_path(), Some(typed.as_str()));
+        pressed(&mut picker, ctrl('a'));
+        assert_eq!(picker.typed_path(), Some(""));
+        pressed(&mut picker, ctrl('x'));
+        pressed(&mut picker, plain(KeyCode::Tab));
+        assert_eq!(picker.typed_path(), Some(""));
+        assert_eq!(picker_mode(&picker), "typing");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn esc_in_the_typed_path_leaves_typing_without_going_back() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-edit-esc");
-        pressed(&mut picker, &mut manager, ch('p'));
-        assert_eq!(
-            pressed(&mut picker, &mut manager, plain(KeyCode::Esc)),
-            None
-        );
-        assert_eq!(picker_mode(&picker, &manager), "browsing");
+        let (mut picker, dir) = picker_rig("pin-picker-edit-esc");
+        pressed(&mut picker, ch('p'));
+        assert_eq!(pressed(&mut picker, plain(KeyCode::Esc)), None);
+        assert_eq!(picker_mode(&picker), "browsing");
         assert_eq!(picker.current, dir);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn enter_on_a_typed_folder_goes_there_and_stops_typing() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-edit-go");
-        pressed(&mut picker, &mut manager, ch('p'));
-        pressed(&mut picker, &mut manager, ctrl('a'));
+        let (mut picker, dir) = picker_rig("pin-picker-edit-go");
+        pressed(&mut picker, ch('p'));
+        pressed(&mut picker, ctrl('a'));
         for c in dir.join("alpha").to_string_lossy().chars() {
-            pressed(&mut picker, &mut manager, ch(c));
+            pressed(&mut picker, ch(c));
         }
-        assert_eq!(
-            pressed(&mut picker, &mut manager, plain(KeyCode::Enter)),
-            None
-        );
-        assert_eq!(picker_mode(&picker, &manager), "browsing");
+        assert_eq!(pressed(&mut picker, plain(KeyCode::Enter)), None);
+        assert_eq!(picker_mode(&picker), "browsing");
         assert_eq!(picker.current.file_name().unwrap(), "alpha");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn enter_on_a_typed_file_or_missing_path_explains_and_keeps_typing() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-edit-bad");
-        pressed(&mut picker, &mut manager, ch('p'));
-        pressed(&mut picker, &mut manager, ctrl('a'));
+        let (mut picker, dir) = picker_rig("pin-picker-edit-bad");
+        pressed(&mut picker, ch('p'));
+        pressed(&mut picker, ctrl('a'));
         for c in dir.join("file.txt").to_string_lossy().chars() {
-            pressed(&mut picker, &mut manager, ch(c));
+            pressed(&mut picker, ch(c));
         }
-        pressed(&mut picker, &mut manager, plain(KeyCode::Enter));
+        pressed(&mut picker, plain(KeyCode::Enter));
         assert_eq!(picker.status, "That path is not a folder");
-        assert_eq!(picker_mode(&picker, &manager), "typing");
-        pressed(&mut picker, &mut manager, ctrl('a'));
+        assert_eq!(picker_mode(&picker), "typing");
+        pressed(&mut picker, ctrl('a'));
         for c in dir.join("missing").to_string_lossy().chars() {
-            pressed(&mut picker, &mut manager, ch(c));
+            pressed(&mut picker, ch(c));
         }
-        pressed(&mut picker, &mut manager, plain(KeyCode::Enter));
+        pressed(&mut picker, plain(KeyCode::Enter));
         assert!(
             picker.status.starts_with("Cannot open that path"),
             "{}",
             picker.status
         );
-        assert_eq!(picker_mode(&picker, &manager), "typing");
+        assert_eq!(picker_mode(&picker), "typing");
         assert_eq!(picker.current, dir);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_picker_manager_swallows_keys_and_closes_on_its_closing_keys() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-manager");
+        let (mut picker, dir) = picker_rig("pin-picker-manager");
         for closing in [plain(KeyCode::Esc), ch('q'), plain(KeyCode::F(2))] {
-            assert_eq!(
-                pressed(&mut picker, &mut manager, plain(KeyCode::F(2))),
-                None
-            );
-            assert_eq!(picker_mode(&picker, &manager), "manager");
+            assert_eq!(pressed(&mut picker, plain(KeyCode::F(2))), None);
+            assert_eq!(picker_mode(&picker), "manager");
             for key in [
                 ch('s'),
                 ch('p'),
                 plain(KeyCode::Enter),
                 plain(KeyCode::Down),
             ] {
-                assert_eq!(pressed(&mut picker, &mut manager, key), None, "{key:?}");
-                assert_eq!(picker_mode(&picker, &manager), "manager");
+                assert_eq!(pressed(&mut picker, key), None, "{key:?}");
+                assert_eq!(picker_mode(&picker), "manager");
             }
             assert_eq!(picker.current, dir);
             assert_eq!(picker.selected, 1);
-            assert_eq!(pressed(&mut picker, &mut manager, closing), None);
-            assert_eq!(picker_mode(&picker, &manager), "browsing");
+            assert_eq!(pressed(&mut picker, closing), None);
+            assert_eq!(picker_mode(&picker), "browsing");
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn f2_works_while_typing_and_the_typed_path_survives_the_manager() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-manager-typing");
-        pressed(&mut picker, &mut manager, ch('p'));
-        pressed(&mut picker, &mut manager, ch('z'));
-        let typed = picker.path_input.clone();
-        pressed(&mut picker, &mut manager, plain(KeyCode::F(2)));
-        assert_eq!(picker_mode(&picker, &manager), "manager");
-        pressed(&mut picker, &mut manager, ch('x'));
-        pressed(&mut picker, &mut manager, plain(KeyCode::Esc));
-        assert_eq!(picker_mode(&picker, &manager), "typing");
-        assert_eq!(picker.path_input, typed);
+        let (mut picker, dir) = picker_rig("pin-picker-manager-typing");
+        pressed(&mut picker, ch('p'));
+        pressed(&mut picker, ch('z'));
+        let typed = picker.typed_path().map(str::to_owned);
+        pressed(&mut picker, plain(KeyCode::F(2)));
+        assert_eq!(picker_mode(&picker), "manager");
+        pressed(&mut picker, ch('x'));
+        pressed(&mut picker, plain(KeyCode::Esc));
+        assert_eq!(picker_mode(&picker), "typing");
+        assert_eq!(picker.typed_path().map(str::to_owned), typed);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_picker_ignores_key_releases() {
-        let (mut picker, mut manager, dir) = picker_rig("pin-picker-release");
+        let (mut picker, dir) = picker_rig("pin-picker-release");
         let release = KeyEvent::new_with_kind(
             KeyCode::Char('q'),
             KeyModifiers::NONE,
             KeyEventKind::Release,
         );
-        assert_eq!(pressed(&mut picker, &mut manager, release), None);
+        assert_eq!(pressed(&mut picker, release), None);
         let _ = fs::remove_dir_all(&dir);
     }
 }
