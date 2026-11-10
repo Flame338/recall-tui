@@ -7,11 +7,11 @@ use crate::{
     cache,
     lux::{DEFAULT_LIBRARY, MARK_END, MARK_START},
     shelf::{self, Mode, Outcome, Reach, Shelf, Source},
+    view::plain_path,
 };
 
 const DEFAULT_LIMIT: usize = 10;
 const SNIPPET_LENGTH: usize = 100;
-const VERBATIM_PREFIX: &str = r"\\?\";
 const USAGE: &str = "usage: recall search [--syntax] [--limit N] [--json] [--lib PATH] QUERY...\n       recall projects [--lib PATH]";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,11 +163,7 @@ pub fn missing_library(library: &Path) -> String {
 }
 
 fn plain_root(root: &Path) -> String {
-    let shown = root.to_string_lossy();
-    shown
-        .strip_prefix(VERBATIM_PREFIX)
-        .unwrap_or(&shown)
-        .to_owned()
+    plain_path(&root.to_string_lossy()).into_owned()
 }
 
 fn one_line(marked: &str) -> String {
@@ -493,6 +489,15 @@ mod tests {
             lines[3].contains("watcher debounces bursts"),
             "{}",
             lines[3]
+        );
+    }
+
+    #[test]
+    fn a_verbatim_root_prints_in_its_plain_form() {
+        assert_eq!(plain_root(Path::new(r"\\?\C:\work")), r"C:\work");
+        assert_eq!(
+            plain_root(Path::new(r"\\?\UNC\srv\share\p")),
+            r"\\srv\share\p"
         );
     }
 

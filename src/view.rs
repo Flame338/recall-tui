@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     io::stdout,
     path::{Path, PathBuf},
 };
@@ -80,12 +81,19 @@ fn is_invisible_format(ch: char) -> bool {
     )
 }
 
+pub(crate) fn plain_path(path: &str) -> Cow<'_, str> {
+    match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => Cow::Owned(format!(r"\\{share}")),
+        None => Cow::Borrowed(path.strip_prefix(r"\\?\").unwrap_or(path)),
+    }
+}
+
 pub(crate) fn compact_path(path: &Path, max_chars: usize) -> String {
     let raw = path.to_string_lossy();
-    let value = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let value = plain_path(&raw);
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= max_chars {
-        return value.to_owned();
+        return value.into_owned();
     }
     let tail: String = chars[chars.len().saturating_sub(max_chars - 1)..]
         .iter()
@@ -122,5 +130,22 @@ mod tests {
         assert_eq!(sanitize_for_display("ab\tx"), "ab  x");
         assert_eq!(sanitize_for_display("\u{FEFF}a\u{FE0F}\u{200D}b\x1b"), "ab");
         assert_eq!(sanitize_for_display("naïve → ✓"), "naïve → ✓");
+    }
+
+    #[test]
+    fn a_verbatim_path_becomes_its_plain_form() {
+        assert_eq!(plain_path(r"\\?\C:\x"), r"C:\x");
+        assert_eq!(plain_path(r"\\?\UNC\srv\share\p"), r"\\srv\share\p");
+        assert_eq!(plain_path(r"C:\x"), r"C:\x");
+        assert_eq!(plain_path(r"\\srv\share"), r"\\srv\share");
+        assert_eq!(plain_path("/home/x"), "/home/x");
+        assert_eq!(plain_path(r"\\?\UNC"), "UNC");
+    }
+
+    #[test]
+    fn compact_path_shows_a_unc_root_as_a_share() {
+        let path = Path::new(r"\\?\UNC\srv\share\p");
+        assert_eq!(compact_path(path, 40), r"\\srv\share\p");
+        assert_eq!(compact_path(Path::new(r"\\?\C:\x"), 40), r"C:\x");
     }
 }

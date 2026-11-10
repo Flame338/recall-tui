@@ -6,9 +6,8 @@ use std::{
 use crate::{
     cache,
     lux::{Hit, LuxIndex, QueryFailure},
+    view::plain_path,
 };
-
-const VERBATIM_PREFIX: &str = r"\\?\";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -70,9 +69,9 @@ impl Project {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let shown = root.to_string_lossy();
-        let plain = shown.strip_prefix(VERBATIM_PREFIX).unwrap_or(&shown);
-        let name = Path::new(plain).file_name().map_or_else(
-            || plain.to_owned(),
+        let plain = plain_path(&shown);
+        let name = Path::new(plain.as_ref()).file_name().map_or_else(
+            || plain.to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
         Self { name, root }
@@ -90,8 +89,8 @@ pub struct Shelf {
 }
 
 fn same_root(left: &str, right: &str) -> bool {
-    let left = left.strip_prefix(VERBATIM_PREFIX).unwrap_or(left);
-    let right = right.strip_prefix(VERBATIM_PREFIX).unwrap_or(right);
+    let left = plain_path(left);
+    let right = plain_path(right);
     if cfg!(windows) {
         left.to_lowercase() == right.to_lowercase()
     } else {
@@ -401,6 +400,16 @@ mod tests {
         let verbatim = Project::at(r"\\?\F:/work/Alpha");
         assert_eq!(verbatim.name, "Alpha");
         assert_eq!(verbatim.root, PathBuf::from(r"\\?\F:/work/Alpha"));
+    }
+
+    #[test]
+    fn a_verbatim_unc_root_reads_as_the_share_it_is() {
+        assert_eq!(Project::at(r"\\?\UNC\srv\share").name, r"\\srv\share");
+        assert!(same_root(r"\\?\UNC\srv\share\Alpha", r"\\srv\share\Alpha"));
+        assert!(!same_root(
+            r"\\?\UNC\srv\share\Alpha",
+            r"UNC\srv\share\Alpha"
+        ));
     }
 
     fn corpus() -> (Shard, Shelf) {
