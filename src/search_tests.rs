@@ -1082,3 +1082,28 @@ fn ctrl_e_with_a_query_keeps_reporting_results() {
     rig.press(ctrl('e'));
     assert!(status_of(&rig).starts_with("14 results across 3 projects"));
 }
+
+#[test]
+fn only_a_file_that_exists_is_launched() {
+    let dir = picker_dir("launch-target");
+    fs::write(dir.join("here.md"), "zebra").unwrap();
+    assert_eq!(
+        launch_target(dir.join("here.md"), "here.md"),
+        Ok(dir.join("here.md"))
+    );
+    assert_eq!(
+        launch_target(dir.join("gone.md"), "gone.md"),
+        Err("File is gone: gone.md".to_owned())
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enter_on_a_hit_whose_file_is_gone_says_so_instead_of_opening() {
+    let mut rig = Rig::shelved("open-gone");
+    rig.type_text("zebra");
+    rig.press(ctrl('e'));
+    assert_eq!(rig.app.hits[0].key, "far.md");
+    rig.press(plain(KeyCode::Enter));
+    assert_eq!(status_of(&rig), "File is gone: far.md");
+}

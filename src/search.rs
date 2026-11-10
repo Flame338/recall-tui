@@ -496,13 +496,29 @@ fn target_path(all: &[Source], found: &Found) -> Option<PathBuf> {
     Some(all.get(found.source)?.project.root.join(&found.key))
 }
 
+fn launch_target(path: PathBuf, key: &str) -> Result<PathBuf, String> {
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(format!("File is gone: {key}"))
+    }
+}
+
 fn open_selected(app: &mut App, index: &LuxIndex) {
     let Some(hit) = app.hits.get(app.selected) else {
         return;
     };
+    let key = hit.key.clone();
     let all = sources(Some((&app.project, index)), &app.shelf);
     let Some(path) = target_path(&all, hit) else {
         return;
+    };
+    let path = match launch_target(path, &key) {
+        Ok(path) => path,
+        Err(gone) => {
+            app.status = gone.into();
+            return;
+        }
     };
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe").arg(&path).spawn();
@@ -511,7 +527,7 @@ fn open_selected(app: &mut App, index: &LuxIndex) {
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = Command::new("xdg-open").arg(&path).spawn();
     let status = match result {
-        Ok(_) => format!("Opened {}", hit.key),
+        Ok(_) => format!("Opened {key}"),
         Err(error) => format!("Could not open file: {error}"),
     };
     app.status = status.into();
