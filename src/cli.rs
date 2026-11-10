@@ -7,11 +7,11 @@ use crate::{
     cache,
     lux::{DEFAULT_LIBRARY, MARK_END, MARK_START},
     shelf::{self, Mode, Outcome, Reach, Shelf, Source},
+    view::plain_path,
 };
 
 const DEFAULT_LIMIT: usize = 10;
 const SNIPPET_LENGTH: usize = 100;
-const VERBATIM_PREFIX: &str = r"\\?\";
 const USAGE: &str = "usage: recall search [--syntax] [--limit N] [--json] [--lib PATH] QUERY...\n       recall projects [--lib PATH]";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +26,7 @@ pub struct SearchOptions {
 pub enum Command {
     Search(SearchOptions),
     Projects,
+    Help,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +84,17 @@ fn value_of<'a>(
     rest.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 
+fn is_help(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h")
+}
+
+fn help() -> Invocation {
+    Invocation {
+        command: Command::Help,
+        library: None,
+    }
+}
+
 pub fn parse(args: &[String]) -> Result<Invocation, String> {
     let (name, rest) = args.split_first().ok_or("missing command")?;
     let mut rest = rest.iter();
@@ -92,6 +104,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
             while let Some(arg) = rest.next() {
                 if arg == "--lib" {
                     library = Some(PathBuf::from(value_of("--lib", &mut rest)?));
+                } else if is_help(arg) {
+                    return Ok(help());
                 } else {
                     return Err(format!("projects does not take {arg}"));
                 }
@@ -122,6 +136,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
                             })?;
                     }
                     "--" => words.extend(rest.by_ref().map(String::as_str)),
+                    "--help" => return Ok(help()),
+                    "-h" if words.is_empty() => return Ok(help()),
                     flag if flag.starts_with("--") => {
                         return Err(format!("unknown option {flag}"));
                     }
@@ -129,7 +145,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
                 }
             }
             let query = words.join(" ");
-            if query.trim().is_empty() {
+            if shelf::parse_request(&query, mode, Reach::Everywhere)
+                .text
+                .trim()
+                .is_empty()
+            {
                 return Err("search needs a query".into());
             }
             Ok(Invocation {
@@ -163,11 +183,7 @@ pub fn missing_library(library: &Path) -> String {
 }
 
 fn plain_root(root: &Path) -> String {
-    let shown = root.to_string_lossy();
-    shown
-        .strip_prefix(VERBATIM_PREFIX)
-        .unwrap_or(&shown)
-        .to_owned()
+    plain_path(&root.to_string_lossy()).into_owned()
 }
 
 fn one_line(marked: &str) -> String {
@@ -269,18 +285,50 @@ pub fn exit_for(outcome: &Outcome) -> Exit {
     }
 }
 
+pub fn failure_note(outcome: &Outcome) -> String {
+    match outcome.failed.len() {
+        0 => String::new(),
+        count => format!("recall: {count} project(s) could not be searched\n"),
+    }
+}
+
+fn report_of(
+    sources: &[Source],
+    options: &SearchOptions,
+    request: &shelf::Request,
+    outcome: &Outcome,
+) -> Report {
+    let note = failure_note(outcome);
+    if let Some(problem) = outcome.problem {
+        let stderr = render_problem(&options.query, problem.offset) + &note;
+        return Report::err(stderr, Exit::Usage);
+    }
+    let stdout = if options.json {
+        render_json(sources, outcome)
+    } else {
+        render_text(sources, request, outcome)
+    };
+    Report {
+        stdout,
+        stderr: note,
+        exit: exit_for(outcome),
+    }
+}
+
 pub fn search_report(sources: &[Source], options: &SearchOptions) -> Report {
     let request = shelf::parse_request(&options.query, options.mode, Reach::Everywhere);
     let outcome = shelf::search(sources, &request, options.limit);
-    if let Some(problem) = outcome.problem {
-        return Report::err(render_problem(&options.query, problem.offset), Exit::Usage);
-    }
-    let stdout = if options.json {
-        render_json(sources, &outcome)
-    } else {
-        render_text(sources, &request, &outcome)
-    };
-    Report::out(stdout, exit_for(&outcome))
+    report_of(sources, options, &request, &outcome)
+}
+
+fn usage_report() -> Report {
+    Report::out(
+        format!(
+            "{USAGE}
+"
+        ),
+        Exit::Matched,
+    )
 }
 
 pub fn run(command: &Command, cache_dir: &Path, library: &Path) -> Report {
@@ -298,6 +346,7 @@ pub fn run(command: &Command, cache_dir: &Path, library: &Path) -> Report {
     match command {
         Command::Projects => Report::out(render_projects(&all), Exit::Matched),
         Command::Search(options) => search_report(&all, options),
+        Command::Help => usage_report(),
     }
 }
 
@@ -308,6 +357,9 @@ fn report_for(args: &[String]) -> Report {
             return Report::err(format!("recall: {message}\n{USAGE}\n"), Exit::Usage);
         }
     };
+    if invocation.command == Command::Help {
+        return usage_report();
+    }
     let library = resolve_library(invocation.library);
     if !library.is_file() {
         return Report::err(
@@ -340,7 +392,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::{Header, Manifest, Stamp, serialize},
+        cache::Records,
         lux::{LuxIndex, library_path},
         shelf::{Project, Shard},
     };
@@ -352,7 +404,7 @@ mod tests {
     fn search_options(list: &[&str]) -> SearchOptions {
         match parse(&args(list)).unwrap().command {
             Command::Search(options) => options,
-            Command::Projects => panic!("expected a search"),
+            Command::Projects | Command::Help => panic!("expected a search"),
         }
     }
 
@@ -447,6 +499,59 @@ mod tests {
     }
 
     #[test]
+    fn a_query_of_only_scopes_is_a_usage_error() {
+        for list in [
+            &["search", "@name"][..],
+            &["search", "@a", "@b"],
+            &["search", "@a", " "],
+        ] {
+            assert_eq!(
+                parse(&args(list)),
+                Err("search needs a query".to_owned()),
+                "{list:?}"
+            );
+        }
+        assert!(parse(&args(&["search", "@"])).is_ok());
+        assert!(parse(&args(&["search", "@name", "text"])).is_ok());
+        let done = report_for(&args(&["search", "@name"]));
+        assert_eq!(done.exit, Exit::Usage);
+        assert!(done.stderr.starts_with(
+            "recall: search needs a query
+"
+        ));
+    }
+
+    #[test]
+    fn help_after_a_command_prints_the_usage_and_exits_zero() {
+        for list in [
+            &["search", "--help"][..],
+            &["search", "-h"],
+            &["search", "watcher", "--help"],
+            &["projects", "--help"],
+            &["projects", "-h"],
+        ] {
+            let parsed = parse(&args(list)).unwrap_or_else(|error| panic!("{list:?}: {error}"));
+            assert_eq!(parsed.command, Command::Help, "{list:?}");
+            let done = report_for(&args(list));
+            assert_eq!(done.exit, Exit::Matched, "{list:?}");
+            assert_eq!(
+                done.stdout,
+                format!(
+                    "{USAGE}
+"
+                ),
+                "{list:?}"
+            );
+            assert!(done.stderr.is_empty(), "{list:?}");
+        }
+        assert_eq!(search_options(&["search", "--", "--help"]).query, "--help");
+        assert_eq!(
+            search_options(&["search", "--syntax", "+watcher", "-h"]).query,
+            "+watcher -h"
+        );
+    }
+
+    #[test]
     fn the_library_flag_beats_the_default() {
         assert_eq!(
             resolve_library(Some(PathBuf::from("flag.dll"))),
@@ -493,6 +598,15 @@ mod tests {
             lines[3].contains("watcher debounces bursts"),
             "{}",
             lines[3]
+        );
+    }
+
+    #[test]
+    fn a_verbatim_root_prints_in_its_plain_form() {
+        assert_eq!(plain_root(Path::new(r"\\?\C:\work")), r"C:\work");
+        assert_eq!(
+            plain_root(Path::new(r"\\?\UNC\srv\share\p")),
+            r"\\srv\share\p"
         );
     }
 
@@ -566,6 +680,47 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_source_is_named_on_stderr_without_changing_the_exit() {
+        let shelf = corpus();
+        let all = shelf::sources(None, &shelf);
+        let opts = options("watcher", Mode::Fuzzy, false);
+        let request = shelf::parse_request(&opts.query, opts.mode, Reach::Everywhere);
+        let mut outcome = shelf::search(&all, &request, opts.limit);
+        let clean = report_of(&all, &opts, &request, &outcome);
+        assert!(clean.stderr.is_empty());
+
+        outcome.failed = vec![1];
+        let matched = report_of(&all, &opts, &request, &outcome);
+        assert_eq!(
+            matched.stderr,
+            "recall: 1 project(s) could not be searched
+"
+        );
+        assert_eq!(
+            (matched.stdout, matched.exit),
+            (clean.stdout, Exit::Matched)
+        );
+
+        outcome.failed = vec![0, 1];
+        outcome.found.clear();
+        let nothing = report_of(&all, &opts, &request, &outcome);
+        assert_eq!(
+            nothing.stderr,
+            "recall: 2 project(s) could not be searched
+"
+        );
+        assert_eq!(nothing.exit, Exit::Nothing);
+
+        outcome.problem = Some(shelf::Problem { offset: 0 });
+        let usage = report_of(&all, &opts, &request, &outcome);
+        assert!(usage.stderr.ends_with(
+            "recall: 2 project(s) could not be searched
+"
+        ));
+        assert_eq!(usage.exit, Exit::Usage);
+    }
+
+    #[test]
     fn exit_codes_follow_the_outcome() {
         let shelf = corpus();
         let matched = report(&shelf, &options("watcher", Mode::Fuzzy, false));
@@ -575,24 +730,12 @@ mod tests {
         assert_eq!(codes, [0, 1, 2]);
     }
 
-    fn save_entry(dir: &Path, stem: &str, root: &str, body: &str) {
+    fn save_entry(dir: &Path, root: &Path, body: &str) {
         let mut index = LuxIndex::load(&library_path()).unwrap();
         index.add("a.md", "a.md", body).unwrap();
-        index.save(&dir.join(format!("{stem}.lux"))).unwrap();
-        let header = Header {
-            fingerprint: "fp".into(),
-            root: root.into(),
-            index: Stamp {
-                size: 1,
-                modified: 1,
-            },
-            cursor: None,
-        };
-        fs::write(
-            dir.join(format!("{stem}.manifest")),
-            serialize(&header, &Manifest::new()),
-        )
-        .unwrap();
+        let files = cache::cache_files(dir, root);
+        let fingerprint = cache::fingerprint(&library_path());
+        cache::save(&index, &files, &fingerprint, None, &Records::new()).unwrap();
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -605,16 +748,14 @@ mod tests {
     #[test]
     fn run_searches_and_lists_a_saved_cache() {
         let dir = temp_dir("saved");
-        save_entry(
-            &dir,
-            "0000000000000001",
-            r"\\?\F:/work/Zeta",
-            "zeta watcher",
-        );
+        let zeta = dir.join("Zeta");
+        fs::create_dir_all(&zeta).unwrap();
+        let verbatim = format!(r"\\?\{}", zeta.display());
+        save_entry(&dir, Path::new(&verbatim), "zeta watcher");
         let library = library_path();
 
         let projects = run(&Command::Projects, &dir, &library);
-        assert_eq!(projects.stdout, "F:/work/Zeta\n");
+        assert_eq!(projects.stdout, format!("{}\n", zeta.display()));
         assert_eq!(projects.exit, Exit::Matched);
 
         let found = run(
@@ -630,7 +771,8 @@ mod tests {
             &dir,
             &library,
         );
-        assert!(json.stdout.contains(r#""root": "F:/work/Zeta""#));
+        let root = format!(r#""root": {}"#, json_string(&zeta.to_string_lossy()));
+        assert!(json.stdout.contains(&root), "{}", json.stdout);
         let _ = fs::remove_dir_all(&dir);
     }
 

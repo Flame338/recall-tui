@@ -6,9 +6,8 @@ use std::{
 use crate::{
     cache,
     lux::{Hit, LuxIndex, QueryFailure},
+    view::plain_path,
 };
-
-const VERBATIM_PREFIX: &str = r"\\?\";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -70,9 +69,9 @@ impl Project {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let shown = root.to_string_lossy();
-        let plain = shown.strip_prefix(VERBATIM_PREFIX).unwrap_or(&shown);
-        let name = Path::new(plain).file_name().map_or_else(
-            || plain.to_owned(),
+        let plain = plain_path(&shown);
+        let name = Path::new(plain.as_ref()).file_name().map_or_else(
+            || plain.to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
         Self { name, root }
@@ -84,14 +83,21 @@ pub struct Shard {
     pub index: LuxIndex,
 }
 
+struct Origin {
+    cache_dir: PathBuf,
+    library: PathBuf,
+    except: Option<PathBuf>,
+}
+
 #[derive(Default)]
 pub struct Shelf {
     shards: Vec<Shard>,
+    origin: Option<Origin>,
 }
 
 fn same_root(left: &str, right: &str) -> bool {
-    let left = left.strip_prefix(VERBATIM_PREFIX).unwrap_or(left);
-    let right = right.strip_prefix(VERBATIM_PREFIX).unwrap_or(right);
+    let left = plain_path(left);
+    let right = plain_path(right);
     if cfg!(windows) {
         left.to_lowercase() == right.to_lowercase()
     } else {
@@ -101,7 +107,9 @@ fn same_root(left: &str, right: &str) -> bool {
 
 impl Shelf {
     pub fn load(cache_dir: &Path, library: &Path, except: Option<&Path>) -> Self {
+        let except_path = except.map(Path::to_path_buf);
         let except = except.map(|path| path.to_string_lossy().into_owned());
+        let fingerprint = cache::fingerprint(library);
         let shards = cache::list_entries(cache_dir)
             .into_iter()
             .filter_map(|entry| {
@@ -112,25 +120,50 @@ impl Shelf {
                 {
                     return None;
                 }
+                if !Path::new(&root).is_dir() {
+                    return None;
+                }
+                let files = cache::entry_files(cache_dir, &entry.name, Path::new(&root));
                 let mut index = LuxIndex::load(library).ok()?;
-                index
-                    .restore(&cache_dir.join(format!("{}.lux", entry.name)))
-                    .ok()?;
+                cache::restore(&mut index, &files, &fingerprint)?;
                 Some(Shard {
                     project: Project::at(root),
                     index,
                 })
             })
             .collect();
-        Self::from_shards(shards)
+        Self {
+            origin: Some(Origin {
+                cache_dir: cache_dir.to_path_buf(),
+                library: library.to_path_buf(),
+                except: except_path,
+            }),
+            ..Self::from_shards(shards)
+        }
     }
 
     pub fn from_shards(mut shards: Vec<Shard>) -> Self {
-        shards.sort_by(|left, right| {
-            (&left.project.name, &left.project.root)
-                .cmp(&(&right.project.name, &right.project.root))
+        shards.sort_by_cached_key(|shard| {
+            (
+                shard.project.name.to_lowercase(),
+                shard.project.name.clone(),
+                shard.project.root.clone(),
+            )
         });
-        Self { shards }
+        Self {
+            shards,
+            origin: None,
+        }
+    }
+
+    pub fn reload(&mut self) {
+        if let Some(origin) = self.origin.take() {
+            *self = Self::load(&origin.cache_dir, &origin.library, origin.except.as_deref());
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.len()
     }
 
     #[cfg(test)]
@@ -177,7 +210,8 @@ pub struct Problem {
 pub struct Outcome {
     pub found: Vec<Found>,
     pub problem: Option<Problem>,
-    pub searched: usize,
+    pub searched: Vec<usize>,
+    pub failed: Vec<usize>,
 }
 
 fn in_scope(source: &Source, request: &Request) -> bool {
@@ -217,13 +251,17 @@ fn query(source: &Source, request: &Request, limit: usize) -> Result<Vec<Hit>, Q
 }
 
 pub fn search(sources: &[Source], request: &Request, limit: usize) -> Outcome {
+    let in_scope: Vec<(usize, &Source)> = in_scope_sources(sources, request).collect();
+    let searched: Vec<usize> = in_scope.iter().map(|(position, _)| *position).collect();
     if request.text.trim().is_empty() {
-        return Outcome::default();
+        return Outcome {
+            searched,
+            ..Outcome::default()
+        };
     }
     let mut found = Vec::new();
-    let mut searched = 0;
-    for (position, source) in in_scope_sources(sources, request) {
-        searched += 1;
+    let mut failed = Vec::new();
+    for (position, source) in in_scope {
         match query(source, request, limit) {
             Ok(hits) => found.extend(hits.into_iter().map(|hit| Found {
                 source: position,
@@ -237,9 +275,10 @@ pub fn search(sources: &[Source], request: &Request, limit: usize) -> Outcome {
                         offset: request.text_offset + offset,
                     }),
                     searched,
+                    failed,
                 };
             }
-            Err(QueryFailure::Other(_)) => {}
+            Err(QueryFailure::Other(_)) => failed.push(position),
         }
     }
     found.sort_by(order);
@@ -248,6 +287,7 @@ pub fn search(sources: &[Source], request: &Request, limit: usize) -> Outcome {
         found,
         problem: None,
         searched,
+        failed,
     }
 }
 
@@ -307,7 +347,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::{Header, Manifest, Stamp, serialize},
+        cache::{CacheFiles, Header, Manifest, Records, Stamp, serialize},
         lux::{MARK_START, library_path},
     };
 
@@ -400,6 +440,16 @@ mod tests {
         assert_eq!(verbatim.root, PathBuf::from(r"\\?\F:/work/Alpha"));
     }
 
+    #[test]
+    fn a_verbatim_unc_root_reads_as_the_share_it_is() {
+        assert_eq!(Project::at(r"\\?\UNC\srv\share").name, r"\\srv\share");
+        assert!(same_root(r"\\?\UNC\srv\share\Alpha", r"\\srv\share\Alpha"));
+        assert!(!same_root(
+            r"\\?\UNC\srv\share\Alpha",
+            r"UNC\srv\share\Alpha"
+        ));
+    }
+
     fn corpus() -> (Shard, Shelf) {
         let here = watchers("here");
         let shelf = Shelf::from_shards(vec![watchers("beta"), watchers("alpha")]);
@@ -415,6 +465,23 @@ mod tests {
             .map(|shard| shard.project.name.as_str())
             .collect();
         assert_eq!(names, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_shelf_orders_its_shards_without_regard_to_case() {
+        let shelf = Shelf::from_shards(vec![
+            watchers("Zeta"),
+            watchers("api"),
+            watchers("Beta"),
+            watchers("alpha"),
+            watchers("Api"),
+        ]);
+        let names: Vec<&str> = shelf
+            .shards()
+            .iter()
+            .map(|shard| shard.project.name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "Api", "api", "Beta", "Zeta"]);
     }
 
     #[test]
@@ -434,7 +501,7 @@ mod tests {
         let (here, shelf) = corpus();
         let all = sources(Some((&here.project, &here.index)), &shelf);
         let outcome = search(&all, &request("watcher", Mode::Fuzzy, Reach::Here), 10);
-        assert_eq!(outcome.searched, 1);
+        assert_eq!(outcome.searched, [0]);
         assert_eq!(found(&outcome), [(0, "a.md")]);
     }
 
@@ -447,7 +514,7 @@ mod tests {
             &request("watcher", Mode::Fuzzy, Reach::Everywhere),
             10,
         );
-        assert_eq!(outcome.searched, 3);
+        assert_eq!(outcome.searched, [0, 1, 2]);
         assert_eq!(found(&outcome), [(0, "a.md"), (1, "a.md"), (2, "a.md")]);
     }
 
@@ -457,10 +524,10 @@ mod tests {
         let all = sources(Some((&here.project, &here.index)), &shelf);
         for reach in [Reach::Here, Reach::Everywhere] {
             let outcome = search(&all, &request("@ALP watcher", Mode::Fuzzy, reach), 10);
-            assert_eq!(outcome.searched, 1, "{reach:?}");
+            assert_eq!(outcome.searched, [1], "{reach:?}");
             assert_eq!(found(&outcome), [(1, "a.md")], "{reach:?}");
             let outcome = search(&all, &request("@he @bet watcher", Mode::Fuzzy, reach), 10);
-            assert_eq!(outcome.searched, 2, "{reach:?}");
+            assert_eq!(outcome.searched, [0, 2], "{reach:?}");
             assert_eq!(found(&outcome), [(0, "a.md"), (2, "a.md")], "{reach:?}");
             let outcome = search(&all, &request("@nothing watcher", Mode::Fuzzy, reach), 10);
             assert_eq!(outcome, Outcome::default(), "{reach:?}");
@@ -518,17 +585,28 @@ mod tests {
         let all = sources(None, &shelf);
         let outcome = search(&all, &request("watcher", Mode::Fuzzy, Reach::Everywhere), 3);
         assert_eq!(outcome.found.len(), 3);
-        assert_eq!(outcome.searched, 2);
+        assert_eq!(outcome.searched, [0, 1]);
     }
 
     #[test]
-    fn blank_text_searches_nothing() {
+    fn blank_text_finds_nothing_but_still_names_the_sources_in_scope() {
         let (here, shelf) = corpus();
         let all = sources(Some((&here.project, &here.index)), &shelf);
-        for input in ["", "   ", "@alpha", "@alpha   "] {
+        let cases: [(&str, Reach, &[usize]); 5] = [
+            ("", Reach::Everywhere, &[0, 1, 2]),
+            ("   ", Reach::Here, &[0]),
+            ("@alpha", Reach::Everywhere, &[1]),
+            ("@alpha   ", Reach::Here, &[1]),
+            ("@nothing", Reach::Everywhere, &[]),
+        ];
+        for (input, reach, expected) in cases {
             for mode in [Mode::Fuzzy, Mode::Syntax] {
-                let outcome = search(&all, &request(input, mode, Reach::Everywhere), 10);
-                assert_eq!(outcome, Outcome::default(), "{input:?}");
+                let outcome = search(&all, &request(input, mode, reach), 10);
+                let wanted = Outcome {
+                    searched: expected.to_vec(),
+                    ..Outcome::default()
+                };
+                assert_eq!(outcome, wanted, "{input:?} {mode:?} {reach:?}");
             }
         }
     }
@@ -695,50 +773,63 @@ mod tests {
         assert_eq!(snippet(&all[0], "missing.md", &fuzzy, 80), None);
     }
 
-    fn save_entry(dir: &Path, stem: &str, root: &str, body: Option<&str>) {
-        let file = dir.join(format!("{stem}.lux"));
-        match body {
-            Some(body) => {
-                let mut index = LuxIndex::load(&library_path()).unwrap();
-                index.add("a.md", "a.md", body).unwrap();
-                index.save(&file).unwrap();
-            }
-            None => fs::write(&file, b"not an index").unwrap(),
-        }
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("recall-shelf-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn project_dir(dir: &Path, name: &str) -> PathBuf {
+        let root = dir.join("projects").join(name);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn index_of(body: &str) -> LuxIndex {
+        let mut index = LuxIndex::load(&library_path()).unwrap();
+        index.add("a.md", "a.md", body).unwrap();
+        index
+    }
+
+    fn save_index(dir: &Path, root: &Path, fingerprint: &str, body: &str) -> CacheFiles {
+        let files = cache::cache_files(dir, root);
+        cache::save(&index_of(body), &files, fingerprint, None, &Records::new()).unwrap();
+        files
+    }
+
+    fn save_current(dir: &Path, root: &Path, body: &str) -> CacheFiles {
+        save_index(dir, root, &cache::fingerprint(&library_path()), body)
+    }
+
+    fn save_broken(dir: &Path, root: &Path) {
+        let files = cache::cache_files(dir, root);
+        fs::write(&files.index, b"not an index").unwrap();
         let header = Header {
-            fingerprint: "fp".into(),
-            root: root.into(),
-            index: Stamp {
-                size: 1,
-                modified: 1,
-            },
+            fingerprint: cache::fingerprint(&library_path()),
+            root: root.to_string_lossy().into_owned(),
+            index: Stamp::of(&fs::metadata(&files.index).unwrap()),
             cursor: None,
         };
-        fs::write(
-            dir.join(format!("{stem}.manifest")),
-            serialize(&header, &Manifest::new()),
-        )
-        .unwrap();
+        fs::write(&files.manifest, serialize(&header, &Manifest::new())).unwrap();
+    }
+
+    fn loaded_names(shelf: &Shelf) -> Vec<&str> {
+        shelf
+            .shards()
+            .iter()
+            .map(|shard| shard.project.name.as_str())
+            .collect()
     }
 
     #[test]
     fn a_shelf_loads_saved_indexes_from_disk() {
-        let dir = env::temp_dir().join(format!("recall-shelf-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        save_entry(
-            &dir,
-            "0000000000000001",
-            "F:/work/Zeta",
-            Some("zeta watcher"),
-        );
-        save_entry(
-            &dir,
-            "0000000000000002",
-            "F:/work/Alpha",
-            Some("alpha watcher"),
-        );
-        save_entry(&dir, "0000000000000003", "F:/work/Broken", None);
+        let dir = temp_dir("disk");
+        let zeta = project_dir(&dir, "Zeta");
+        let alpha = project_dir(&dir, "Alpha");
+        save_current(&dir, &zeta, "zeta watcher");
+        save_current(&dir, &alpha, "alpha watcher");
+        save_broken(&dir, &project_dir(&dir, "Broken"));
         fs::write(
             dir.join("0000000000000004.lux"),
             b"orphan without a manifest",
@@ -752,10 +843,7 @@ mod tests {
             .iter()
             .map(|shard| shard.project.root.as_path())
             .collect();
-        assert_eq!(
-            roots,
-            [Path::new("F:/work/Alpha"), Path::new("F:/work/Zeta")]
-        );
+        assert_eq!(roots, [alpha.as_path(), zeta.as_path()]);
         let all = sources(None, &shelf);
         let outcome = search(
             &all,
@@ -764,19 +852,15 @@ mod tests {
         );
         assert_eq!(outcome.found.len(), 2);
 
-        let skipped = Shelf::load(&dir, &library, Some(Path::new(r"\\?\f:/WORK/alpha")));
-        let names: Vec<&str> = skipped
-            .shards()
-            .iter()
-            .map(|shard| shard.project.name.as_str())
-            .collect();
+        let shouted = format!(r"\\?\{}", alpha.to_string_lossy().to_uppercase());
+        let skipped = Shelf::load(&dir, &library, Some(Path::new(&shouted)));
         let expected: &[&str] = if cfg!(windows) {
             &["Zeta"]
         } else {
             &["Alpha", "Zeta"]
         };
-        assert_eq!(names, expected);
-        let skipped = Shelf::load(&dir, &library, Some(Path::new("F:/work/Alpha")));
+        assert_eq!(loaded_names(&skipped), expected);
+        let skipped = Shelf::load(&dir, &library, Some(&alpha));
         assert_eq!(skipped.shards().len(), 1);
 
         assert!(
@@ -784,6 +868,80 @@ mod tests {
                 .shards()
                 .is_empty()
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_rereads_the_saved_indexes_from_where_the_shelf_was_loaded() {
+        let dir = temp_dir("reload");
+        let library = library_path();
+        let kept = project_dir(&dir, "kept");
+        let open = project_dir(&dir, "open");
+        let dropped = project_dir(&dir, "dropped");
+        save_current(&dir, &kept, "watcher");
+        save_current(&dir, &open, "watcher");
+        save_current(&dir, &dropped, "watcher");
+        let mut shelf = Shelf::load(&dir, &library, Some(&open));
+        assert_eq!(loaded_names(&shelf), ["dropped", "kept"]);
+
+        fs::remove_dir_all(&dropped).unwrap();
+        save_current(&dir, &project_dir(&dir, "added"), "watcher");
+        index_of(&"fresh body ".repeat(40))
+            .save(&cache::cache_files(&dir, &kept).index)
+            .unwrap();
+        shelf.reload();
+        assert_eq!(loaded_names(&shelf), ["added"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+        shelf.reload();
+        assert!(shelf.shards().is_empty());
+    }
+
+    #[test]
+    fn reloading_a_shelf_made_from_shards_changes_nothing() {
+        let mut shelf = Shelf::from_shards(vec![watchers("beta"), watchers("alpha")]);
+        shelf.reload();
+        assert_eq!(loaded_names(&shelf), ["alpha", "beta"]);
+        Shelf::default().reload();
+    }
+
+    #[test]
+    fn a_shelf_skips_an_index_saved_with_another_library_or_rules() {
+        let dir = temp_dir("stale");
+        save_current(&dir, &project_dir(&dir, "fresh"), "watcher");
+        save_index(
+            &dir,
+            &project_dir(&dir, "stale"),
+            "rules 0 lib 1 1",
+            "watcher",
+        );
+        let shelf = Shelf::load(&dir, &library_path(), None);
+        assert_eq!(loaded_names(&shelf), ["fresh"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shelf_skips_a_torn_index_and_manifest_pair() {
+        let dir = temp_dir("torn");
+        save_current(&dir, &project_dir(&dir, "whole"), "watcher");
+        let torn = save_current(&dir, &project_dir(&dir, "torn"), "watcher");
+        index_of(&"another body entirely ".repeat(50))
+            .save(&torn.index)
+            .unwrap();
+        let shelf = Shelf::load(&dir, &library_path(), None);
+        assert_eq!(loaded_names(&shelf), ["whole"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shelf_skips_a_project_whose_folder_is_gone() {
+        let dir = temp_dir("gone");
+        save_current(&dir, &project_dir(&dir, "kept"), "watcher");
+        let removed = project_dir(&dir, "removed");
+        save_current(&dir, &removed, "watcher");
+        fs::remove_dir_all(&removed).unwrap();
+        let shelf = Shelf::load(&dir, &library_path(), None);
+        assert_eq!(loaded_names(&shelf), ["kept"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

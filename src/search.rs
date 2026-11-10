@@ -30,7 +30,9 @@ use crate::{
     lux::LuxIndex,
     manager::{IndexManager, Outcome},
     preview::build_preview,
-    shelf::{self, Found, Mode, Problem, Project, Reach, Shelf, Source, parse_request, sources},
+    shelf::{
+        self, Found, Mode, Problem, Project, Reach, Request, Shelf, Source, parse_request, sources,
+    },
     view::{
         Move, Opener, TerminalCleanup, centered_rect, compact_path, draw_manager, open_manager,
         sanitize_for_display,
@@ -286,6 +288,9 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
         Action::Quit => return Some(Exit::Quit),
         Action::SwitchProject => return Some(Exit::SwitchProject),
         Action::Rescan => {
+            app.shelf.reload();
+            app.preview_for = None;
+            refresh_hits(app, live.index());
             live.rescan();
             app.status = if *live.mode() == live::Mode::Gone {
                 GONE.into()
@@ -326,6 +331,9 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
             refresh_hits(app, live.index());
             if matches!(edit, Edit::Cancel) {
                 app.status = "Search cleared".into();
+            }
+            if matches!(edit, Edit::ToggleReach) && app.query.trim().is_empty() {
+                app.status = reach_status(app.reach, app.shelf.len()).into();
             }
         }
         Action::Move(step) => app.go(step),
@@ -383,22 +391,15 @@ fn refresh_hits(app: &mut App, index: &LuxIndex) {
 }
 
 fn run_query(app: &mut App, index: &LuxIndex, keep: Option<(usize, String)>) {
-    if app.query.trim().is_empty() {
-        app.hits.clear();
-        app.suggestions.clear();
-        app.problem = None;
-        app.selected = 0;
-        app.preview_for = None;
-        app.preview.clear();
-        app.status = format!("Indexed {} files · type a query", app.total_files).into();
-        return;
-    }
-    let (outcome, suggestions) = {
+    let (outcome, suggestions, status) = {
         let all = sources(Some((&app.project, index)), &app.shelf);
         let request = parse_request(&app.query, app.mode, app.reach);
+        let outcome = shelf::search(&all, &request, MAX_RESULTS);
+        let status = status_text(&request, &outcome, &all, app.total_files);
         (
-            shelf::search(&all, &request, MAX_RESULTS),
+            outcome,
             shelf::suggest(&all, &request, MAX_SUGGESTIONS),
+            status,
         )
     };
     app.hits = outcome.found;
@@ -413,22 +414,65 @@ fn run_query(app: &mut App, index: &LuxIndex, keep: Option<(usize, String)>) {
         .unwrap_or(app.selected)
         .min(app.hits.len().saturating_sub(1));
     sync_preview(app, index);
-    let found = app.hits.len();
-    app.status = if app.problem.is_some() {
-        BAD_QUERY.into()
-    } else if outcome.searched > 1 {
-        format!(
-            "{found} results across {} projects · Enter opens selected file",
-            outcome.searched
-        )
-        .into()
-    } else {
-        format!(
-            "{found} results · {} indexed · Enter opens selected file",
-            app.total_files
-        )
-        .into()
+    app.status = status.into();
+}
+
+fn reach_status(reach: Reach, others: usize) -> String {
+    match (reach, others) {
+        (_, 0) => "No other saved projects yet · open one in Recall to search it from here".into(),
+        (Reach::Everywhere, 1) => "Searching every saved project · 1 other project".into(),
+        (Reach::Everywhere, others) => {
+            format!("Searching every saved project · {others} other projects")
+        }
+        (Reach::Here, _) => "Searching this project only".into(),
+    }
+}
+
+fn status_text(
+    request: &Request,
+    outcome: &shelf::Outcome,
+    sources: &[Source],
+    total_files: usize,
+) -> String {
+    let blank = request.text.trim().is_empty();
+    let found = outcome.found.len();
+    let name_of = |position: &usize| {
+        sources
+            .get(*position)
+            .map(|source| source.project.name.as_str())
     };
+    let mut text = match (request.scopes.as_slice(), outcome.searched.as_slice()) {
+        ([], _) if blank => format!("Indexed {total_files} files · type a query"),
+        ([_, ..], []) => {
+            let typed: Vec<String> = request
+                .scopes
+                .iter()
+                .map(|scope| format!("@{scope}"))
+                .collect();
+            format!("No saved project matches {}", typed.join(" "))
+        }
+        (_, searched) if blank => {
+            let names: Vec<&str> = searched.iter().filter_map(name_of).collect();
+            format!("Searching {} · type a query", names.join(", "))
+        }
+        _ if outcome.problem.is_some() => BAD_QUERY.into(),
+        (_, [only]) if sources.get(*only).is_some_and(|source| !source.here) => format!(
+            "{found} results in {} · Enter opens selected file",
+            name_of(only).unwrap_or_default()
+        ),
+        (_, [_, _, ..]) => format!(
+            "{found} results across {} projects · Enter opens selected file",
+            outcome.searched.len()
+        ),
+        _ => format!("{found} results · {total_files} indexed · Enter opens selected file"),
+    };
+    if !outcome.failed.is_empty() {
+        text.push_str(&format!(
+            " · {} could not be searched",
+            outcome.failed.len()
+        ));
+    }
+    text
 }
 
 fn sync_preview(app: &mut App, index: &LuxIndex) {
@@ -458,13 +502,29 @@ fn target_path(all: &[Source], found: &Found) -> Option<PathBuf> {
     Some(all.get(found.source)?.project.root.join(&found.key))
 }
 
+fn launch_target(path: PathBuf, key: &str) -> Result<PathBuf, String> {
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(format!("File is gone: {key}"))
+    }
+}
+
 fn open_selected(app: &mut App, index: &LuxIndex) {
     let Some(hit) = app.hits.get(app.selected) else {
         return;
     };
+    let key = hit.key.clone();
     let all = sources(Some((&app.project, index)), &app.shelf);
     let Some(path) = target_path(&all, hit) else {
         return;
+    };
+    let path = match launch_target(path, &key) {
+        Ok(path) => path,
+        Err(gone) => {
+            app.status = gone.into();
+            return;
+        }
     };
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe").arg(&path).spawn();
@@ -473,7 +533,7 @@ fn open_selected(app: &mut App, index: &LuxIndex) {
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = Command::new("xdg-open").arg(&path).spawn();
     let status = match result {
-        Ok(_) => format!("Opened {}", hit.key),
+        Ok(_) => format!("Opened {key}"),
         Err(error) => format!("Could not open file: {error}"),
     };
     app.status = status.into();

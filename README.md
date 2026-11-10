@@ -60,7 +60,7 @@ Start the query with `@name` to search only the saved projects whose folder name
 
 `Ctrl-T` switches to LuxCore query syntax, such as `title:readme AND build` or `+watcher -daemon`, and the box title says `syntax`. This mode matches whole words only, with no typo tolerance and no completion. When LuxCore cannot read the query, the query turns red from the byte it rejected. Recall builds its indexes without positions, so a quoted phrase is rejected.
 
-The open project is searched live. The other projects are read from their saved indexes when you open a project, so they are as fresh as their last save, and an index saved by an older version of Recall is left out until that project is opened again. Each project scores against its own statistics, so scores from different projects are close but not strictly comparable.
+The open project is searched live. The other projects are read from their saved indexes when you open a project, so they are as fresh as their last save. `Ctrl-R` re-reads those saved indexes. A saved project is left out when its index was saved with a different LuxCore library or scan rules, by an older version of Recall, or when its folder no longer exists. Opening a project rebuilds a stale index. Each project scores against its own statistics, so scores from different projects are close but not strictly comparable.
 
 ## From a script
 
