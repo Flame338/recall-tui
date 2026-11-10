@@ -1060,9 +1060,20 @@ fn a_query_problem_wins_over_the_counts() {
 fn ctrl_e_on_an_empty_query_says_what_it_now_searches() {
     let mut rig = Rig::shelved("reach-status");
     rig.press(ctrl('e'));
-    assert_eq!(status_of(&rig), "Searching every saved project · 2 others");
+    assert_eq!(
+        status_of(&rig),
+        "Searching every saved project · 2 other projects"
+    );
     rig.press(ctrl('e'));
     assert_eq!(status_of(&rig), "Searching this project only");
+}
+
+#[test]
+fn one_other_project_is_counted_in_the_singular() {
+    assert_eq!(
+        reach_status(Reach::Everywhere, 1),
+        "Searching every saved project · 1 other project"
+    );
 }
 
 #[test]

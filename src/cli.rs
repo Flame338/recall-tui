@@ -136,7 +136,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
                             })?;
                     }
                     "--" => words.extend(rest.by_ref().map(String::as_str)),
-                    flag if is_help(flag) => return Ok(help()),
+                    "--help" => return Ok(help()),
+                    "-h" if words.is_empty() => return Ok(help()),
                     flag if flag.starts_with("--") => {
                         return Err(format!("unknown option {flag}"));
                     }
@@ -544,6 +545,10 @@ mod tests {
             assert!(done.stderr.is_empty(), "{list:?}");
         }
         assert_eq!(search_options(&["search", "--", "--help"]).query, "--help");
+        assert_eq!(
+            search_options(&["search", "--syntax", "+watcher", "-h"]).query,
+            "+watcher -h"
+        );
     }
 
     #[test]

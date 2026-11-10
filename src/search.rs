@@ -420,7 +420,10 @@ fn run_query(app: &mut App, index: &LuxIndex, keep: Option<(usize, String)>) {
 fn reach_status(reach: Reach, others: usize) -> String {
     match (reach, others) {
         (_, 0) => "No other saved projects yet · open one in Recall to search it from here".into(),
-        (Reach::Everywhere, others) => format!("Searching every saved project · {others} others"),
+        (Reach::Everywhere, 1) => "Searching every saved project · 1 other project".into(),
+        (Reach::Everywhere, others) => {
+            format!("Searching every saved project · {others} other projects")
+        }
         (Reach::Here, _) => "Searching this project only".into(),
     }
 }
