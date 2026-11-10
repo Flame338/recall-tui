@@ -32,7 +32,7 @@ use flow::Screen;
 use live::Live;
 use lux::{DEFAULT_LIBRARY, Hit, LuxIndex, MARK_END, MARK_START};
 use manager::{IndexManager, Outcome};
-use opening::open_project;
+use opening::{Opened, open_project};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -242,14 +242,14 @@ fn run_screen(
             Choice::Quit => flow::Event::Quit,
         },
         Screen::Open { root } => match open_project(root.clone(), library_path) {
-            Ok(Some(opened)) => {
+            Ok(Opened::Ready(opened)) => {
                 session
                     .replace(opened)
                     .into_iter()
                     .for_each(|old| old.live.close());
                 flow::Event::Opened
             }
-            Ok(None) => flow::Event::OpenCancelled,
+            Ok(Opened::Cancelled) => flow::Event::OpenCancelled,
             Err(error) => recover_open_failure(session, root, error)?,
         },
         Screen::Search => {
