@@ -329,6 +329,9 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
             if matches!(edit, Edit::Cancel) {
                 app.status = "Search cleared".into();
             }
+            if matches!(edit, Edit::ToggleReach) && app.query.trim().is_empty() {
+                app.status = reach_status(app.reach, app.shelf.len()).into();
+            }
         }
         Action::Move(step) => app.go(step),
         Action::OpenFile => open_selected(app, live.index()),
@@ -409,6 +412,14 @@ fn run_query(app: &mut App, index: &LuxIndex, keep: Option<(usize, String)>) {
         .min(app.hits.len().saturating_sub(1));
     sync_preview(app, index);
     app.status = status.into();
+}
+
+fn reach_status(reach: Reach, others: usize) -> String {
+    match (reach, others) {
+        (_, 0) => "No other saved projects yet · open one in Recall to search it from here".into(),
+        (Reach::Everywhere, others) => format!("Searching every saved project · {others} others"),
+        (Reach::Here, _) => "Searching this project only".into(),
+    }
 }
 
 fn status_text(

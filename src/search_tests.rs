@@ -1055,3 +1055,30 @@ fn a_query_problem_wins_over_the_counts() {
     outcome.problem = Some(Problem { offset: 0 });
     assert_eq!(status_text(&request, &outcome, &all, 7), BAD_QUERY);
 }
+
+#[test]
+fn ctrl_e_on_an_empty_query_says_what_it_now_searches() {
+    let mut rig = Rig::shelved("reach-status");
+    rig.press(ctrl('e'));
+    assert_eq!(status_of(&rig), "Searching every saved project · 2 others");
+    rig.press(ctrl('e'));
+    assert_eq!(status_of(&rig), "Searching this project only");
+}
+
+#[test]
+fn ctrl_e_with_nothing_on_the_shelf_says_so() {
+    let mut rig = Rig::new("reach-empty");
+    let empty = "No other saved projects yet · open one in Recall to search it from here";
+    rig.press(ctrl('e'));
+    assert_eq!(status_of(&rig), empty);
+    rig.press(ctrl('e'));
+    assert_eq!(status_of(&rig), empty);
+}
+
+#[test]
+fn ctrl_e_with_a_query_keeps_reporting_results() {
+    let mut rig = Rig::shelved("reach-query");
+    rig.type_text("zebra");
+    rig.press(ctrl('e'));
+    assert!(status_of(&rig).starts_with("14 results across 3 projects"));
+}

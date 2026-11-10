@@ -138,6 +138,10 @@ impl Shelf {
         Self { shards }
     }
 
+    pub fn len(&self) -> usize {
+        self.shards.len()
+    }
+
     #[cfg(test)]
     pub fn shards(&self) -> &[Shard] {
         &self.shards
