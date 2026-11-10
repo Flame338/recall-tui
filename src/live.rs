@@ -146,6 +146,10 @@ pub struct Live {
     jobs: usize,
     current: String,
     summary: Summary,
+    /// A saved pair existed, from the load or from our own save.
+    pair_on_disk: bool,
+    /// How `rescan` gets a new feed after the old one was lost.
+    connector: fn(&Path, Option<Cursor>) -> Feed,
 }
 
 impl Live {
@@ -201,6 +205,8 @@ impl Live {
             synced: false,
             last_feed: Instant::now(),
             save: SavePolicy::new(),
+            pair_on_disk: reused,
+            connector: connect,
             backoff: BACKOFF,
             manual_grace: MANUAL_GRACE,
             jobs: 0,
@@ -276,7 +282,17 @@ impl Live {
         loop {
             let busy = self.poll_wait().is_zero();
             self.drain(if busy { Duration::ZERO } else { SETTLE_WAIT });
-            self.walk_if_stranded()?;
+            let walked = self.walk_if_stranded(|found, latest| {
+                progress(Progress {
+                    mode: &Mode::Scanning { found },
+                    done: 0,
+                    total: 0,
+                    current: latest,
+                })
+            })?;
+            if !walked {
+                return Ok(false);
+            }
             if self.mode == Mode::Gone || self.synced && self.pending() <= WARM_LIMIT {
                 break;
             }
@@ -331,12 +347,15 @@ impl Live {
         if asked {
             return;
         }
+        // The daemon stopped or crashed. This starts it again, on the user's ask.
         self.lose_feed();
-        if let Err(error) = self.walk_project() {
-            self.mode = Mode::Manual {
-                reason: format!("scan failed: {error}"),
-            };
-        }
+        let feed = (self.connector)(&self.root, self.received);
+        self.link = Some(feed.link);
+        self.engine = feed.engine;
+        self.via = feed.via;
+        self.mode = Mode::Connecting;
+        self.synced = false;
+        self.last_feed = Instant::now();
     }
 
     /// Saves what is applied. Jobs still queued are not run: they come back
@@ -523,7 +542,13 @@ impl Live {
                     changed: indexed || was_indexed,
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            // Access denied does not clear on its own, so it is not retried.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied
+                ) =>
+            {
                 self.drop_document(key, was_indexed);
                 self.record(key, unindexed(stamp));
                 Step::Done {
@@ -568,6 +593,11 @@ impl Live {
     }
 
     fn save_now(&mut self) -> bool {
+        if self.pair_on_disk && self.files.as_ref().is_some_and(|files| !files.manifest.exists()) {
+            // The saved index was deleted while this window was open, as the F2
+            // list promises it is rebuilt next launch, so it is not written back.
+            self.files = None;
+        }
         let Some(files) = &self.files else {
             return false;
         };
@@ -582,29 +612,39 @@ impl Live {
         self.save.last_save = Instant::now();
         if saved {
             self.save.unsaved = 0;
+            self.pair_on_disk = true;
         }
         saved
     }
 
-    fn walk_if_stranded(&mut self) -> Result<(), Box<dyn Error>> {
+    fn walk_if_stranded(
+        &mut self,
+        tick: impl FnMut(usize, &str) -> Result<bool, Box<dyn Error>>,
+    ) -> Result<bool, Box<dyn Error>> {
         let silent = matches!(self.mode, Mode::Manual { .. })
             && self.last_feed.elapsed() >= self.manual_grace;
         if self.synced || self.mode == Mode::Gone || !(silent || self.link.is_none()) {
-            return Ok(());
+            return Ok(true);
         }
-        self.walk_project()
+        self.walk_project(tick)
     }
 
-    fn walk_project(&mut self) -> Result<(), Box<dyn Error>> {
-        let observed = scan::walk(&self.root, &Scope::ROOT, |_, _| Ok(true))?;
-        let files = observed.map(|observed| observed.found).unwrap_or_default();
-        self.take_snapshot(&files, None);
-        Ok(())
+    fn walk_project(
+        &mut self,
+        tick: impl FnMut(usize, &str) -> Result<bool, Box<dyn Error>>,
+    ) -> Result<bool, Box<dyn Error>> {
+        let Some(observed) = scan::walk(&self.root, &Scope::ROOT, tick)? else {
+            return Ok(false);
+        };
+        self.take_snapshot(&observed.found, None);
+        Ok(true)
     }
 
     #[cfg(test)]
     pub fn detached(root: &Path, library: &Path) -> Result<Live, Box<dyn Error>> {
-        Live::build(root, library, None, |_| None)
+        let mut live = Live::build(root, library, None, |_| None)?;
+        live.connector = in_process;
+        Ok(live)
     }
 }
 
@@ -1261,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_asks_the_engine_and_walks_alone_when_it_is_gone() {
+    fn ctrl_r_asks_the_engine_and_reconnects_when_the_feed_is_gone() {
         let project = Project::new("rescan");
         project.write("a.md", "alpha");
         let mut rig = project.rig(None);
@@ -1275,10 +1315,86 @@ mod tests {
         } = rig;
         drop(commands);
         drop(updates);
+        live.connector = in_process_feed;
         live.rescan();
-        assert!(matches!(live.mode(), Mode::Manual { .. }));
-        live.tick();
-        assert_eq!(found(&live, "alpha"), ["a.md"]);
+        assert_eq!(live.mode(), &Mode::Connecting);
+        let end = Instant::now() + Duration::from_secs(6);
+        while found(&live, "alpha").is_empty() || live.mode() != &(Mode::Live { via: Via::InProcess }) {
+            live.tick();
+            assert!(Instant::now() < end, "never reconnected: {:?}", live.mode());
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn in_process_feed(root: &Path, have: Option<Cursor>) -> Feed {
+        in_process(root, have)
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_by_permission_is_unindexed_not_retried() {
+        let project = Project::new("denied");
+        project.write("ok.md", "alpha");
+        // Reading a folder fails with access denied, as an ACL-denied file does.
+        fs::create_dir_all(project.root.join("denied.md")).unwrap();
+        let mut rig = project.rig(None);
+        let stamp = Stamp { size: 1, modified: 1 };
+        let mut files = project.walk();
+        files.insert("denied.md".into(), stamp);
+        rig.send(snapshot(&files, 1));
+        rig.drive();
+        assert_eq!(rig.live.pending(), 0, "it is not retried");
+        let entry = rig.live.manifest["denied.md"];
+        assert_eq!((entry.stamp, entry.indexed), (stamp, false));
+        assert_eq!(found(&rig.live, "alpha"), ["ok.md"]);
+        rig.settled();
+        assert_eq!(rig.live.committed, Some(cursor(1)), "the cursor still advances");
+    }
+
+    #[test]
+    fn cancelling_during_lives_own_walk_stops_it() {
+        let project = Project::new("cancel-walk");
+        for n in 0..50 {
+            project.write(&format!("d{}/f{n}.md", n % 5), "x");
+        }
+        let Rig {
+            mut live,
+            commands,
+            updates,
+        } = project.rig(None);
+        drop(commands);
+        drop(updates);
+        let mut asked = 0;
+        let settled = live
+            .settle(|progress| {
+                asked += 1;
+                assert!(matches!(progress.mode, Mode::Scanning { .. }), "{:?}", progress.mode);
+                Ok(false)
+            })
+            .unwrap();
+        assert!(!settled);
+        assert_eq!(asked, 1);
+        assert_eq!(live.pending(), 0, "no snapshot was taken from a cancelled walk");
+    }
+
+    #[test]
+    fn a_saved_index_deleted_while_open_is_not_written_back() {
+        let project = Project::new("deleted-open");
+        project.write("a.md", "alpha");
+        let mut first = project.rig(Some(&project.cache));
+        first.send(snapshot(&project.walk(), 1));
+        first.settled();
+        first.live.close();
+        let files = cache::cache_files(&project.cache, &project.root);
+        assert!(files.manifest.exists());
+
+        let mut rig = project.rig(Some(&project.cache));
+        rig.send(snapshot(&project.walk(), 1));
+        rig.settled();
+        fs::remove_file(&files.index).unwrap();
+        fs::remove_file(&files.manifest).unwrap();
+        rig.live.save.unsaved = 1;
+        rig.live.close();
+        assert!(!files.manifest.exists() && !files.index.exists(), "the deleted pair came back");
     }
 
     #[test]

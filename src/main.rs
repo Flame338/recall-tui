@@ -1295,9 +1295,15 @@ mod tests {
 
         fs::write(dir.join("c.md"), "zebra zebra zebra zebra zebra").unwrap();
         live.rescan();
-        let tick = live.tick();
-        assert_eq!(tick.changed, ["c.md"]);
-        on_live_change(&mut app, &live, &tick.changed);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        let mut changed = Vec::new();
+        while changed.is_empty() {
+            changed = live.tick().changed;
+            assert!(std::time::Instant::now() < end, "the rescan never reached the index");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(changed, ["c.md"]);
+        on_live_change(&mut app, &live, &changed);
 
         assert_eq!(app.total_files, 3);
         assert_eq!(app.hits.len(), 3);
