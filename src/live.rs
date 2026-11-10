@@ -147,10 +147,39 @@ enum Step {
     Retry,
 }
 
+enum Store {
+    /// No cache folder, or the user deleted the saved pair while this window
+    /// was open. The F2 list promises a deleted pair is rebuilt next launch,
+    /// so it is not written back.
+    Off,
+    Unsaved(CacheFiles),
+    /// A pair this window loaded or saved.
+    Saved(CacheFiles),
+}
+
+impl Store {
+    /// Runs `write` when this store may save, and returns whether it saved.
+    fn save(&mut self, write: impl FnOnce(&CacheFiles) -> bool) -> bool {
+        let (files, was_saved) = match std::mem::replace(self, Store::Off) {
+            Store::Off => return false,
+            Store::Saved(files) if !files.manifest.exists() => return false,
+            Store::Saved(files) => (files, true),
+            Store::Unsaved(files) => (files, false),
+        };
+        let saved = write(&files);
+        *self = if saved || was_saved {
+            Store::Saved(files)
+        } else {
+            Store::Unsaved(files)
+        };
+        saved
+    }
+}
+
 pub struct Live {
     root: PathBuf,
     index: LuxIndex,
-    files: Option<CacheFiles>,
+    store: Store,
     fingerprint: String,
     records: Records,
     indexed: usize,
@@ -169,8 +198,6 @@ pub struct Live {
     jobs: usize,
     current: String,
     summary: Summary,
-    /// A saved pair existed, from the load or from our own save.
-    pair_on_disk: bool,
     /// How `rescan` gets a new feed after the old one was lost.
     connector: fn(&Path, Option<Cursor>) -> Feed,
 }
@@ -206,6 +233,11 @@ impl Live {
             committed = None;
         }
         let indexed = records.values().filter(|record| record.indexed).count();
+        let store = match files {
+            None => Store::Off,
+            Some(files) if reused => Store::Saved(files),
+            Some(files) => Store::Unsaved(files),
+        };
         let (link, engine, via) = match feed(committed) {
             Some(feed) => (Some(feed.link), feed.engine, feed.via),
             None => (None, None, Via::InProcess),
@@ -213,7 +245,7 @@ impl Live {
         Ok(Live {
             root: root.to_path_buf(),
             index,
-            files,
+            store,
             fingerprint,
             records,
             indexed,
@@ -227,7 +259,6 @@ impl Live {
             synced: false,
             last_feed: Instant::now(),
             save: SavePolicy::new(),
-            pair_on_disk: reused,
             connector: connect,
             backoff: BACKOFF,
             manual_grace: MANUAL_GRACE,
@@ -613,26 +644,19 @@ impl Live {
     }
 
     fn save_now(&mut self) -> bool {
-        if self.pair_on_disk && self.files.as_ref().is_some_and(|files| !files.manifest.exists()) {
-            // The saved index was deleted while this window was open, as the F2
-            // list promises it is rebuilt next launch, so it is not written back.
-            self.files = None;
-        }
-        let Some(files) = &self.files else {
-            return false;
-        };
-        let saved = cache::save(
-            &self.index,
-            files,
-            &self.fingerprint,
-            self.committed,
-            &self.records,
-        )
-        .is_ok();
-        self.save.last_save = Instant::now();
+        let saved = self.store.save(|files| {
+            self.save.last_save = Instant::now();
+            cache::save(
+                &self.index,
+                files,
+                &self.fingerprint,
+                self.committed,
+                &self.records,
+            )
+            .is_ok()
+        });
         if saved {
             self.save.unsaved = 0;
-            self.pair_on_disk = true;
         }
         saved
     }
@@ -1666,6 +1690,22 @@ mod tests {
         let mut rig = project.rig(Some(&project.cache));
         rig.send(snapshot(&project.walk(), 1));
         rig.settled();
+        fs::remove_file(&files.index).unwrap();
+        fs::remove_file(&files.manifest).unwrap();
+        rig.live.save.unsaved = 1;
+        rig.live.close();
+        assert!(!files.manifest.exists() && !files.index.exists(), "the deleted pair came back");
+    }
+
+    #[test]
+    fn a_pair_this_window_saved_and_the_user_deleted_is_not_written_back() {
+        let project = Project::new("deleted-own");
+        project.write("a.md", "alpha");
+        let mut rig = project.rig(Some(&project.cache));
+        rig.send(snapshot(&project.walk(), 1));
+        rig.settled();
+        assert!(rig.live.summary().saved);
+        let files = cache::cache_files(&project.cache, &project.root);
         fs::remove_file(&files.index).unwrap();
         fs::remove_file(&files.manifest).unwrap();
         rig.live.save.unsaved = 1;
