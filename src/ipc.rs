@@ -45,6 +45,7 @@ pub enum ConnectError {
     OtherBuild {
         daemon: String,
     },
+    #[cfg(not(windows))]
     Unsupported,
     Io(io::Error),
 }
@@ -56,6 +57,7 @@ impl fmt::Display for ConnectError {
             ConnectError::OtherBuild { daemon } => {
                 write!(f, "the daemon runs another build ({daemon})")
             }
+            #[cfg(not(windows))]
             ConnectError::Unsupported => write!(f, "this platform has no daemon"),
             ConnectError::Io(error) => write!(f, "daemon pipe: {error}"),
         }
@@ -415,7 +417,7 @@ fn hex(text: &str) -> String {
 }
 
 fn parse_root(field: &str) -> io::Result<PathBuf> {
-    if field.is_empty() || field.len() % 2 != 0 {
+    if field.is_empty() || !field.len().is_multiple_of(2) {
         return Err(bad("invalid root"));
     }
     let bytes = (0..field.len())

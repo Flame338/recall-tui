@@ -185,10 +185,6 @@ impl Dirty {
         window.last = now;
     }
 
-    pub fn is_clean(&self) -> bool {
-        self.window.is_none()
-    }
-
     /// When the engine should resolve: after `quiet` with no event, or at the
     /// `ceiling` after the first event, whichever is sooner. `None` when clean.
     pub fn deadline(&self, limits: &Debounce) -> Option<Instant> {
@@ -332,6 +328,7 @@ impl Truth {
         }
     }
 
+    #[cfg(test)]
     pub fn files(&self) -> &BTreeMap<String, Stamp> {
         &self.files
     }
@@ -532,7 +529,7 @@ mod tests {
             dirty.resolve(&Truth::new(Epoch(1)), &files_probe, &limits),
             [Scope::ROOT]
         );
-        assert!(dirty.is_clean());
+        assert_eq!(dirty.deadline(&limits), None);
     }
 
     #[test]
