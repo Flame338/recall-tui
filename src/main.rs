@@ -620,8 +620,6 @@ fn remove_last_word(query: &mut String) {
     query.truncate(start);
 }
 
-/// Re-runs the query after the index changed and keeps the selected file
-/// selected, wherever it moved to.
 fn on_live_change(app: &mut App, live: &Live, changed: &[String]) {
     app.total_files = live.indexed_files();
     let keep = app.hits.get(app.selected).map(|hit| hit.key.clone());

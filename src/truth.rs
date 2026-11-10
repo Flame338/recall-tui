@@ -1,11 +1,3 @@
-//! What a fresh full walk of a project would return, kept converged by
-//! re-walking only the scopes that filesystem events touched.
-//!
-//! Events never edit state. They mark paths dirty, `Dirty::resolve` turns the
-//! dirty set into scopes, and `Truth::apply` replaces everything a scope covers
-//! with what `scan::walk` saw there. Duplicated, reordered or late events are
-//! harmless, and lost events are reported as an overflow, which rescans all.
-
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     hash::BuildHasher,
@@ -50,12 +42,9 @@ impl Rel {
     }
 }
 
-/// A part of the project one walk re-observes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
-    /// Files directly inside the folder.
     Shallow(Rel),
-    /// The path itself and everything beneath it. `Deep(ROOT)` is a full walk.
     Deep(Rel),
 }
 
@@ -68,7 +57,6 @@ impl Scope {
         }
     }
 
-    /// Whether a file key belongs to this scope.
     pub fn covers(&self, key: &str) -> bool {
         match self {
             Scope::Shallow(dir) => same(parent_of(key).as_bytes(), dir.as_str().as_bytes()),
@@ -76,7 +64,6 @@ impl Scope {
         }
     }
 
-    /// Whether a walk must descend into `dir` to see everything this scope covers.
     pub fn enters(&self, dir: &str) -> bool {
         match self {
             Scope::Shallow(target) => within(target.as_str(), dir),
@@ -93,7 +80,6 @@ fn fold(path: &str) -> String {
     }
 }
 
-/// `key` equals `dir` or lies beneath it.
 fn within(key: &str, dir: &str) -> bool {
     if dir.is_empty() {
         return true;
@@ -117,7 +103,6 @@ fn parent_of(key: &str) -> &str {
     key.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-/// What one walk saw inside one scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed {
     pub scope: Scope,
@@ -131,7 +116,6 @@ pub enum Kind {
     Missing,
 }
 
-/// Asks the filesystem what a path is now. `scan::Disk` is the real one.
 pub trait Probe {
     fn kind(&self, rel: &Rel) -> Kind;
 }
@@ -142,16 +126,11 @@ impl<F: Fn(&Rel) -> Kind> Probe for F {
     }
 }
 
-/// Timing and size limits for coalescing a burst of events.
 #[derive(Clone, Copy, Debug)]
 pub struct Debounce {
-    /// Resolve once no event arrived for this long.
     pub quiet: Duration,
-    /// Never hold a dirty set longer than this under constant churn.
     pub ceiling: Duration,
-    /// More scopes than this become one full walk.
     pub max_scopes: usize,
-    /// More dirty paths than this stop being recorded and mean a full walk.
     pub max_paths: usize,
 }
 
@@ -172,7 +151,6 @@ struct Window {
     last: Instant,
 }
 
-/// The paths touched since the last resolve.
 #[derive(Debug, Default)]
 pub struct Dirty {
     paths: BTreeSet<Rel>,
@@ -193,7 +171,6 @@ impl Dirty {
         }
     }
 
-    /// Events were lost, the watcher restarted, a walk failed, or the user asked to rescan.
     pub fn overflow(&mut self, now: Instant) {
         self.touch(now);
         self.paths.clear();
@@ -219,7 +196,6 @@ impl Dirty {
             .map(|window| (window.last + limits.quiet).min(window.first + limits.ceiling))
     }
 
-    /// Drains the dirty set into the fewest scopes whose walks make `truth` converge.
     pub fn resolve(&mut self, truth: &Truth, probe: &impl Probe, limits: &Debounce) -> Vec<Scope> {
         let paths = std::mem::take(&mut self.paths);
         let all = std::mem::take(&mut self.all);
@@ -233,7 +209,6 @@ impl Dirty {
             }
             match probe.kind(&rel) {
                 Kind::Dir => Scope::Deep(rel),
-                // A folder replaced by a file, or deleted, leaves keys under it.
                 _ if truth.has_under(&rel) => Scope::Deep(rel),
                 Kind::File | Kind::Missing => Scope::Shallow(rel.parent()),
             }
@@ -242,8 +217,6 @@ impl Dirty {
     }
 }
 
-/// Drops scopes a `Deep` ancestor already covers, merges duplicates, and
-/// collapses to one full walk past `max` scopes.
 fn coalesce(scopes: impl Iterator<Item = Scope>, max: usize) -> Vec<Scope> {
     let mut unique: BTreeMap<(bool, String), Scope> = BTreeMap::new();
     for scope in scopes {
@@ -276,7 +249,6 @@ fn coalesce(scopes: impl Iterator<Item = Scope>, max: usize) -> Vec<Scope> {
     }
 }
 
-/// Proper ancestors of a non-root path, nearest first, ending with the root.
 fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     std::iter::successors((!path.is_empty()).then_some(path), |current| {
         (!current.is_empty()).then(|| parent_of(current))
@@ -284,7 +256,6 @@ fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     .skip(1)
 }
 
-/// Identifies one engine lifetime. A cursor from another lifetime is meaningless.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Epoch(pub u64);
 
@@ -295,11 +266,9 @@ impl Epoch {
     }
 }
 
-/// Counts walks that changed something.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Gen(pub u64);
 
-/// Where a client's view stands in one engine's history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cursor {
     pub epoch: Epoch,
@@ -312,12 +281,9 @@ pub enum Change {
     Remove(String),
 }
 
-/// The only thing that crosses from an engine to a client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Update {
-    /// The first walk is running.
     Scanning { found: usize },
-    /// Replace the whole view. Sent when the client's cursor is unusable.
     Snapshot {
         at: Cursor,
         files: BTreeMap<String, Stamp>,
@@ -328,9 +294,7 @@ pub enum Update {
         at: Cursor,
         changes: Vec<Change>,
     },
-    /// The engine cannot watch this project. Rescans still work.
     Manual { reason: String },
-    /// The project root is gone. Watching ended.
     Gone,
 }
 
@@ -341,7 +305,6 @@ pub struct Truth {
     generation: Gen,
     files: BTreeMap<String, Stamp>,
     log: VecDeque<(Gen, Change)>,
-    /// The newest generation with evicted changes. Cursors below it get a snapshot.
     floor: Gen,
     log_cap: usize,
 }

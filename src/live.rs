@@ -1,10 +1,3 @@
-//! Keeps the TUI's LuxIndex equal to the project's files while it runs.
-//!
-//! `Live` owns the index and is the only thing that changes it. Updates come
-//! from a `watch::Link`, which is either the daemon's pipe or an engine on a
-//! thread of this process, and `Live` cannot tell which. Every update becomes
-//! entries in one queue, so a snapshot and a delta share one reconcile path.
-
 use std::{
     collections::BTreeMap,
     env,
@@ -24,8 +17,6 @@ use crate::{
     watch::{Cmd, Engine, EngineConfig, Link},
 };
 
-/// A project with at most this many jobs left counts as open. The rest
-/// finishes while the user types.
 const WARM_LIMIT: usize = 64;
 const WORK_BUDGET: Duration = Duration::from_millis(25);
 const SETTLE_SLICE: Duration = Duration::from_millis(15);
@@ -35,34 +26,27 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(60);
 const IDLE_POLL: Duration = Duration::from_millis(100);
 const MAX_TRIES: u8 = 5;
 const BACKOFF: Duration = Duration::from_millis(250);
-/// A file that stays unreadable is retried at this pace for as long as it is wanted.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const MANUAL_GRACE: Duration = Duration::from_secs(1);
 const WATCH_BUFFER_BYTES: usize = 256 * 1024;
 
-/// The stamp of a file that could not be read. No file can have it, so the
-/// next plan that names the file reads it again.
 const UNREAD: Stamp = Stamp {
     size: u64::MAX,
     modified: u64::MAX,
 };
 
-/// What the status bar shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     Connecting,
     Scanning {
         found: usize,
     },
-    /// Events are flowing.
     Live {
         via: Via,
     },
-    /// Cannot watch here. A rescan still works.
     Manual {
         reason: String,
     },
-    /// The project root is gone.
     Gone,
 }
 
@@ -72,16 +56,12 @@ pub enum Via {
     InProcess,
 }
 
-/// What one tick tells the TUI.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tick {
-    /// Keys whose indexed content changed.
     pub changed: Vec<String>,
-    /// Files still waiting to be read or removed.
     pub pending: usize,
 }
 
-/// What `settle` reports to the Open screen.
 pub struct Progress<'a> {
     pub mode: &'a Mode,
     pub done: usize,
@@ -89,20 +69,15 @@ pub struct Progress<'a> {
     pub current: &'a str,
 }
 
-/// What opening the project did, for the startup message.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     pub indexed: usize,
-    /// A saved index was restored.
     pub reused: bool,
     pub updated: usize,
     pub removed: usize,
-    /// The open itself wrote the cache.
     pub saved: bool,
 }
 
-/// Saves are whole-index and big, so they are rare: on close, and once the
-/// index has been quiet for a while after enough changes.
 struct SavePolicy {
     quiet: Duration,
     min_gap: Duration,
@@ -137,11 +112,9 @@ impl SavePolicy {
     }
 }
 
-/// Where updates come from.
 struct Feed {
     link: Link,
     via: Via,
-    /// Set for an in-process engine, which this `Live` must stop.
     engine: Option<Engine>,
 }
 
@@ -155,23 +128,16 @@ pub struct Live {
     index: LuxIndex,
     files: Option<CacheFiles>,
     fingerprint: String,
-    /// What the index holds.
     manifest: Manifest,
     indexed: usize,
-    /// The newest engine position whose updates are all applied. Saved with the manifest.
     committed: Option<Cursor>,
-    /// The newest engine position accepted into the queue.
     received: Option<Cursor>,
-    /// The work queue. `Some(stamp)` makes the index match that stamp, `None`
-    /// removes the file. A newer update for a key replaces the older job.
     want: BTreeMap<String, Option<Stamp>>,
-    /// Keys that hit a read error: tries so far and when to try again.
     attempts: BTreeMap<String, (u8, Instant)>,
     link: Option<Link>,
     engine: Option<Engine>,
     via: Via,
     mode: Mode,
-    /// A snapshot or delta arrived, so the queue describes the whole project.
     synced: bool,
     last_feed: Instant,
     save: SavePolicy,
@@ -204,14 +170,12 @@ impl Live {
             .as_ref()
             .and_then(|files| cache::load(&mut index, files, &fingerprint));
         if loaded.is_none() && files.as_ref().is_some_and(|files| files.manifest.exists()) {
-            // A failed load can leave a half restored index behind.
             index = LuxIndex::load(library)?;
         }
         let reused = loaded.is_some();
         let (manifest, mut committed) =
             loaded.map_or_else(Default::default, |loaded| (loaded.manifest, loaded.cursor));
         if manifest.values().any(|entry| entry.stamp == UNREAD) {
-            // A delta never names an unread file again. Only a snapshot re-reads it.
             committed = None;
         }
         let indexed = manifest.values().filter(|entry| entry.indexed).count();
@@ -260,7 +224,6 @@ impl Live {
         self.indexed
     }
 
-    /// Files still waiting to be read, removed, or retried.
     pub fn pending(&self) -> usize {
         self.want.len()
     }
@@ -285,7 +248,6 @@ impl Live {
             })
     }
 
-    /// The status bar suffix.
     pub fn status(&self) -> String {
         let pending = self.pending();
         match &self.mode {
@@ -405,7 +367,6 @@ impl Live {
         }
     }
 
-    /// Accepts every waiting update. With `wait`, sleeps for the first one.
     fn drain(&mut self, mut wait: Duration) {
         loop {
             match self.recv(wait) {
@@ -428,8 +389,6 @@ impl Live {
         }
     }
 
-    /// Turns an update into queue entries by comparing it with the manifest.
-    /// Accepting the same update twice queues nothing new.
     fn accept(&mut self, update: Update) {
         self.last_feed = Instant::now();
         match update {
@@ -475,8 +434,6 @@ impl Live {
         }
     }
 
-    /// `replaced` holds the jobs this update superseded, so a job that comes
-    /// back unchanged keeps its retry state.
     fn queue(&mut self, plan: Plan, replaced: BTreeMap<String, Option<Stamp>>) {
         for key in plan.to_forget {
             self.record(&key, None);
@@ -503,8 +460,6 @@ impl Live {
             .map(|(key, job)| (key.clone(), *job))
     }
 
-    /// Runs jobs for about `budget`, and at least one. Returns the keys whose
-    /// indexed content changed.
     fn work(&mut self, budget: Duration) -> Vec<String> {
         let start = Instant::now();
         let mut changed = Vec::new();
@@ -541,8 +496,6 @@ impl Live {
         changed
     }
 
-    /// One job. The stamp comes from the update and was taken before the
-    /// read, so a file that changes mid-read is named again by the next delta.
     fn run_job(&mut self, key: &str, job: Option<Stamp>, last_try: bool) -> Step {
         let was_indexed = self.manifest.get(key).is_some_and(|entry| entry.indexed);
         let Some(stamp) = job else {
@@ -570,10 +523,6 @@ impl Live {
                     changed: indexed || was_indexed,
                 }
             }
-            // A missing file is retried like a locked one. If it is really gone, the
-            // engine's next delta removes the key and replaces this job. If it was
-            // renamed away and back, the engine sees the same stamp and says nothing,
-            // so dropping it here would leave it out of the index for good.
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 self.drop_document(key, was_indexed);
                 self.record(key, unindexed(stamp));
@@ -583,8 +532,6 @@ impl Live {
             }
             Err(_) => {
                 if last_try {
-                    // Marks the file for a re-read at the next open. The old
-                    // document stays searchable while the retries go on.
                     self.record(
                         key,
                         Some(Entry {
@@ -614,8 +561,6 @@ impl Live {
         self.indexed = self.indexed - usize::from(was) + usize::from(now);
     }
 
-    /// The cursor only moves once the queue is empty, so a saved cursor never
-    /// runs ahead of the saved manifest. A crash repeats work and never skips it.
     fn commit_cursor(&mut self) {
         if self.want.is_empty() && self.received.is_some() {
             self.committed = self.received;
@@ -641,7 +586,6 @@ impl Live {
         saved
     }
 
-    /// With no engine to wait for, builds the snapshot itself.
     fn walk_if_stranded(&mut self) -> Result<(), Box<dyn Error>> {
         let silent = matches!(self.mode, Mode::Manual { .. })
             && self.last_feed.elapsed() >= self.manual_grace;
@@ -672,7 +616,6 @@ impl Drop for Live {
     }
 }
 
-/// The daemon when one answers or starts, otherwise an engine in this process.
 fn connect(root: &Path, have: Option<Cursor>) -> Feed {
     if env::var_os("RECALL_DAEMON").is_some_and(|value| value == "0") {
         return in_process(root, have);
@@ -1010,7 +953,6 @@ mod tests {
         assert!(found(&rig.live, "alpha").is_empty());
         assert_eq!(rig.live.pending(), 1, "it keeps being retried");
 
-        // No new snapshot: the retry itself picks the file up once it is free.
         drop(lock);
         rig.live.backoff = Duration::from_millis(1);
         rig.live.attempts.get_mut("a.md").unwrap().1 = Instant::now();
@@ -1276,7 +1218,6 @@ mod tests {
         let sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(80));
             updates.send(Update::Scanning { found: 2 }).unwrap();
-            // Longer than the 60 ms progress pace, so a report lands in between.
             thread::sleep(Duration::from_millis(400));
             updates.send(snapshot(&files, 1)).unwrap();
         });
@@ -1463,7 +1404,6 @@ mod tests {
             project.write("keep.md", "keep");
             let mut live = open_in_process(&project, None);
             project.write("x.md", "roundtriptoken");
-            // The engine walks and queues the delta, but this Live does not tick yet.
             thread::sleep(Duration::from_millis(900));
             fs::rename(project.root.join("x.md"), project.root.join("x.tmp")).unwrap();
             live.tick();

@@ -45,17 +45,14 @@ pub struct Entry {
 
 pub type Manifest = BTreeMap<String, Entry>;
 
-/// What an engine reports about the files: all of them, or only what changed.
 #[derive(Clone, Copy, Debug)]
 pub enum Seen<'a> {
     All(&'a BTreeMap<String, Stamp>),
     Changes(&'a [Change]),
 }
 
-/// How to bring a manifest and its index in line with what was seen.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// Read and index these, then record the stamp.
     pub to_read: Vec<(String, Stamp)>,
     /// Indexed files that are gone. Remove them from the index and the manifest.
     pub to_remove: Vec<String>,
@@ -102,15 +99,11 @@ pub fn plan(cached: &Manifest, seen: Seen) -> Plan {
     plan
 }
 
-/// What a manifest file says about itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     pub fingerprint: String,
     pub root: String,
-    /// The stat of the `.lux` saved with this manifest. Another process may
-    /// replace the `.lux` between our two renames, and a mismatch shows it.
     pub index: Stamp,
-    /// Where in an engine's history this manifest is current.
     pub cursor: Option<Cursor>,
 }
 
@@ -407,7 +400,6 @@ pub fn load(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Opti
         return None;
     }
     index.restore(&files.index).ok()?;
-    // Another process may have replaced the .lux while it was being restored.
     paired().then_some(Loaded {
         manifest,
         cursor: header.cursor,
@@ -442,8 +434,6 @@ fn stamp_of(path: &Path) -> Option<Stamp> {
     fs::metadata(path).ok().map(|metadata| Stamp::of(&metadata))
 }
 
-/// Returns the stat of the written file. It is taken before the rename, so it
-/// names our bytes even if another process renames its own file in right after.
 fn write_atomic(
     target: &Path,
     write: impl FnOnce(&Path) -> Result<(), Box<dyn Error>>,
@@ -677,7 +667,6 @@ mod tests {
         run_in(workspace, &workspace.0.join("cache"), fingerprint)
     }
 
-    /// Indexes the workspace cold and saves the pair, as a first open does.
     fn run_in(workspace: &Workspace, dir: &Path, fingerprint: &str) -> LuxIndex {
         let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
         let mut manifest = Manifest::new();

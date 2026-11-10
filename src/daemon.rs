@@ -1,9 +1,4 @@
-//! The background process that hosts one engine per watched project. It never
-//! loads LuxCore. Clients reach it through `ipc`.
-//!
-//! The daemon keeps an engine armed for 12 hours after its last client left,
-//! at most 16 idle ones, and exits once it hosts nothing and nobody is
-//! connected. It runs from a copy of the exe under `%LOCALAPPDATA%\Recall\bin`,
+//! The daemon runs from a copy of the exe under `%LOCALAPPDATA%\Recall\bin`,
 //! so `cargo build` can still replace the original.
 
 use std::{error::Error, fmt};
@@ -19,7 +14,6 @@ impl fmt::Display for SpawnError {
 
 impl Error for SpawnError {}
 
-/// Starts the daemon unless one already answers.
 pub fn ensure_running() -> Result<(), SpawnError> {
     #[cfg(windows)]
     {
@@ -31,7 +25,6 @@ pub fn ensure_running() -> Result<(), SpawnError> {
     }
 }
 
-/// The body of the daemon process.
 pub fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]
     {
@@ -110,15 +103,11 @@ pub(crate) mod host {
         }
     }
 
-    /// Starts an engine for a project root.
     pub(crate) type Spawn = Box<dyn Fn(&Path) -> Box<dyn Hosted> + Send + Sync>;
 
     pub(crate) struct Policy {
-        /// An engine stays armed this long after its last client leaves.
         pub idle_ttl: Duration,
-        /// Beyond this many projects the least recently used idle one stops.
         pub max_projects: usize,
-        /// With no projects and no connections for this long, the daemon exits.
         pub linger: Duration,
         pub tick: Duration,
     }
@@ -158,11 +147,9 @@ pub(crate) mod host {
         }
     }
 
-    /// What the daemon learned about a project from its own subscription.
     #[derive(Default)]
     struct Seen {
         generation: Gen,
-        /// Key hashes, enough to count files without a second copy of every key.
         files: HashSet<u64>,
         ended: bool,
     }
@@ -198,7 +185,6 @@ pub(crate) mod host {
     }
 
     struct Project {
-        /// Tells this engine apart from a later one for the same root.
         id: u64,
         root: PathBuf,
         engine: Box<dyn Hosted>,
@@ -249,7 +235,6 @@ pub(crate) mod host {
     struct Registry {
         projects: HashMap<String, Project>,
         peers: HashMap<u64, Writer>,
-        /// When `projects` or `peers` last changed. Drives the exit after `linger`.
         changed: Instant,
         next_id: u64,
     }
@@ -283,8 +268,6 @@ pub(crate) mod host {
             (key, project.id)
         }
 
-        /// Stops the idle project used longest ago. Projects with clients stay,
-        /// even past the cap.
         fn evict_least_recent(&mut self) {
             let oldest = self
                 .projects
@@ -508,8 +491,6 @@ pub(crate) mod host {
         registry.changed = now;
     }
 
-    /// Copies one subscription's updates to its client on a thread of its own,
-    /// so a client that stops reading stalls nobody else.
     fn forward(rx: mpsc::Receiver<Update>, writer: Writer, done: Arc<AtomicBool>) {
         let _ = thread::Builder::new()
             .name("recall-daemon-send".to_owned())
@@ -521,8 +502,6 @@ pub(crate) mod host {
                                 break;
                             }
                         }
-                        // The engine keeps its sender until its next send fails, so the
-                        // end of the connection has to be noticed here.
                         Err(RecvTimeoutError::Timeout) if !done.load(Ordering::Relaxed) => {}
                         Err(_) => break,
                     }
@@ -551,8 +530,6 @@ pub(crate) mod host {
             if answers(pipe) {
                 return Ok(());
             }
-            // A child that already exited will never open the pipe, so every
-            // launch would otherwise wait out the full timeout for nothing.
             if let Some(code) = child.exit_code() {
                 return Err(SpawnError(format!(
                     "{} exited with code {code} before it answered",
@@ -574,8 +551,6 @@ pub(crate) mod host {
         )
     }
 
-    /// Copies `exe` to `bin\recall-<build>.exe` unless that copy exists. The
-    /// copy keeps the mtime, so it computes the same build id.
     fn install(exe: &Path, bin: &Path, build: &str) -> io::Result<PathBuf> {
         let copy = bin.join(format!("recall-{build}.exe"));
         let source = fs::metadata(exe)?;
@@ -595,7 +570,6 @@ pub(crate) mod host {
             fs::rename(&partial, &copy)
         })();
         let _ = fs::remove_file(&partial);
-        // A racing client may have installed the same copy first.
         match made {
             Err(error) if !current(&copy) => Err(error),
             _ => Ok(copy),
@@ -616,8 +590,6 @@ pub(crate) mod host {
         }
     }
 
-    /// The process handle of a daemon just started. It lets `ensure` see a child
-    /// that died instead of waiting for it.
     struct Child(HANDLE);
 
     impl Child {
@@ -767,8 +739,6 @@ pub(crate) mod host {
             }
         }
 
-        /// An engine that hands out a snapshot of `files(root)` files and adds
-        /// one file per rescan.
         fn fake(log: &Arc<Log>, files: fn(&Path) -> usize) -> Spawn {
             let log = Arc::clone(log);
             Box::new(move |root| {
@@ -1149,7 +1119,6 @@ pub(crate) mod host {
 
         const CHILD: &str = "RECALL_DAEMON_TEST_CHILD";
 
-        /// Runs in a child process: plays the TUI that starts the daemon.
         #[test]
         #[ignore = "a helper process for ensure_running_starts_a_detached_copy"]
         fn ensure_from_a_child_process() {
@@ -1168,7 +1137,6 @@ pub(crate) mod host {
             .unwrap();
         }
 
-        /// Runs in a child process: starts a "daemon" that exits at once.
         #[test]
         #[ignore = "a helper process for ensure_running_gives_up_when_the_daemon_exits"]
         fn ensure_with_a_daemon_that_exits() {
@@ -1212,7 +1180,6 @@ pub(crate) mod host {
             );
         }
 
-        /// Runs in the detached copy: the daemon process itself.
         #[test]
         #[ignore = "a helper process for ensure_running_starts_a_detached_copy"]
         fn daemon_in_a_child_process() {

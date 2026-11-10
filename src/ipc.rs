@@ -41,13 +41,10 @@ pub(crate) use pipe::{
 
 #[derive(Debug)]
 pub enum ConnectError {
-    /// No daemon answered.
     Absent,
-    /// A daemon from another build answered. The client runs its own engine.
     OtherBuild {
         daemon: String,
     },
-    /// This platform has no daemon.
     Unsupported,
     Io(io::Error),
 }
@@ -86,10 +83,8 @@ pub fn connect(root: &Path, have: Option<Cursor>) -> Result<Link, ConnectError> 
 }
 
 const PROTO: u32 = 1;
-/// Longer lines are rejected, so a bad peer cannot make the reader buffer without bound.
 const MAX_LINE: u64 = 1 << 16;
 
-/// What a client asks once the handshake is done.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Request {
     Subscribe { root: PathBuf, have: Option<Cursor> },
@@ -99,18 +94,15 @@ pub(crate) enum Request {
     Stop,
 }
 
-/// One armed project, as `recall daemon status` shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectStatus {
     pub root: PathBuf,
     pub generation: Gen,
     pub files: usize,
     pub clients: usize,
-    /// How long the project has had no clients. `None` while it has some.
     pub idle: Option<Duration>,
 }
 
-/// Who answered the handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Daemon {
     pub build: String,
@@ -253,7 +245,6 @@ fn encode_reply(message: &ToClient) -> String {
     }
 }
 
-/// Decodes one reply. `more` yields the lines after `header`, `None` at the end of the stream.
 fn decode_reply(
     header: &str,
     more: &mut dyn FnMut() -> io::Result<Option<String>>,
@@ -365,8 +356,6 @@ fn split_tag(line: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Splits `rest` into exactly `N` fields. The last one keeps any tabs, and the
-/// field parsers reject them where they do not belong.
 fn fields<const N: usize>(rest: &str) -> io::Result<[&str; N]> {
     let parts: Vec<&str> = rest.splitn(N, '\t').collect();
     parts.try_into().map_err(|_| bad("missing field"))
@@ -402,14 +391,12 @@ fn text(field: &str) -> io::Result<String> {
     Ok(field.to_owned())
 }
 
-/// Keeps free text on one line and in one field.
 fn clean(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
 
-/// A key is a project-relative `/` path that a walk could have produced.
 fn parse_key(field: &str) -> io::Result<String> {
     let valid = !field.is_empty()
         && !field.contains(['\\', ':'])
@@ -449,7 +436,6 @@ fn parse_root(field: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Reads one LF-terminated line, without the LF. `None` at a clean end of stream.
 fn read_line(reader: &mut impl io::BufRead) -> io::Result<Option<String>> {
     let mut line = Vec::new();
     let mut limited = io::Read::take(reader.by_ref(), MAX_LINE + 1);
@@ -543,7 +529,6 @@ mod pipe {
     const BUFFER: u32 = 64 * 1024;
     const OPEN_TIMEOUT: Duration = Duration::from_secs(1);
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-    /// A peer that stops reading for this long is dropped, so it costs only its own thread.
     const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
     struct Handle(HANDLE);
@@ -565,7 +550,6 @@ mod pipe {
         })
     }
 
-    /// A manual-reset event.
     struct Event(Handle);
 
     impl Event {
@@ -586,7 +570,6 @@ mod pipe {
         }
     }
 
-    /// Tells the accept loop and the daemon's timer to finish.
     pub(crate) struct Stop(Event);
 
     impl Stop {
@@ -624,7 +607,6 @@ mod pipe {
             self.handle.0
         }
 
-        /// Runs one overlapped operation to completion or until `timeout`.
         fn overlapped(
             &self,
             timeout: Option<Duration>,
@@ -678,7 +660,6 @@ mod pipe {
             }
         }
 
-        /// Writes one whole message. Messages from different threads never interleave.
         fn send(&self, message: &str) -> io::Result<()> {
             let _turn = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
             let mut rest = message.as_bytes();
@@ -783,12 +764,10 @@ mod pipe {
             .as_ref()
     }
 
-    /// The full name of a daemon pipe. One per user, so users never share a daemon.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct PipeName(String);
 
     impl PipeName {
-        /// The current user's pipe. `RECALL_PIPE_SUFFIX` gives a test its own daemon.
         pub(crate) fn from_env() -> PipeName {
             PipeName::with_suffix(env::var("RECALL_PIPE_SUFFIX").ok().as_deref())
         }
@@ -810,15 +789,12 @@ mod pipe {
             self.0.encode_utf16().chain([0]).collect()
         }
 
-        /// The path a plain `File::open` can reach, for tests that misbehave on purpose.
         #[cfg(test)]
         pub(crate) fn path(&self) -> &str {
             &self.0
         }
     }
 
-    /// Names this build. The daemon runs a copy of the exe, so the id is made
-    /// of what a copy keeps: the version, the size and the mtime.
     pub(crate) fn build_id() -> &'static str {
         static ID: OnceLock<String> = OnceLock::new();
         ID.get_or_init(|| {
@@ -880,8 +856,6 @@ mod pipe {
         Ok(Pipe::new(handle))
     }
 
-    /// The daemon's hold on the pipe name. While it lives no other daemon can
-    /// create the pipe, so the name is the single-daemon lock.
     pub(crate) struct Listener {
         name: Vec<u16>,
         waiting: Option<Pipe>,
@@ -956,14 +930,12 @@ mod pipe {
         }
     }
 
-    /// The daemon's side of one client connection.
     pub(crate) struct Peer {
         pipe: Arc<Pipe>,
         lines: BufReader<Reading>,
     }
 
     impl Peer {
-        /// Reads `HELLO` and answers `WELCOME`. The client compares builds.
         pub(crate) fn handshake(&mut self, build: &str) -> io::Result<()> {
             let line = read_line(&mut self.lines)?.ok_or(io::ErrorKind::UnexpectedEof)?;
             let ToDaemon::Hello { .. } = decode_request(&line)? else {
@@ -997,7 +969,6 @@ mod pipe {
         }
     }
 
-    /// Sends replies to one client. Clones share the connection.
     #[derive(Clone)]
     pub(crate) struct Writer(Arc<Pipe>);
 
@@ -1117,7 +1088,6 @@ mod pipe {
         }
     }
 
-    /// `connect` with an explicit pipe and build, so tests can run their own daemon.
     pub(crate) fn connect_to(
         name: &PipeName,
         build: &str,
@@ -1159,8 +1129,6 @@ mod pipe {
                     let sent = match cmd {
                         Cmd::Rescan => pipe.send("RESCAN\n"),
                         Cmd::Stop => break,
-                        // A pipe link carries one subscription. Dropping `tx`
-                        // ends the new receiver at once, and its owner reconnects.
                         Cmd::Subscribe { .. } => Ok(()),
                     };
                     if sent.is_err() {
@@ -1173,7 +1141,6 @@ mod pipe {
         Ok((cmd_tx, update_rx))
     }
 
-    /// Says whether a daemon answers on `name`, and who it is.
     pub(crate) fn ping(name: &PipeName) -> Result<Daemon, ConnectError> {
         let conversation = hello(name, build_id())?;
         let _ = conversation.ask(Request::Bye);
@@ -1192,7 +1159,6 @@ mod pipe {
         }
     }
 
-    /// Asks the daemon to exit and waits until it hangs up.
     pub(crate) fn stop(name: &PipeName) -> Result<Daemon, ConnectError> {
         let mut conversation = hello(name, build_id())?;
         conversation.ask(Request::Stop)?;
@@ -1200,7 +1166,6 @@ mod pipe {
         Ok(conversation.daemon)
     }
 
-    /// A client that subscribes and then never reads, for stall tests.
     #[cfg(test)]
     pub(crate) fn stalled_subscriber(
         name: &PipeName,

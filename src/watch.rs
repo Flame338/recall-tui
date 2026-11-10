@@ -1,7 +1,3 @@
-//! Turns filesystem events into `Update`s. One engine thread per project owns
-//! that project's `Truth` and `Dirty`. Everything else reaches it through
-//! channels, so the same engine runs inside the daemon or inside the TUI.
-
 use std::{
     error::Error,
     path::{Path, PathBuf},
@@ -17,8 +13,6 @@ use crate::{
 
 use reader::Watcher;
 
-/// A client's two ends: commands in, updates out. An in-process engine and
-/// the daemon pipe both hand out this pair, so a client cannot tell them apart.
 pub type Link = (Sender<Cmd>, Receiver<Update>);
 
 pub enum Cmd {
@@ -27,25 +21,19 @@ pub enum Cmd {
         have: Option<Cursor>,
         tx: Sender<Update>,
     },
-    /// Mark the whole project dirty.
     Rescan,
-    /// End the engine thread.
     Stop,
 }
 
-/// What the directory reader tells the engine.
 pub enum Raw {
     Changed(Rel),
-    /// The event buffer overflowed, so some events were lost.
     Lost,
-    /// The root is gone or the directory handle failed.
     Gone,
 }
 
 pub struct EngineConfig {
     pub root: PathBuf,
     pub debounce: Debounce,
-    /// Size of the ReadDirectoryChangesW buffer.
     pub buffer_bytes: usize,
 }
 
@@ -74,7 +62,6 @@ impl Engine {
         Engine { cmd }
     }
 
-    /// Subscribes a new client and returns its link.
     pub fn subscribe(&self, have: Option<Cursor>) -> Link {
         let (tx, rx) = mpsc::channel();
         let _ = self.cmd.send(Cmd::Subscribe { have, tx });
@@ -94,17 +81,13 @@ enum Flow {
 }
 
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
-/// How often an idle engine checks that its root is still the folder it watches.
 #[cfg(not(test))]
 const ROOT_CHECK: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const ROOT_CHECK: Duration = Duration::from_millis(300);
-/// A walk that keeps failing is retried at this pace at most.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 fn run(config: EngineConfig, input: Sender<Input>, inbox: Receiver<Input>) {
-    // Armed before the first walk, so a change made while it runs is either
-    // seen by the walk or queued as an event. Nothing falls between them.
     let watcher = Watcher::start(&config.root, config.buffer_bytes, input);
     let mut actor = Actor {
         debounce: config.debounce,
@@ -117,7 +100,6 @@ fn run(config: EngineConfig, input: Sender<Input>, inbox: Receiver<Input>) {
         failures: 0,
     };
     actor.serve(&config.root, &inbox);
-    // The directory handle closes before subscribers see their channel end.
     drop(watcher);
 }
 
@@ -127,15 +109,12 @@ struct Sub {
 }
 
 impl Sub {
-    /// The first reply to a new client. A client already at the current cursor
-    /// still gets an empty delta, or it would wait for a change that may never come.
     fn answer(&mut self, truth: &Truth) -> bool {
         let update = truth.since(self.cursor);
         self.cursor = Some(truth.cursor());
         self.tx.send(update).is_ok()
     }
 
-    /// Sends what changed since this client's cursor. False once the client is gone.
     fn catch_up(&mut self, truth: &Truth) -> bool {
         if self.cursor == Some(truth.cursor()) {
             return true;
@@ -151,13 +130,9 @@ struct Actor {
     truth: Truth,
     dirty: Dirty,
     subs: Vec<Sub>,
-    /// Why this project is not watched. Rescans still work.
     manual: Option<String>,
-    /// Files found so far, until the first full walk succeeds.
     scanning: Option<usize>,
-    /// Which folder the watch was opened on.
     identity: Option<reader::FileId>,
-    /// Walks that failed in a row, for the retry pace.
     failures: u32,
 }
 
@@ -252,8 +227,6 @@ impl Actor {
         self.subs.retain_mut(|sub| sub.catch_up(truth));
     }
 
-    /// Walks each scope and applies what it saw. A failed walk applies nothing
-    /// and marks the whole project dirty, so the next round retries it all.
     fn round(&mut self, root: &Path, scopes: Vec<Scope>, inbox: &Receiver<Input>) -> Flow {
         let mut failed = false;
         for scope in scopes {
@@ -268,8 +241,6 @@ impl Actor {
                 }
                 Some(Err(_)) => {
                     failed = true;
-                    // A folder that stays unreadable must not trigger a full walk
-                    // every debounce, so the retry backs off.
                     let delay = (self.debounce.quiet * 2u32.pow(self.failures.min(8)))
                         .min(MAX_RETRY_DELAY);
                     self.failures = self.failures.saturating_add(1);
@@ -287,7 +258,6 @@ impl Actor {
         Flow::Go
     }
 
-    /// Keeps serving the inbox while the walk runs. `None` means stop.
     fn walk(
         &mut self,
         root: &Path,
@@ -426,10 +396,8 @@ mod reader {
 
     struct Borrowed(HANDLE);
 
-    // The `Watcher` that owns this handle joins the thread before closing it.
     unsafe impl Send for Borrowed {}
 
-    /// One subtree watch on a project root, read by its own thread.
     pub struct Watcher {
         stop: Owned,
         thread: Option<JoinHandle<()>>,
@@ -496,7 +464,6 @@ mod reader {
         dir: Owned,
     }
 
-    // Moved to the reader thread once and only touched there afterward.
     unsafe impl Send for Read {}
 
     enum Done {
@@ -739,7 +706,6 @@ mod tests {
         }
     }
 
-    /// A subscriber that mirrors the engine's view the way a client would.
     struct Client {
         cmd: Sender<Cmd>,
         rx: Receiver<Update>,
@@ -792,7 +758,6 @@ mod tests {
             }
         }
 
-        /// Takes updates until the mirror equals a fresh full walk.
         fn converge(&mut self, project: &Project, within: Duration) {
             let deadline = Instant::now() + within;
             loop {
@@ -813,7 +778,6 @@ mod tests {
             }
         }
 
-        /// Counts what still arrives once the engine has had time to settle.
         fn settle(&mut self) {
             let quiet = Debounce::default().ceiling + Debounce::default().quiet;
             while let Ok(update) = self.rx.recv_timeout(quiet) {
@@ -834,7 +798,6 @@ mod tests {
         (upserts, removes)
     }
 
-    /// Counts what a bare reader on `root` reports, to measure event volume.
     fn counter(root: &Path, buffer_bytes: usize) -> (reader::Watcher, Receiver<Input>) {
         let (tx, rx) = mpsc::channel();
         (reader::Watcher::start(root, buffer_bytes, tx).unwrap(), rx)
@@ -922,8 +885,6 @@ mod tests {
         assert!(client.deltas <= 10, "{} deltas", client.deltas);
     }
 
-    /// Writes 2,000 files from 8 threads into an engine with a small buffer.
-    /// Returns how many overflows a bare reader with the same buffer saw.
     fn flood(name: &str, buffer_bytes: usize) -> usize {
         let project = Project::new(name);
         let engine = project.engine_with(buffer_bytes);
@@ -1068,8 +1029,6 @@ mod tests {
             buffer_bytes: 4096,
         });
         let (_cmd, rx) = engine.subscribe(None);
-        // The engine may end before it registers this subscriber, so the
-        // channel can close without a Gone. It must never report an empty project.
         let deadline = Instant::now() + SOON;
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -1180,8 +1139,6 @@ mod tests {
         }
         let engine = project.engine();
         let mut client = Client::of(&engine);
-        // A fast disk can finish the walk before the subscribe is read, so
-        // the first update is Scanning or already the Snapshot. It is never a Delta.
         let first = client.rx.recv_timeout(SOON).unwrap();
         assert!(
             matches!(first, Update::Scanning { .. } | Update::Snapshot { .. }),
@@ -1298,7 +1255,6 @@ mod converge {
         }
     }
 
-    /// Mirrors the engine, runs `act`, waits 3 s, returns (engine view, fresh walk).
     fn run(p: &P, act: impl FnOnce(&P)) -> (Vec<String>, Vec<String>) {
         let engine = Engine::spawn(EngineConfig { root: p.root.clone(), debounce: Debounce::default(), buffer_bytes: 256 * 1024 });
         let (_cmd, rx) = engine.subscribe(None);

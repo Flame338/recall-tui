@@ -14,10 +14,6 @@ const INDEX_EXTENSIONS: &[&str] = &[
 ];
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 
-/// Walks the files `scope` covers. The walk always starts at the project root
-/// and prunes toward the scope, because `ignore` never filters the folder it
-/// starts in and only learns a folder's rules by passing through it. A walk
-/// started inside an ignored folder would index what a full walk skips.
 pub fn walk(
     root: &Path,
     scope: &Scope,
@@ -70,9 +66,8 @@ pub fn walk(
     }))
 }
 
-/// A folder that cannot be read right now must fail the walk. Skipping it would
-/// make every file under it look deleted. Permission errors are stable, so they
-/// count as absent, and so does a file that vanished mid-walk.
+// Failing the walk keeps files under an unreadable folder in the index. A permission
+// error never clears on its own, so it counts as absent instead of stalling every walk.
 fn walk_error_is_fatal(error: &ignore::Error, root: &Path) -> bool {
     match error.io_error().map(std::io::Error::kind) {
         Some(std::io::ErrorKind::PermissionDenied) | None => false,
@@ -87,7 +82,6 @@ fn key_of(root: &Path, path: &Path) -> Option<String> {
     Some(parts?.join("/"))
 }
 
-/// The filesystem as `Dirty::resolve` sees it.
 pub struct Disk<'a>(pub &'a Path);
 
 impl Probe for Disk<'_> {
@@ -100,8 +94,6 @@ impl Probe for Disk<'_> {
     }
 }
 
-/// Folders a walk never enters. Shared with `Rel::from_event` so an event
-/// inside one is dropped as noise.
 pub fn enters_dir(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
@@ -130,7 +122,6 @@ pub fn is_indexable(name: &str) -> bool {
         })
 }
 
-/// Files whose edits change what is indexable without touching any indexed file.
 pub fn is_rule_file(name: &str) -> bool {
     // NTFS opens `.GITIGNORE` when the walk asks for `.gitignore`.
     let case = |rule: &str| {
@@ -143,7 +134,6 @@ pub fn is_rule_file(name: &str) -> bool {
     case(".gitignore") || case(".ignore")
 }
 
-/// Keys go into a line-based manifest and pipe protocol, so they never hold one.
 fn has_control(name: &str) -> bool {
     name.chars().any(char::is_control)
 }
@@ -320,7 +310,6 @@ mod tests {
     const MID_RULES: &[&str] = &["local/\n", "", "*.txt\n", "e/\n"];
     const PARENT_RULES: &[&str] = &["secret*.md\n", "", "z.txt\n"];
 
-    /// A project under a parent folder whose own `.gitignore` applies to it.
     struct Fixture {
         outer: PathBuf,
         root: PathBuf,
@@ -339,7 +328,6 @@ mod tests {
             Self { outer, root }
         }
 
-        /// Every path on disk under the root, as a raw event name.
         fn paths(&self) -> Vec<String> {
             fn visit(dir: &Path, prefix: &str, out: &mut Vec<String>) {
                 let Ok(entries) = fs::read_dir(dir) else {
@@ -378,8 +366,6 @@ mod tests {
             }
         }
 
-        /// One random edit. Returns the names an RDCW handle on the root would report,
-        /// or `None` when the edit sits above the root, where nothing is watched.
         fn mutate(&self, rng: &mut Rng) -> Option<Vec<String>> {
             let mut events = Vec::new();
             let join = |dir: &str, name: &str| {
@@ -482,8 +468,6 @@ mod tests {
             Some(events)
         }
 
-        /// Scopes worth checking: every folder pool entry and every path on disk,
-        /// shallow and deep, including ignored, hidden and missing ones.
         fn scopes(&self) -> Vec<Scope> {
             let mut names: BTreeSet<String> = DIRS.iter().map(|dir| (*dir).to_owned()).collect();
             names.extend(self.paths());

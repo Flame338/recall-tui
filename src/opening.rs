@@ -1,5 +1,3 @@
-//! The Open screen: restores a project, brings it current, and shows progress.
-
 use std::{
     error::Error,
     io::stdout,
