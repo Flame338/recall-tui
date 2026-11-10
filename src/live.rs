@@ -113,6 +113,35 @@ struct Feed {
     engine: Option<Engine>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Job {
+    Upsert(Stamp),
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Retry {
+    tries: u8,
+    due: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pending {
+    job: Job,
+    /// Set while the job is backing off after a failed read.
+    retry: Option<Retry>,
+}
+
+impl Pending {
+    /// A job keeps its backoff only when the update asks for the same job again.
+    fn queue(job: Job, before: Option<Pending>) -> Pending {
+        let retry = before
+            .filter(|before| before.job == job)
+            .and_then(|before| before.retry);
+        Pending { job, retry }
+    }
+}
+
 enum Step {
     Done { changed: bool },
     Retry,
@@ -127,8 +156,7 @@ pub struct Live {
     indexed: usize,
     committed: Option<Cursor>,
     received: Option<Cursor>,
-    want: BTreeMap<String, Option<Stamp>>,
-    attempts: BTreeMap<String, (u8, Instant)>,
+    want: BTreeMap<String, Pending>,
     link: Option<Link>,
     engine: Option<Engine>,
     via: Via,
@@ -192,7 +220,6 @@ impl Live {
             committed,
             received: None,
             want: BTreeMap::new(),
-            attempts: BTreeMap::new(),
             link,
             engine,
             via,
@@ -241,8 +268,8 @@ impl Live {
     pub fn poll_wait(&self) -> Duration {
         let now = Instant::now();
         self.want
-            .keys()
-            .map(|key| self.attempts.get(key).map_or(now, |(_, due)| *due))
+            .values()
+            .map(|pending| pending.retry.map_or(now, |retry| retry.due))
             .min()
             .map_or(IDLE_POLL, |due| {
                 due.saturating_duration_since(now).min(IDLE_POLL)
@@ -414,14 +441,14 @@ impl Live {
             Update::Snapshot { at, files } => self.take_snapshot(&files, Some(at)),
             Update::Delta { at, changes, .. } => {
                 let plan = cache::plan(&self.records, Seen::Changes(&changes));
-                let replaced = changes
+                let before = changes
                     .iter()
                     .map(|change| match change {
                         Change::Upsert(key, _) | Change::Remove(key) => key,
                     })
-                    .filter_map(|key| self.want.remove(key).map(|job| (key.clone(), job)))
+                    .filter_map(|key| self.want.remove(key).map(|pending| (key.clone(), pending)))
                     .collect();
-                self.queue(plan, replaced);
+                self.queue(plan, before);
                 self.received = Some(at);
                 self.synced();
             }
@@ -432,8 +459,8 @@ impl Live {
 
     fn take_snapshot(&mut self, files: &BTreeMap<String, Stamp>, at: Option<Cursor>) {
         let plan = cache::plan(&self.records, Seen::All(files));
-        let replaced = std::mem::take(&mut self.want);
-        self.queue(plan, replaced);
+        let before = std::mem::take(&mut self.want);
+        self.queue(plan, before);
         self.received = at;
         if at.is_none() {
             self.committed = None;
@@ -448,50 +475,44 @@ impl Live {
         }
     }
 
-    fn queue(&mut self, plan: Plan, replaced: BTreeMap<String, Option<Stamp>>) {
+    /// `before` holds the queued jobs this update replaces.
+    fn queue(&mut self, plan: Plan, mut before: BTreeMap<String, Pending>) {
         for key in plan.to_forget {
             self.record(&key, None);
         }
-        let jobs = plan
+        let jobs: BTreeMap<String, Job> = plan
             .to_read
             .into_iter()
-            .map(|(key, stamp)| (key, Some(stamp)))
-            .chain(plan.to_remove.into_iter().map(|key| (key, None)));
-        self.want.extend(jobs);
-        self.attempts.retain(|key, _| {
-            self.want.contains_key(key)
-                && replaced
-                    .get(key)
-                    .is_none_or(|before| Some(before) == self.want.get(key))
-        });
+            .map(|(key, stamp)| (key, Job::Upsert(stamp)))
+            .chain(plan.to_remove.into_iter().map(|key| (key, Job::Remove)))
+            .collect();
+        for (key, job) in jobs {
+            let pending = Pending::queue(job, before.remove(&key));
+            self.want.insert(key, pending);
+        }
     }
 
-    fn next_job(&self) -> Option<(String, Option<Stamp>)> {
+    fn next_job(&self) -> Option<(String, Pending)> {
         let now = Instant::now();
         self.want
             .iter()
-            .find(|(key, _)| self.attempts.get(*key).is_none_or(|(_, due)| *due <= now))
-            .map(|(key, job)| (key.clone(), *job))
+            .find(|(_, pending)| pending.retry.is_none_or(|retry| retry.due <= now))
+            .map(|(key, pending)| (key.clone(), *pending))
     }
 
     fn work(&mut self, budget: Duration) -> Vec<String> {
         let start = Instant::now();
         let mut changed = Vec::new();
-        while let Some((key, job)) = self.next_job() {
-            let tries = self
-                .attempts
-                .get(&key)
-                .map_or(0, |(tries, _)| *tries)
-                .saturating_add(1);
+        while let Some((key, Pending { job, retry })) = self.next_job() {
+            let tries = retry.map_or(0, |retry| retry.tries).saturating_add(1);
             match self.run_job(&key, job, tries >= MAX_TRIES) {
                 Step::Done { changed: moved } => {
                     self.want.remove(&key);
-                    self.attempts.remove(&key);
                     self.jobs += 1;
                     self.save.changed();
                     match job {
-                        Some(_) => self.summary.updated += 1,
-                        None => self.summary.removed += 1,
+                        Job::Upsert(_) => self.summary.updated += 1,
+                        Job::Remove => self.summary.removed += 1,
                     }
                     if moved {
                         changed.push(key.clone());
@@ -500,7 +521,11 @@ impl Live {
                 }
                 Step::Retry => {
                     let wait = (self.backoff * 2u32.pow(u32::from(tries.min(16)) - 1)).min(MAX_BACKOFF);
-                    self.attempts.insert(key, (tries, Instant::now() + wait));
+                    let retry = Some(Retry {
+                        tries,
+                        due: Instant::now() + wait,
+                    });
+                    self.want.insert(key, Pending { job, retry });
                 }
             }
             if start.elapsed() >= budget {
@@ -510,9 +535,9 @@ impl Live {
         changed
     }
 
-    fn run_job(&mut self, key: &str, job: Option<Stamp>, last_try: bool) -> Step {
+    fn run_job(&mut self, key: &str, job: Job, last_try: bool) -> Step {
         let was_indexed = self.records.get(key).is_some_and(|record| record.indexed);
-        let Some(stamp) = job else {
+        let Job::Upsert(stamp) = job else {
             self.drop_document(key, was_indexed);
             self.record(key, None);
             return Step::Done {
@@ -930,10 +955,7 @@ mod tests {
         rig.send(delta(0, 1, vec![upsert("a.md", old)]));
         rig.send(delta(1, 2, vec![upsert("a.md", new)]));
         rig.live.drain(Duration::ZERO);
-        assert_eq!(
-            rig.live.want,
-            BTreeMap::from([("a.md".to_owned(), Some(new))])
-        );
+        assert_eq!(jobs(&rig.live), [("a.md", Job::Upsert(new))]);
 
         rig.drive();
         assert_eq!(rig.live.records["a.md"].content, Content::Read(new));
@@ -941,18 +963,21 @@ mod tests {
         rig.send(delta(2, 3, vec![upsert("a.md", old)]));
         rig.send(delta(3, 4, vec![Change::Remove("a.md".into())]));
         rig.live.drain(Duration::ZERO);
-        assert_eq!(
-            rig.live.want,
-            BTreeMap::from([("a.md".to_owned(), None)]),
-            "the remove replaced the upsert"
-        );
+        assert_eq!(jobs(&rig.live), [("a.md", Job::Remove)], "the remove replaced the upsert");
         rig.drive();
         assert!(found(&rig.live, "alpha").is_empty());
         assert!(rig.live.records.is_empty());
     }
 
+    fn jobs(live: &Live) -> Vec<(&str, Job)> {
+        live.want
+            .iter()
+            .map(|(key, pending)| (key.as_str(), pending.job))
+            .collect()
+    }
+
     fn tries(live: &Live, key: &str) -> Option<u8> {
-        live.attempts.get(key).map(|(tries, _)| *tries)
+        live.want.get(key)?.retry.map(|retry| retry.tries)
     }
 
     #[test]
@@ -1012,7 +1037,7 @@ mod tests {
             1,
             "a locked file is retried, not dropped"
         );
-        assert_eq!(rig.live.attempts["a.md"].0, 1);
+        assert_eq!(tries(&rig.live, "a.md"), Some(1));
 
         let end = Instant::now() + Duration::from_secs(10);
         while rig.live.records.get("a.md").map(|record| record.content) != Some(Content::Unread) {
@@ -1026,7 +1051,7 @@ mod tests {
 
         drop(lock);
         rig.live.backoff = Duration::from_millis(1);
-        rig.live.attempts.get_mut("a.md").unwrap().1 = Instant::now();
+        rig.live.want.get_mut("a.md").unwrap().retry.as_mut().unwrap().due = Instant::now();
         rig.drive();
         assert_eq!(found(&rig.live, "alpha"), ["a.md"]);
         assert!(rig.live.records["a.md"].indexed);
