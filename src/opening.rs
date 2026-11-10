@@ -26,7 +26,7 @@ use crate::{
 };
 
 pub enum Opened {
-    Ready(Session),
+    Ready(Box<Session>),
     Cancelled,
 }
 
@@ -55,7 +55,7 @@ pub fn open_project(root: PathBuf, library_path: &Path) -> Result<Opened, Box<dy
     }
     let status = format!("{} · F1 help", describe_startup(&live.summary()));
     let app = App::new(root, live.indexed_files(), status);
-    Ok(Opened::Ready(Session { live, app }))
+    Ok(Opened::Ready(Box::new(Session { live, app })))
 }
 
 fn describe_startup(summary: &Summary) -> String {

@@ -244,7 +244,7 @@ fn run_screen(
         Screen::Open { root } => match open_project(root.clone(), library_path) {
             Ok(Opened::Ready(opened)) => {
                 session
-                    .replace(opened)
+                    .replace(*opened)
                     .into_iter()
                     .for_each(|old| old.live.close());
                 flow::Event::Opened
