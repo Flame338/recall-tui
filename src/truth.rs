@@ -233,7 +233,8 @@ impl Dirty {
             }
             match probe.kind(&rel) {
                 Kind::Dir => Scope::Deep(rel),
-                Kind::Missing if truth.has_under(&rel) => Scope::Deep(rel),
+                // A folder replaced by a file, or deleted, leaves keys under it.
+                _ if truth.has_under(&rel) => Scope::Deep(rel),
                 Kind::File | Kind::Missing => Scope::Shallow(rel.parent()),
             }
         });

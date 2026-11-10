@@ -501,7 +501,7 @@ mod pipe {
     use windows_sys::Win32::{
         Foundation::{
             CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
-            ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ,
+            ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ,
             GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
         },
         Security::{
@@ -809,6 +809,12 @@ mod pipe {
         fn wide(&self) -> Vec<u16> {
             self.0.encode_utf16().chain([0]).collect()
         }
+
+        /// The path a plain `File::open` can reach, for tests that misbehave on purpose.
+        #[cfg(test)]
+        pub(crate) fn path(&self) -> &str {
+            &self.0
+        }
     }
 
     /// Names this build. The daemon runs a copy of the exe, so the id is made
@@ -927,6 +933,9 @@ mod pipe {
                                 GetOverlappedResult(pipe.raw(), &overlapped, &mut done, 1) != 0
                             }
                         }
+                        // The client connected and left before this call. It costs
+                        // only itself, the daemon keeps serving.
+                        ERROR_NO_DATA => false,
                         error => return Err(io::Error::from_raw_os_error(error as i32)),
                     }
                 };

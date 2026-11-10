@@ -94,6 +94,13 @@ enum Flow {
 }
 
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+/// How often an idle engine checks that its root is still the folder it watches.
+#[cfg(not(test))]
+const ROOT_CHECK: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const ROOT_CHECK: Duration = Duration::from_millis(300);
+/// A walk that keeps failing is retried at this pace at most.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 fn run(config: EngineConfig, input: Sender<Input>, inbox: Receiver<Input>) {
     // Armed before the first walk, so a change made while it runs is either
@@ -106,6 +113,8 @@ fn run(config: EngineConfig, input: Sender<Input>, inbox: Receiver<Input>) {
         subs: Vec::new(),
         manual: watcher.as_ref().err().cloned(),
         scanning: Some(0),
+        identity: reader::identity(&config.root),
+        failures: 0,
     };
     actor.serve(&config.root, &inbox);
     // The directory handle closes before subscribers see their channel end.
@@ -118,6 +127,14 @@ struct Sub {
 }
 
 impl Sub {
+    /// The first reply to a new client. A client already at the current cursor
+    /// still gets an empty delta, or it would wait for a change that may never come.
+    fn answer(&mut self, truth: &Truth) -> bool {
+        let update = truth.since(self.cursor);
+        self.cursor = Some(truth.cursor());
+        self.tx.send(update).is_ok()
+    }
+
     /// Sends what changed since this client's cursor. False once the client is gone.
     fn catch_up(&mut self, truth: &Truth) -> bool {
         if self.cursor == Some(truth.cursor()) {
@@ -138,6 +155,10 @@ struct Actor {
     manual: Option<String>,
     /// Files found so far, until the first full walk succeeds.
     scanning: Option<usize>,
+    /// Which folder the watch was opened on.
+    identity: Option<reader::FileId>,
+    /// Walks that failed in a row, for the retry pace.
+    failures: u32,
 }
 
 impl Actor {
@@ -145,20 +166,29 @@ impl Actor {
         if self.round(root, vec![Scope::ROOT], inbox) == Flow::Stop {
             return;
         }
+        let mut checked = Instant::now();
         loop {
-            let input = match self.dirty.deadline(&self.debounce) {
-                None => match inbox.recv() {
-                    Ok(input) => Some(input),
-                    Err(_) => return,
-                },
-                Some(at) => {
-                    match inbox.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                        Ok(input) => Some(input),
-                        Err(RecvTimeoutError::Timeout) => None,
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    }
-                }
+            let wait = self
+                .dirty
+                .deadline(&self.debounce)
+                .map_or(ROOT_CHECK, |at| {
+                    at.saturating_duration_since(Instant::now()).min(ROOT_CHECK)
+                });
+            let input = match inbox.recv_timeout(wait) {
+                Ok(input) => Some(input),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
             };
+            if checked.elapsed() >= ROOT_CHECK {
+                checked = Instant::now();
+                if reader::identity(root) != self.identity {
+                    // The watch holds the old folder. A folder renamed away and
+                    // replaced produces no event, so the engine would stay "live"
+                    // on stale data.
+                    self.broadcast(Update::Gone);
+                    return;
+                }
+            }
             if let Some(input) = input
                 && self.take(input) == Flow::Stop
             {
@@ -206,7 +236,7 @@ impl Actor {
         }
         let alive = match self.scanning {
             Some(found) => sub.tx.send(Update::Scanning { found }).is_ok(),
-            None => sub.catch_up(&self.truth),
+            None => sub.answer(&self.truth),
         };
         if alive {
             self.subs.push(sub);
@@ -238,11 +268,17 @@ impl Actor {
                 }
                 Some(Err(_)) => {
                     failed = true;
-                    self.dirty.overflow(Instant::now());
+                    // A folder that stays unreadable must not trigger a full walk
+                    // every debounce, so the retry backs off.
+                    let delay = (self.debounce.quiet * 2u32.pow(self.failures.min(8)))
+                        .min(MAX_RETRY_DELAY);
+                    self.failures = self.failures.saturating_add(1);
+                    self.dirty.overflow(Instant::now() + delay);
                 }
             }
         }
         if !failed {
+            self.failures = 0;
             self.scanning = None;
         }
         if self.scanning.is_none() {
@@ -290,6 +326,13 @@ mod reader {
 
     pub struct Watcher;
 
+    #[derive(PartialEq, Eq)]
+    pub struct FileId;
+
+    pub fn identity(_: &Path) -> Option<FileId> {
+        None
+    }
+
     impl Watcher {
         pub fn start(_: &Path, _: usize, _: Sender<Input>) -> Result<Watcher, String> {
             Err("live watching is only built for Windows".into())
@@ -318,8 +361,8 @@ mod reader {
             CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
             FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
             FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, GetLongPathNameW, OPEN_EXISTING,
-            ReadDirectoryChangesW,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, GetLongPathNameW,
+            OPEN_EXISTING, ReadDirectoryChangesW, BY_HANDLE_FILE_INFORMATION,
         },
         System::{
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
@@ -352,6 +395,33 @@ mod reader {
         fn drop(&mut self) {
             unsafe { CloseHandle(self.0) };
         }
+    }
+
+    /// Which folder a path names: volume plus file index. A renamed folder keeps
+    /// its identity, and a new folder created under the old name gets another.
+    #[derive(PartialEq, Eq)]
+    pub struct FileId(u32, u32, u32);
+
+    pub fn identity(root: &Path) -> Option<FileId> {
+        let path = wide(root);
+        let dir = Owned::check(unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        })
+        .ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        (unsafe { GetFileInformationByHandle(dir.0, &mut info) } != 0).then_some(FileId(
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
     }
 
     struct Borrowed(HANDLE);
@@ -1054,6 +1124,13 @@ mod tests {
         let have = first.cursor.unwrap();
 
         let (_cmd, current) = engine.subscribe(Some(have));
+        match current.recv_timeout(SOON).unwrap() {
+            Update::Delta { from, at, changes } => {
+                assert_eq!((from, at), (have.generation, have), "{changes:?}");
+                assert!(changes.is_empty(), "a client at the current cursor gets an empty delta");
+            }
+            other => panic!("expected an empty delta, got {other:?}"),
+        }
         project.write("new.md", "new");
         match current.recv_timeout(SOON).unwrap() {
             Update::Delta { from, at, changes } => {
@@ -1096,15 +1173,21 @@ mod tests {
     }
 
     #[test]
-    fn a_subscriber_during_the_first_walk_sees_scanning_then_a_snapshot() {
+    fn a_subscriber_during_the_first_walk_gets_scanning_or_the_snapshot_first() {
         let project = Project::new("scanning");
         for n in 0..3_000 {
             project.write(&format!("d{}/f{n}.md", n % 30), "x");
         }
         let engine = project.engine();
         let mut client = Client::of(&engine);
+        // A fast disk can finish the walk before the subscribe is read, so
+        // the first update is Scanning or already the Snapshot. It is never a Delta.
         let first = client.rx.recv_timeout(SOON).unwrap();
-        assert!(matches!(first, Update::Scanning { .. }), "{first:?}");
+        assert!(
+            matches!(first, Update::Scanning { .. } | Update::Snapshot { .. }),
+            "{first:?}"
+        );
+        client.apply(first);
         client.converge(&project, BIG);
         assert_eq!(client.files.len(), 3_000);
     }
@@ -1167,5 +1250,143 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["src/old.rs", "src/new.rs"]);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod converge {
+    use std::{collections::BTreeMap, fs, sync::atomic::{AtomicUsize, Ordering}};
+
+    use super::*;
+    use crate::{cache::Stamp, truth::Change};
+
+    struct P { outer: PathBuf, root: PathBuf }
+
+    impl P {
+        fn new(name: &str) -> P {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let outer = std::env::temp_dir().join(format!(
+                "recall-converge-{}-{}-{name}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let _ = fs::remove_dir_all(&outer);
+            let root = outer.join("proj");
+            fs::create_dir_all(&root).unwrap();
+            P { outer, root }
+        }
+        fn write(&self, rel: &str, text: &str) {
+            let path = self.root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        fn walk(&self) -> BTreeMap<String, Stamp> {
+            scan::walk(&self.root, &Scope::ROOT, |_, _| Ok(true)).unwrap().unwrap().found
+        }
+    }
+    impl Drop for P {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.outer); }
+    }
+
+    fn apply(files: &mut BTreeMap<String, Stamp>, update: Update) {
+        match update {
+            Update::Snapshot { files: all, .. } => *files = all,
+            Update::Delta { changes, .. } => for change in changes {
+                match change {
+                    Change::Upsert(k, s) => { files.insert(k, s); }
+                    Change::Remove(k) => { files.remove(&k); }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// Mirrors the engine, runs `act`, waits 3 s, returns (engine view, fresh walk).
+    fn run(p: &P, act: impl FnOnce(&P)) -> (Vec<String>, Vec<String>) {
+        let engine = Engine::spawn(EngineConfig { root: p.root.clone(), debounce: Debounce::default(), buffer_bytes: 256 * 1024 });
+        let (_cmd, rx) = engine.subscribe(None);
+        let mut files = BTreeMap::new();
+        let end = Instant::now() + Duration::from_secs(5);
+        while files != p.walk() || files.is_empty() {
+            if let Ok(u) = rx.recv_timeout(Duration::from_millis(100)) { apply(&mut files, u) }
+            assert!(Instant::now() < end, "never converged before act");
+        }
+        act(p);
+        let end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < end {
+            if let Ok(u) = rx.recv_timeout(Duration::from_millis(100)) { apply(&mut files, u) }
+        }
+        let engine_view: Vec<String> = files.keys().cloned().collect();
+        let fresh: Vec<String> = p.walk().keys().cloned().collect();
+        eprintln!("after act:  engine={engine_view:?}\n            fresh ={fresh:?}");
+        (engine_view, fresh)
+    }
+
+    #[test]
+    fn git_init_in_a_subfolder_changes_nothing() {
+        let p = P::new("gitinit");
+        p.write(".gitignore", "secret.md\n");
+        p.write("keep.md", "k");
+        p.write("sub/secret.md", "s");
+        p.write("sub/open.md", "o");
+        let (engine, fresh) = run(&p, |p| fs::create_dir_all(p.root.join("sub/.git")).unwrap());
+        assert_eq!(engine, fresh);
+    }
+
+    #[test]
+    fn a_rule_file_in_another_case_is_applied_and_watched() {
+        let p = P::new("upper");
+        p.write("keep.md", "k");
+        p.write("private.md", "p");
+        let (engine, fresh) = run(&p, |p| fs::write(p.root.join(".GITIGNORE"), "private.md\n").unwrap());
+        assert_eq!(engine, fresh);
+    }
+
+    #[test]
+    fn a_folder_moved_out_by_another_case_leaves_the_index() {
+        let p = P::new("caseout");
+        p.write("keep.md", "k");
+        p.write("Docs/x.md", "x");
+        let (engine, fresh) = run(&p, |p| fs::rename(p.root.join("DOCS"), p.outer.join("moved")).unwrap());
+        assert_eq!(engine, fresh);
+    }
+
+    #[test]
+    fn a_folder_replaced_by_a_file_drops_the_old_keys() {
+        let p = P::new("dir2file");
+        p.write("keep.md", "k");
+        p.write("docs/x.md", "x");
+        let (engine, fresh) = run(&p, |p| {
+            fs::rename(p.root.join("docs"), p.outer.join("moved")).unwrap();
+            fs::write(p.root.join("docs"), "now a file").unwrap();
+        });
+        assert_eq!(engine, fresh);
+    }
+
+    #[test]
+    fn a_root_replaced_by_a_new_folder_ends_the_engine() {
+        let p = P::new("root-swap");
+        p.write("a.md", "a");
+        let engine = Engine::spawn(EngineConfig {
+            root: p.root.clone(),
+            debounce: Debounce::default(),
+            buffer_bytes: 256 * 1024,
+        });
+        let (_cmd, rx) = engine.subscribe(None);
+        let mut files = BTreeMap::new();
+        let end = Instant::now() + Duration::from_secs(5);
+        while files.is_empty() {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                apply(&mut files, update);
+            }
+            assert!(Instant::now() < end, "never converged");
+        }
+        fs::rename(&p.root, p.outer.join("old")).unwrap();
+        fs::create_dir_all(&p.root).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+                Ok(Update::Gone) => break,
+                Ok(_) => continue,
+                Err(error) => panic!("the engine stayed live on a replaced root: {error:?}"),
+            }
+        }
     }
 }

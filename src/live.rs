@@ -35,6 +35,8 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(60);
 const IDLE_POLL: Duration = Duration::from_millis(100);
 const MAX_TRIES: u8 = 5;
 const BACKOFF: Duration = Duration::from_millis(250);
+/// A file that stays unreadable is retried at this pace for as long as it is wanted.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const MANUAL_GRACE: Duration = Duration::from_secs(1);
 const WATCH_BUFFER_BYTES: usize = 256 * 1024;
 
@@ -507,7 +509,11 @@ impl Live {
         let start = Instant::now();
         let mut changed = Vec::new();
         while let Some((key, job)) = self.next_job() {
-            let tries = self.attempts.get(&key).map_or(0, |(tries, _)| *tries) + 1;
+            let tries = self
+                .attempts
+                .get(&key)
+                .map_or(0, |(tries, _)| *tries)
+                .saturating_add(1);
             match self.run_job(&key, job, tries >= MAX_TRIES) {
                 Step::Done { changed: moved } => {
                     self.want.remove(&key);
@@ -524,7 +530,7 @@ impl Live {
                     self.current = key;
                 }
                 Step::Retry => {
-                    let wait = self.backoff * 2u32.pow(u32::from(tries) - 1);
+                    let wait = (self.backoff * 2u32.pow(u32::from(tries.min(16)) - 1)).min(MAX_BACKOFF);
                     self.attempts.insert(key, (tries, Instant::now() + wait));
                 }
             }
@@ -564,13 +570,10 @@ impl Live {
                     changed: indexed || was_indexed,
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.drop_document(key, was_indexed);
-                self.record(key, None);
-                Step::Done {
-                    changed: was_indexed,
-                }
-            }
+            // A missing file is retried like a locked one. If it is really gone, the
+            // engine's next delta removes the key and replaces this job. If it was
+            // renamed away and back, the engine sees the same stamp and says nothing,
+            // so dropping it here would leave it out of the index for good.
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 self.drop_document(key, was_indexed);
                 self.record(key, unindexed(stamp));
@@ -578,14 +581,20 @@ impl Live {
                     changed: was_indexed,
                 }
             }
-            Err(_) if last_try => {
-                self.drop_document(key, was_indexed);
-                self.record(key, unindexed(UNREAD));
-                Step::Done {
-                    changed: was_indexed,
+            Err(_) => {
+                if last_try {
+                    // Marks the file for a re-read at the next open. The old
+                    // document stays searchable while the retries go on.
+                    self.record(
+                        key,
+                        Some(Entry {
+                            stamp: UNREAD,
+                            indexed: was_indexed,
+                        }),
+                    );
                 }
+                Step::Retry
             }
-            Err(_) => Step::Retry,
         }
     }
 
@@ -990,13 +999,21 @@ mod tests {
         );
         assert_eq!(rig.live.attempts["a.md"].0, 1);
 
-        rig.drive();
+        let end = Instant::now() + Duration::from_secs(10);
+        while rig.live.manifest.get("a.md").map(|entry| entry.stamp) != Some(UNREAD) {
+            rig.live.tick();
+            assert!(Instant::now() < end, "never marked unread");
+            thread::sleep(Duration::from_millis(1));
+        }
         let entry = rig.live.manifest["a.md"];
         assert_eq!((entry.stamp, entry.indexed), (UNREAD, false));
         assert!(found(&rig.live, "alpha").is_empty());
+        assert_eq!(rig.live.pending(), 1, "it keeps being retried");
 
+        // No new snapshot: the retry itself picks the file up once it is free.
         drop(lock);
-        rig.send(snapshot(&files, 1));
+        rig.live.backoff = Duration::from_millis(1);
+        rig.live.attempts.get_mut("a.md").unwrap().1 = Instant::now();
         rig.drive();
         assert_eq!(found(&rig.live, "alpha"), ["a.md"]);
         assert!(rig.live.manifest["a.md"].indexed);
@@ -1109,6 +1126,7 @@ mod tests {
         rig.settled();
         assert_eq!(rig.live.committed, Some(cursor(1)));
 
+        project.write("b.md", "b");
         rig.send(delta(
             1,
             2,
@@ -1258,7 +1276,8 @@ mod tests {
         let sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(80));
             updates.send(Update::Scanning { found: 2 }).unwrap();
-            thread::sleep(Duration::from_millis(40));
+            // Longer than the 60 ms progress pace, so a report lands in between.
+            thread::sleep(Duration::from_millis(400));
             updates.send(snapshot(&files, 1)).unwrap();
         });
         let mut modes = Vec::new();
@@ -1404,5 +1423,127 @@ mod tests {
         drop(live);
         ipc::stop(&name).expect("stop");
         daemon.join().unwrap().unwrap();
+    }
+
+    #[cfg(windows)]
+    mod real_engine {
+        use super::*;
+        use crate::{
+            daemon::host,
+            ipc::{self, PipeName},
+        };
+        use std::os::windows::fs::OpenOptionsExt;
+
+        fn open_in_process(project: &Project, cache: Option<&Path>) -> Live {
+            let root = project.root.clone();
+            let mut live = Live::build(
+                &project.root,
+                &lux::library_path(),
+                cache.map(Path::to_path_buf),
+                move |have| Some(in_process(&root, have)),
+            )
+            .expect("build libluxcore");
+            live.backoff = Duration::from_millis(40);
+            assert!(live.settle(|_| Ok(true)).unwrap());
+            live
+        }
+
+        fn tick_until(live: &mut Live, what: &str, mut done: impl FnMut(&Live) -> bool) {
+            let end = Instant::now() + Duration::from_secs(6);
+            while !done(live) {
+                live.tick();
+                assert!(Instant::now() < end, "timed out waiting until {what}");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn a_file_that_is_missing_at_read_time_and_comes_back_is_indexed() {
+            let project = Project::new("missing-then-back");
+            project.write("keep.md", "keep");
+            let mut live = open_in_process(&project, None);
+            project.write("x.md", "roundtriptoken");
+            // The engine walks and queues the delta, but this Live does not tick yet.
+            thread::sleep(Duration::from_millis(900));
+            fs::rename(project.root.join("x.md"), project.root.join("x.tmp")).unwrap();
+            live.tick();
+            fs::rename(project.root.join("x.tmp"), project.root.join("x.md")).unwrap();
+            tick_until(&mut live, "x.md is searchable", |live| {
+                found(live, "roundtriptoken") == ["x.md"]
+            });
+        }
+
+        #[test]
+        fn a_file_locked_for_a_while_is_indexed_once_it_is_unlocked() {
+            let project = Project::new("locked-a-while");
+            project.write("keep.md", "keep");
+            project.write("a.md", "lockedtoken");
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(project.root.join("a.md"))
+                .unwrap();
+            let mut live = open_in_process(&project, None);
+            let end = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < end {
+                live.tick();
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(found(&live, "lockedtoken").is_empty());
+            assert_eq!(live.manifest["a.md"].stamp, UNREAD, "a close or crash re-reads it");
+            drop(lock);
+            tick_until(&mut live, "a.md is searchable after the unlock", |live| {
+                found(live, "lockedtoken") == ["a.md"]
+            });
+        }
+
+        #[test]
+        fn reopening_against_a_warm_daemon_with_nothing_changed_still_goes_live() {
+            let project = Project::new("warm-reopen");
+            project.write("a.md", "alphatoken");
+            let suffix = format!("warm-reopen-{}", process::id());
+            let name = PipeName::with_suffix(Some(&suffix));
+            let config = host::Config::production(PipeName::with_suffix(Some(&suffix)));
+            let daemon = thread::spawn(move || host::serve(config).map_err(|e| e.to_string()));
+            let until = Instant::now() + Duration::from_secs(5);
+            while ipc::ping(&name).is_err() {
+                assert!(Instant::now() < until, "the daemon never answered");
+                thread::sleep(Duration::from_millis(20));
+            }
+            let open = |name: &PipeName| {
+                let (root, build, name) =
+                    (project.root.clone(), ipc::build_id().to_owned(), name.clone());
+                Live::build(
+                    &project.root,
+                    &lux::library_path(),
+                    Some(project.cache.clone()),
+                    move |have| {
+                        let link = ipc::connect_to(&name, &build, &root, have).expect("connect");
+                        Some(Feed {
+                            link,
+                            via: Via::Daemon,
+                            engine: None,
+                        })
+                    },
+                )
+                .expect("build libluxcore")
+            };
+            let mut first = open(&name);
+            assert!(first.settle(|_| Ok(true)).unwrap());
+            first.close();
+
+            let mut second = open(&name);
+            assert!(second.committed.is_some(), "the saved cursor was handed over");
+            let begun = Instant::now();
+            let settled = second
+                .settle(|_| Ok(begun.elapsed() < Duration::from_secs(5)))
+                .unwrap();
+            assert!(settled, "settle never returned for a cursor with nothing new");
+            assert_eq!(second.mode(), &Mode::Live { via: Via::Daemon });
+            assert_eq!(found(&second, "alphatoken"), ["a.md"]);
+            drop(second);
+            ipc::stop(&name).expect("stop");
+            daemon.join().unwrap().unwrap();
+        }
     }
 }

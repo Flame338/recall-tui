@@ -983,6 +983,30 @@ pub(crate) mod host {
         }
 
         #[test]
+        fn a_client_that_connects_and_drops_does_not_kill_the_daemon() {
+            let (pipe, log) = (pipe("drop"), Arc::new(Log::default()));
+            let daemon = start(config(&pipe, &log, quick()));
+            let end = Instant::now() + Duration::from_millis(1500);
+            let mut opened = 0;
+            while Instant::now() < end {
+                if fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(pipe.path())
+                    .is_ok()
+                {
+                    opened += 1;
+                }
+            }
+            assert!(opened > 0, "no connection was made");
+            assert!(!daemon.is_finished(), "the daemon exited: {:?}", daemon);
+            let link = ipc::connect_to(&pipe, BUILD, &root("drop"), None).unwrap();
+            assert_eq!(snapshot_len(next(&link)), 3, "it still serves");
+            ipc::stop(&pipe).expect("stop");
+            daemon.join().unwrap().expect("serve returns Ok");
+        }
+
+        #[test]
         fn stop_ends_the_daemon() {
             let (pipe, log) = (pipe("stop"), Arc::new(Log::default()));
             let daemon = start(config(&pipe, &log, quick()));

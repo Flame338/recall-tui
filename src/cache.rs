@@ -5,7 +5,8 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -460,11 +461,31 @@ fn write_atomic(
             return Err(error);
         }
     };
-    if let Err(error) = fs::rename(&temp, target) {
+    if let Err(error) = rename_over(&temp, target) {
         let _ = fs::remove_file(&temp);
         return Err(error.into());
     }
     Ok(stamp)
+}
+
+/// Access denied or a sharing violation: another handle has the file open.
+fn is_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(32)
+}
+
+/// Windows refuses to replace a file that a scanner or another Recall window
+/// still has open. That lasts moments, so a few quick retries save most of them.
+fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match fs::rename(from, to) {
+            Err(error) if is_busy(&error) && tries < 8 => {
+                tries += 1;
+                thread::sleep(Duration::from_millis(20 * tries));
+            }
+            done => return done,
+        }
+    }
 }
 
 #[cfg(test)]

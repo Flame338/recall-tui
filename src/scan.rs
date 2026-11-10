@@ -132,7 +132,15 @@ pub fn is_indexable(name: &str) -> bool {
 
 /// Files whose edits change what is indexable without touching any indexed file.
 pub fn is_rule_file(name: &str) -> bool {
-    matches!(name, ".gitignore" | ".ignore")
+    // NTFS opens `.GITIGNORE` when the walk asks for `.gitignore`.
+    let case = |rule: &str| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(rule)
+        } else {
+            name == rule
+        }
+    };
+    case(".gitignore") || case(".ignore")
 }
 
 /// Keys go into a line-based manifest and pipe protocol, so they never hold one.
