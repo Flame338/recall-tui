@@ -340,7 +340,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::{Header, Manifest, Stamp, serialize},
+        cache::Records,
         lux::{LuxIndex, library_path},
         shelf::{Project, Shard},
     };
@@ -575,24 +575,12 @@ mod tests {
         assert_eq!(codes, [0, 1, 2]);
     }
 
-    fn save_entry(dir: &Path, stem: &str, root: &str, body: &str) {
+    fn save_entry(dir: &Path, root: &Path, body: &str) {
         let mut index = LuxIndex::load(&library_path()).unwrap();
         index.add("a.md", "a.md", body).unwrap();
-        index.save(&dir.join(format!("{stem}.lux"))).unwrap();
-        let header = Header {
-            fingerprint: "fp".into(),
-            root: root.into(),
-            index: Stamp {
-                size: 1,
-                modified: 1,
-            },
-            cursor: None,
-        };
-        fs::write(
-            dir.join(format!("{stem}.manifest")),
-            serialize(&header, &Manifest::new()),
-        )
-        .unwrap();
+        let files = cache::cache_files(dir, root);
+        let fingerprint = cache::fingerprint(&library_path());
+        cache::save(&index, &files, &fingerprint, None, &Records::new()).unwrap();
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -605,16 +593,14 @@ mod tests {
     #[test]
     fn run_searches_and_lists_a_saved_cache() {
         let dir = temp_dir("saved");
-        save_entry(
-            &dir,
-            "0000000000000001",
-            r"\\?\F:/work/Zeta",
-            "zeta watcher",
-        );
+        let zeta = dir.join("Zeta");
+        fs::create_dir_all(&zeta).unwrap();
+        let verbatim = format!(r"\\?\{}", zeta.display());
+        save_entry(&dir, Path::new(&verbatim), "zeta watcher");
         let library = library_path();
 
         let projects = run(&Command::Projects, &dir, &library);
-        assert_eq!(projects.stdout, "F:/work/Zeta\n");
+        assert_eq!(projects.stdout, format!("{}\n", zeta.display()));
         assert_eq!(projects.exit, Exit::Matched);
 
         let found = run(
@@ -630,7 +616,8 @@ mod tests {
             &dir,
             &library,
         );
-        assert!(json.stdout.contains(r#""root": "F:/work/Zeta""#));
+        let root = format!(r#""root": {}"#, json_string(&zeta.to_string_lossy()));
+        assert!(json.stdout.contains(&root), "{}", json.stdout);
         let _ = fs::remove_dir_all(&dir);
     }
 

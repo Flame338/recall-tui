@@ -268,6 +268,10 @@ pub struct CacheFiles {
 
 pub fn cache_files(dir: &Path, root: &Path) -> CacheFiles {
     let name = format!("{:016x}", fnv1a(root.to_string_lossy().as_bytes()));
+    entry_files(dir, &name, root)
+}
+
+pub fn entry_files(dir: &Path, name: &str, root: &Path) -> CacheFiles {
     CacheFiles {
         root: root.to_path_buf(),
         index: dir.join(format!("{name}.lux")),
@@ -441,17 +445,22 @@ pub struct Loaded {
     pub cursor: Option<Cursor>,
 }
 
-/// Restores a saved pair, or `None` when it is missing, from another library,
-/// or torn. A torn pair costs a cold start, never a wrong index.
-pub fn load(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Option<Loaded> {
+pub fn restore(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Option<Parsed> {
     let text = fs::read_to_string(&files.manifest).ok()?;
-    let Parsed { header, manifest } = parse_manifest(&text)?;
-    let paired = || stamp_of(&files.index).is_some_and(|stamp| stamp == header.index);
-    if header.fingerprint != fingerprint || !paired() {
+    let parsed = parse_manifest(&text)?;
+    let paired = || stamp_of(&files.index).is_some_and(|stamp| stamp == parsed.header.index);
+    if parsed.header.fingerprint != fingerprint || !paired() {
         return None;
     }
     index.restore(&files.index).ok()?;
-    paired().then(|| Loaded {
+    paired().then_some(parsed)
+}
+
+/// Restores a saved pair, or `None` when it is missing, from another library,
+/// or torn. A torn pair costs a cold start, never a wrong index.
+pub fn load(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Option<Loaded> {
+    let Parsed { header, manifest } = restore(index, files, fingerprint)?;
+    Some(Loaded {
         records: manifest
             .into_iter()
             .map(|(key, entry)| (key, Record::from_row(entry)))

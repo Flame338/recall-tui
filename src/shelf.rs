@@ -102,6 +102,7 @@ fn same_root(left: &str, right: &str) -> bool {
 impl Shelf {
     pub fn load(cache_dir: &Path, library: &Path, except: Option<&Path>) -> Self {
         let except = except.map(|path| path.to_string_lossy().into_owned());
+        let fingerprint = cache::fingerprint(library);
         let shards = cache::list_entries(cache_dir)
             .into_iter()
             .filter_map(|entry| {
@@ -112,10 +113,12 @@ impl Shelf {
                 {
                     return None;
                 }
+                if !Path::new(&root).is_dir() {
+                    return None;
+                }
+                let files = cache::entry_files(cache_dir, &entry.name, Path::new(&root));
                 let mut index = LuxIndex::load(library).ok()?;
-                index
-                    .restore(&cache_dir.join(format!("{}.lux", entry.name)))
-                    .ok()?;
+                cache::restore(&mut index, &files, &fingerprint)?;
                 Some(Shard {
                     project: Project::at(root),
                     index,
@@ -307,7 +310,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::{Header, Manifest, Stamp, serialize},
+        cache::{CacheFiles, Header, Manifest, Records, Stamp, serialize},
         lux::{MARK_START, library_path},
     };
 
@@ -695,50 +698,63 @@ mod tests {
         assert_eq!(snippet(&all[0], "missing.md", &fuzzy, 80), None);
     }
 
-    fn save_entry(dir: &Path, stem: &str, root: &str, body: Option<&str>) {
-        let file = dir.join(format!("{stem}.lux"));
-        match body {
-            Some(body) => {
-                let mut index = LuxIndex::load(&library_path()).unwrap();
-                index.add("a.md", "a.md", body).unwrap();
-                index.save(&file).unwrap();
-            }
-            None => fs::write(&file, b"not an index").unwrap(),
-        }
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("recall-shelf-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn project_dir(dir: &Path, name: &str) -> PathBuf {
+        let root = dir.join("projects").join(name);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn index_of(body: &str) -> LuxIndex {
+        let mut index = LuxIndex::load(&library_path()).unwrap();
+        index.add("a.md", "a.md", body).unwrap();
+        index
+    }
+
+    fn save_index(dir: &Path, root: &Path, fingerprint: &str, body: &str) -> CacheFiles {
+        let files = cache::cache_files(dir, root);
+        cache::save(&index_of(body), &files, fingerprint, None, &Records::new()).unwrap();
+        files
+    }
+
+    fn save_current(dir: &Path, root: &Path, body: &str) -> CacheFiles {
+        save_index(dir, root, &cache::fingerprint(&library_path()), body)
+    }
+
+    fn save_broken(dir: &Path, root: &Path) {
+        let files = cache::cache_files(dir, root);
+        fs::write(&files.index, b"not an index").unwrap();
         let header = Header {
-            fingerprint: "fp".into(),
-            root: root.into(),
-            index: Stamp {
-                size: 1,
-                modified: 1,
-            },
+            fingerprint: cache::fingerprint(&library_path()),
+            root: root.to_string_lossy().into_owned(),
+            index: Stamp::of(&fs::metadata(&files.index).unwrap()),
             cursor: None,
         };
-        fs::write(
-            dir.join(format!("{stem}.manifest")),
-            serialize(&header, &Manifest::new()),
-        )
-        .unwrap();
+        fs::write(&files.manifest, serialize(&header, &Manifest::new())).unwrap();
+    }
+
+    fn loaded_names(shelf: &Shelf) -> Vec<&str> {
+        shelf
+            .shards()
+            .iter()
+            .map(|shard| shard.project.name.as_str())
+            .collect()
     }
 
     #[test]
     fn a_shelf_loads_saved_indexes_from_disk() {
-        let dir = env::temp_dir().join(format!("recall-shelf-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        save_entry(
-            &dir,
-            "0000000000000001",
-            "F:/work/Zeta",
-            Some("zeta watcher"),
-        );
-        save_entry(
-            &dir,
-            "0000000000000002",
-            "F:/work/Alpha",
-            Some("alpha watcher"),
-        );
-        save_entry(&dir, "0000000000000003", "F:/work/Broken", None);
+        let dir = temp_dir("disk");
+        let zeta = project_dir(&dir, "Zeta");
+        let alpha = project_dir(&dir, "Alpha");
+        save_current(&dir, &zeta, "zeta watcher");
+        save_current(&dir, &alpha, "alpha watcher");
+        save_broken(&dir, &project_dir(&dir, "Broken"));
         fs::write(
             dir.join("0000000000000004.lux"),
             b"orphan without a manifest",
@@ -752,10 +768,7 @@ mod tests {
             .iter()
             .map(|shard| shard.project.root.as_path())
             .collect();
-        assert_eq!(
-            roots,
-            [Path::new("F:/work/Alpha"), Path::new("F:/work/Zeta")]
-        );
+        assert_eq!(roots, [alpha.as_path(), zeta.as_path()]);
         let all = sources(None, &shelf);
         let outcome = search(
             &all,
@@ -764,19 +777,15 @@ mod tests {
         );
         assert_eq!(outcome.found.len(), 2);
 
-        let skipped = Shelf::load(&dir, &library, Some(Path::new(r"\\?\f:/WORK/alpha")));
-        let names: Vec<&str> = skipped
-            .shards()
-            .iter()
-            .map(|shard| shard.project.name.as_str())
-            .collect();
+        let shouted = format!(r"\\?\{}", alpha.to_string_lossy().to_uppercase());
+        let skipped = Shelf::load(&dir, &library, Some(Path::new(&shouted)));
         let expected: &[&str] = if cfg!(windows) {
             &["Zeta"]
         } else {
             &["Alpha", "Zeta"]
         };
-        assert_eq!(names, expected);
-        let skipped = Shelf::load(&dir, &library, Some(Path::new("F:/work/Alpha")));
+        assert_eq!(loaded_names(&skipped), expected);
+        let skipped = Shelf::load(&dir, &library, Some(&alpha));
         assert_eq!(skipped.shards().len(), 1);
 
         assert!(
@@ -784,6 +793,46 @@ mod tests {
                 .shards()
                 .is_empty()
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shelf_skips_an_index_saved_with_another_library_or_rules() {
+        let dir = temp_dir("stale");
+        save_current(&dir, &project_dir(&dir, "fresh"), "watcher");
+        save_index(
+            &dir,
+            &project_dir(&dir, "stale"),
+            "rules 0 lib 1 1",
+            "watcher",
+        );
+        let shelf = Shelf::load(&dir, &library_path(), None);
+        assert_eq!(loaded_names(&shelf), ["fresh"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shelf_skips_a_torn_index_and_manifest_pair() {
+        let dir = temp_dir("torn");
+        save_current(&dir, &project_dir(&dir, "whole"), "watcher");
+        let torn = save_current(&dir, &project_dir(&dir, "torn"), "watcher");
+        index_of(&"another body entirely ".repeat(50))
+            .save(&torn.index)
+            .unwrap();
+        let shelf = Shelf::load(&dir, &library_path(), None);
+        assert_eq!(loaded_names(&shelf), ["whole"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shelf_skips_a_project_whose_folder_is_gone() {
+        let dir = temp_dir("gone");
+        save_current(&dir, &project_dir(&dir, "kept"), "watcher");
+        let removed = project_dir(&dir, "removed");
+        save_current(&dir, &removed, "watcher");
+        fs::remove_dir_all(&removed).unwrap();
+        let shelf = Shelf::load(&dir, &library_path(), None);
+        assert_eq!(loaded_names(&shelf), ["kept"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }
