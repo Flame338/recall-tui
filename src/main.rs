@@ -16,6 +16,7 @@ mod picker;
 mod preview;
 mod scan;
 mod search;
+mod shelf;
 #[cfg(test)]
 mod testing;
 mod truth;
