@@ -128,9 +128,12 @@ impl Shelf {
     }
 
     pub fn from_shards(mut shards: Vec<Shard>) -> Self {
-        shards.sort_by(|left, right| {
-            (&left.project.name, &left.project.root)
-                .cmp(&(&right.project.name, &right.project.root))
+        shards.sort_by_cached_key(|shard| {
+            (
+                shard.project.name.to_lowercase(),
+                shard.project.name.clone(),
+                shard.project.root.clone(),
+            )
         });
         Self { shards }
     }
@@ -427,6 +430,23 @@ mod tests {
             .map(|shard| shard.project.name.as_str())
             .collect();
         assert_eq!(names, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_shelf_orders_its_shards_without_regard_to_case() {
+        let shelf = Shelf::from_shards(vec![
+            watchers("Zeta"),
+            watchers("api"),
+            watchers("Beta"),
+            watchers("alpha"),
+            watchers("Api"),
+        ]);
+        let names: Vec<&str> = shelf
+            .shards()
+            .iter()
+            .map(|shard| shard.project.name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "Api", "api", "Beta", "Zeta"]);
     }
 
     #[test]
