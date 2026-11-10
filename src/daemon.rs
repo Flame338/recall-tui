@@ -879,12 +879,15 @@ pub(crate) mod host {
                 1,
                 "one engine per root, whatever its case"
             );
+            // The daemon counts files from its own subscription, a moment after
+            // the clients got the snapshot, so status is awaited rather than sampled.
+            wait_until("status shows both clients and the snapshot", || {
+                projects(&pipe).first().is_some_and(|project| {
+                    (project.clients, project.files, project.generation) == (2, 3, Gen(1))
+                })
+            });
             let status = projects(&pipe);
             assert_eq!(status.len(), 1);
-            assert_eq!(
-                (status[0].clients, status[0].files, status[0].generation),
-                (2, 3, Gen(1))
-            );
             assert_eq!(status[0].idle, None);
 
             a.0.send(Cmd::Rescan).unwrap();
