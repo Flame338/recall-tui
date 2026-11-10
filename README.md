@@ -37,6 +37,9 @@ cargo run --release -- 'C:\path\to\project'
 
 Type words, a phrase, or a code symbol. Results update as you type. Use the arrows or mouse wheel to move through results; the preview shows the closest lines and marks query terms. Press Enter to open the selected file in its default application.
 
+- `Tab`: accept the grey completion of the word you are typing
+- `Ctrl-E`: search every saved project, or only the open one (see Every project at once)
+- `Ctrl-T`: switch between typo-tolerant search and LuxCore query syntax
 - `Esc`: clear the query
 - `Ctrl-W`: delete the last query word
 - `Ctrl-U`: clear the whole query
@@ -48,6 +51,27 @@ Type words, a phrase, or a code symbol. Results update as you type. Use the arro
 - `Ctrl-Q`: quit
 
 Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. Recall saves the index and a file manifest under `%LOCALAPPDATA%\Recall` (or `$XDG_CACHE_HOME/recall`, or `~/.cache/recall`), one pair per folder: a `.lux` index and a `.manifest` that records the folder path and a stamp for each file. At the next launch it loads the saved index and catches up on what changed (see Live updates). A different LuxCore library file, a change to the scan rules, or an index saved by an older version of Recall rebuilds the index from scratch.
+
+## Every project at once
+
+Recall searches the open project until you ask for more. Press `Ctrl-E` and each query also runs against every other project Recall has saved. The hits are merged into one list, best score first, and a hit from another project shows that project's name in front of its path. The box title says `everywhere` while this is on. Press `Ctrl-E` again to return to the open project.
+
+Start the query with `@name` to search only the saved projects whose folder name contains `name`, whatever `Ctrl-E` is set to. Several `@` words widen the scope, so `@lux @recall watcher` searches both.
+
+`Ctrl-T` switches to LuxCore query syntax, such as `title:readme AND build` or `+watcher -daemon`, and the box title says `syntax`. This mode matches whole words only, with no typo tolerance and no completion. When LuxCore cannot read the query, the query turns red from the byte it rejected. Recall builds its indexes without positions, so a quoted phrase is rejected.
+
+The open project is searched live. The other projects are read from their saved indexes when you open a project, so they are as fresh as their last save, and an index saved by an older version of Recall is left out until that project is opened again. Each project scores against its own statistics, so scores from different projects are close but not strictly comparable.
+
+## From a script
+
+```powershell
+recall search watcher debounce
+recall search --json --limit 3 "@comfy sampler"
+recall search --syntax "title:readme AND build"
+recall projects
+```
+
+`recall search` searches every saved project without opening the interface. It prints each hit as `project/path` with its score and one line of context, or a JSON array with `--json`. It exits with 0 when it printed matches, 1 when there were none, and 2 for a query LuxCore cannot read or a bad argument. `recall projects` lists the saved project folders. Both take `--lib PATH`. A project folder named `search` or `projects` needs a path such as `.\search` to open.
 
 ## Live updates
 
