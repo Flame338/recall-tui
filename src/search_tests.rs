@@ -3,9 +3,11 @@ use std::fs;
 use super::*;
 use crate::{
     lux,
+    shelf::Shard,
     testing::{ch, ctrl, no_disk, picker_dir, plain, wheel},
 };
 use crossterm::event::MouseButton;
+use ratatui::buffer::Buffer;
 
 fn app_with_help(show_help: bool) -> App {
     let mut app = App::new(PathBuf::from("root"), 0, String::new());
@@ -15,11 +17,22 @@ fn app_with_help(show_help: bool) -> App {
     app
 }
 
+fn render(app: &App, index: &LuxIndex, width: u16, height: u16) -> Buffer {
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| draw(frame, app, index)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
 fn screen_text(app: &App, width: u16, height: u16) -> String {
-    let mut terminal =
-        Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-    terminal.draw(|frame| draw(frame, app)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
+    let index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+    text_of(&render(app, &index, width, height), width)
+}
+
+fn rig_screen(rig: &Rig, width: u16, height: u16) -> String {
+    text_of(&render(&rig.app, rig.live.index(), width, height), width)
+}
+
+fn text_of(buffer: &Buffer, width: u16) -> String {
     buffer
         .content
         .chunks(width as usize)
@@ -36,6 +49,9 @@ fn footer_hint_fits_a_100_column_terminal() {
         .find(|line| line.contains("Ctrl-O project"))
         .expect("footer hint should list Ctrl-O");
     assert!(hint.contains("Ctrl-Q quit"), "hint truncated: {hint:?}");
+    for expected in ["Tab", "Ctrl-E", "Ctrl-T"] {
+        assert!(hint.contains(expected), "hint is missing {expected:?}");
+    }
 }
 
 #[test]
@@ -49,6 +65,10 @@ fn help_popup_lists_every_key_on_a_short_terminal() {
         "Switch to another project",
         "Saved indexes",
         "Close this panel",
+        "Tab",
+        "Ctrl-E",
+        "Ctrl-T",
+        "@name",
     ] {
         assert!(text.contains(expected), "help is missing {expected:?}");
     }
@@ -95,7 +115,7 @@ fn a_live_change_keeps_the_selected_file_selected_wherever_it_moves() {
     assert_eq!(app.hits.len(), 3);
     assert_eq!(app.hits[app.selected].key, selected);
     assert_eq!(
-        app.preview_for.as_ref().map(|(key, _)| key.clone()),
+        app.preview_for.as_ref().map(|wanted| wanted.key.clone()),
         Some(selected)
     );
     let _ = fs::remove_dir_all(&dir);
@@ -156,6 +176,38 @@ impl Rig {
         let mut rig = Rig::new(name);
         rig.type_text("zebra");
         assert_eq!(rig.app.hits.len(), 12);
+        rig
+    }
+
+    fn shelve(&mut self, projects: &[(&str, &[(&str, &str)])]) {
+        let shards = projects
+            .iter()
+            .map(|(name, docs)| {
+                let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+                for (key, body) in *docs {
+                    index.add(key, key, body).unwrap();
+                }
+                Shard {
+                    project: Project::at(format!("F:/work/{name}")),
+                    index,
+                }
+            })
+            .collect();
+        self.app.shelf = Shelf::from_shards(shards);
+    }
+
+    fn shelved(name: &str) -> Rig {
+        let mut rig = Rig::new(name);
+        rig.shelve(&[
+            (
+                "alpha",
+                &[
+                    ("far.md", "zebra zebra zebra zebra stripes"),
+                    ("note3.md", "zebra three"),
+                ],
+            ),
+            ("beta", &[("other.md", "giraffe")]),
+        ]);
         rig
     }
 
@@ -441,7 +493,10 @@ fn selecting_a_result_shows_its_preview() {
     rig.press(plain(KeyCode::Down));
     assert_ne!(rig.app.preview_for, first);
     assert_eq!(
-        rig.app.preview_for.as_ref().map(|(key, _)| key.clone()),
+        rig.app
+            .preview_for
+            .as_ref()
+            .map(|wanted| wanted.key.clone()),
         Some(rig.app.hits[1].key.clone())
     );
 }
@@ -580,4 +635,301 @@ fn finishing_a_rescan_that_never_started_changes_nothing() {
     let mut rig = Rig::new("pin-rescan-none");
     assert!(!finish_rescan(&mut rig.app, &rig.live));
     assert_eq!(rig.app.status.text(), "ready");
+}
+
+fn sources_of(rig: &Rig) -> Vec<Source<'_>> {
+    sources(Some((&rig.app.project, rig.live.index())), &rig.app.shelf)
+}
+
+fn hit_names(rig: &Rig) -> Vec<(usize, &str)> {
+    rig.app
+        .hits
+        .iter()
+        .map(|hit| (hit.source, hit.key.as_str()))
+        .collect()
+}
+
+#[test]
+fn the_default_reach_ignores_the_shelf() {
+    let mut rig = Rig::shelved("ui-here");
+    rig.type_text("zebra");
+    assert_eq!(rig.app.hits.len(), 12);
+    assert!(rig.app.hits.iter().all(|hit| hit.source == HERE));
+    assert!(
+        rig.app.status.text().starts_with("12 results · "),
+        "{}",
+        rig.app.status.text()
+    );
+}
+
+#[test]
+fn ctrl_e_merges_other_projects_by_score_and_toggles_back() {
+    let mut rig = Rig::shelved("ui-everywhere");
+    rig.type_text("zebra");
+    assert_eq!(rig.press(ctrl('e')), None);
+    assert_eq!(rig.app.reach, Reach::Everywhere);
+    assert_eq!(rig.app.hits.len(), 14);
+    assert_eq!(hit_names(&rig)[0], (1, "far.md"));
+    assert!(hit_names(&rig).contains(&(1, "note3.md")));
+    assert!(
+        rig.app
+            .hits
+            .windows(2)
+            .all(|pair| pair[0].score >= pair[1].score)
+    );
+    assert!(
+        rig.app
+            .status
+            .text()
+            .starts_with("14 results across 3 projects"),
+        "{}",
+        rig.app.status.text()
+    );
+    assert_eq!(rig.press(ctrl('e')), None);
+    assert_eq!(rig.app.reach, Reach::Here);
+    assert_eq!(rig.app.hits.len(), 12);
+    assert!(rig.app.hits.iter().all(|hit| hit.source == HERE));
+    assert!(rig.app.status.text().starts_with("12 results · "));
+}
+
+#[test]
+fn an_at_name_scopes_the_search_whatever_the_reach() {
+    let mut rig = Rig::shelved("ui-scope");
+    rig.type_text("@ALP zebra");
+    assert_eq!(hit_names(&rig).len(), 2);
+    assert!(rig.app.hits.iter().all(|hit| hit.source == 1));
+    rig.press(ctrl('e'));
+    assert_eq!(hit_names(&rig).len(), 2);
+    assert!(rig.app.hits.iter().all(|hit| hit.source == 1));
+    rig.press(ctrl('e'));
+    rig.press(ctrl('u'));
+    rig.type_text("@note zebra");
+    assert!(rig.app.hits.is_empty());
+}
+
+#[test]
+fn a_foreign_hit_shows_its_project_and_a_local_hit_does_not() {
+    let mut rig = Rig::shelved("ui-names");
+    rig.type_text("zebra");
+    let here = rig_screen(&rig, 120, 30);
+    assert!(!here.contains("alpha"), "{here}");
+    rig.press(ctrl('e'));
+    let everywhere = rig_screen(&rig, 120, 30);
+    assert!(everywhere.contains("alpha › far.md"), "{everywhere}");
+    assert!(everywhere.contains("alpha › note3.md"), "{everywhere}");
+    assert!(everywhere.contains("Results (14)"), "{everywhere}");
+    assert!(
+        everywhere.lines().any(|line| line.contains("note0.md")),
+        "{everywhere}"
+    );
+    assert!(
+        !everywhere
+            .lines()
+            .filter(|line| line.contains("note0.md"))
+            .any(|line| line.contains('›')),
+        "{everywhere}"
+    );
+    assert!(everywhere.contains("alpha › far.md ·"), "{everywhere}");
+}
+
+#[test]
+fn the_preview_title_names_the_project_of_a_foreign_hit() {
+    let mut rig = Rig::shelved("ui-preview-title");
+    rig.type_text("zebra");
+    rig.press(ctrl('e'));
+    let text = rig_screen(&rig, 120, 30);
+    assert!(text.contains("┌ alpha › far.md ·"), "{text}");
+    rig.press(plain(KeyCode::End));
+    let text = rig_screen(&rig, 120, 30);
+    assert!(!text.contains("┌ alpha ›"), "{text}");
+}
+
+#[test]
+fn tab_accepts_the_ghost_and_does_nothing_without_one() {
+    let mut rig = Rig::new("ui-tab");
+    assert_eq!(rig.press(plain(KeyCode::Tab)), None);
+    assert_eq!(rig.app.query, "");
+    assert_eq!(rig.app.status.text(), "ready");
+    rig.type_text("zebr");
+    assert_eq!(shelf::ghost(&rig.app.query, &rig.app.suggestions), "a");
+    assert_eq!(rig.press(plain(KeyCode::Tab)), None);
+    assert_eq!(rig.app.query, "zebra");
+    let status = rig.app.status.clone();
+    assert_eq!(rig.press(plain(KeyCode::Tab)), None);
+    assert_eq!(rig.app.query, "zebra");
+    assert_eq!(rig.app.status, status);
+}
+
+#[test]
+fn tab_does_nothing_behind_the_help_popup() {
+    let mut rig = Rig::new("ui-tab-help");
+    rig.type_text("zebr");
+    rig.show(Shown::Help);
+    rig.press(plain(KeyCode::Tab));
+    assert_eq!(rig.app.query, "zebr");
+}
+
+#[test]
+fn the_ghost_is_drawn_in_dark_gray_before_the_cursor() {
+    let mut rig = Rig::new("ui-ghost");
+    rig.type_text("zebr");
+    let buffer = render(&rig.app, rig.live.index(), 120, 30);
+    let row: Vec<&ratatui::buffer::Cell> = (0..120).map(|x| &buffer[(x, 1)]).collect();
+    let symbols: String = row.iter().map(|cell| cell.symbol()).collect();
+    assert!(symbols.contains("zebra▏"), "{symbols}");
+    let at = symbols.chars().position(|c| c == 'a').unwrap();
+    assert_eq!(row[at].fg, Color::DarkGray);
+    assert_eq!(row[at - 1].fg, Color::White);
+}
+
+#[test]
+fn ctrl_t_switches_the_mode_and_refreshes_the_preview() {
+    let mut rig = Rig::searched("ui-mode");
+    assert_eq!(rig.app.mode, Mode::Fuzzy);
+    let before = rig.app.preview_for.clone().unwrap();
+    assert_eq!(rig.press(ctrl('t')), None);
+    assert_eq!(rig.app.mode, Mode::Syntax);
+    let after = rig.app.preview_for.clone().unwrap();
+    assert_eq!((after.source, &after.key), (before.source, &before.key));
+    assert_eq!(after.mode, Mode::Syntax);
+    assert_ne!(after, before);
+    assert_eq!(rig.app.hits.len(), 12);
+    assert_eq!(rig.press(ctrl('T')), None);
+    assert_eq!(rig.app.mode, Mode::Fuzzy);
+    assert_eq!(rig.app.preview_for.clone().unwrap(), before);
+}
+
+#[test]
+fn a_malformed_syntax_query_marks_the_problem_and_finds_nothing() {
+    let mut rig = Rig::new("ui-problem");
+    rig.press(ctrl('t'));
+    rig.type_text("zebra AND (zebra");
+    assert!(rig.app.hits.is_empty());
+    let problem = rig.app.problem.expect("the query is malformed");
+    assert_eq!(problem.offset, rig.app.query.find('(').unwrap());
+    assert_eq!(
+        rig.app.status.text(),
+        "LuxCore cannot read the query from the red mark"
+    );
+    let buffer = render(&rig.app, rig.live.index(), 120, 30);
+    let row: Vec<&ratatui::buffer::Cell> = (0..120).map(|x| &buffer[(x, 1)]).collect();
+    let symbols: String = row.iter().map(|cell| cell.symbol()).collect();
+    let paren = symbols.chars().position(|c| c == '(').unwrap();
+    assert_eq!(row[paren].fg, Color::Red);
+    assert_eq!(row[paren - 1].fg, Color::White);
+    rig.press(ctrl('t'));
+    assert_eq!(rig.app.problem, None);
+    assert_eq!(rig.app.mode, Mode::Fuzzy);
+}
+
+#[test]
+fn a_problem_offset_inside_a_character_is_clamped() {
+    let mut app = App::new(PathBuf::from("root"), 0, String::new());
+    app.query = "añb".into();
+    app.problem = Some(Problem { offset: 2 });
+    let line = query_line(&app);
+    let shown: Vec<&str> = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert_eq!(shown, ["a", "ñb", "▏"]);
+    app.problem = Some(Problem { offset: 99 });
+    let line = query_line(&app);
+    assert_eq!(line.spans[0].content, "añb");
+}
+
+#[test]
+fn the_box_title_marks_the_reach_and_the_mode() {
+    let mut rig = Rig::new("ui-title");
+    let title = |rig: &Rig| rig_screen(rig, 160, 30).lines().next().unwrap().to_owned();
+    let bare = title(&rig);
+    assert!(!bare.contains("everywhere"));
+    assert!(!bare.contains("syntax"));
+    rig.press(ctrl('e'));
+    assert!(title(&rig).contains(" · everywhere "));
+    rig.press(ctrl('t'));
+    assert!(title(&rig).contains(" · everywhere · syntax "));
+    rig.press(ctrl('e'));
+    let last = title(&rig);
+    assert!(last.contains(" · syntax "));
+    assert!(!last.contains("everywhere"));
+}
+
+#[test]
+fn enter_targets_the_root_of_the_hits_own_project() {
+    let mut rig = Rig::shelved("ui-open");
+    rig.type_text("zebra");
+    rig.press(ctrl('e'));
+    let all = sources_of(&rig);
+    let foreign = rig.app.hits[0].clone();
+    assert_eq!(foreign.source, 1);
+    assert_eq!(
+        target_path(&all, &foreign),
+        Some(PathBuf::from("F:/work/alpha").join("far.md"))
+    );
+    let local = rig.app.hits.iter().find(|hit| hit.source == HERE).unwrap();
+    assert_eq!(target_path(&all, local), Some(rig.dir.join(&local.key)));
+    let missing = Found {
+        source: 9,
+        key: "x".into(),
+        score: 0.0,
+    };
+    assert_eq!(target_path(&all, &missing), None);
+}
+
+impl Rig {
+    fn rescan_until_changed(&mut self) -> Vec<String> {
+        self.live.rescan();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            let changed = self.live.tick().changed;
+            if !changed.is_empty() {
+                return changed;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "the rescan never reached the index"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn a_live_change_keeps_a_foreign_hit_selected_by_source_and_key() {
+    let mut rig = Rig::shelved("ui-live-foreign");
+    rig.type_text("zebra");
+    rig.press(ctrl('e'));
+    let at = rig
+        .app
+        .hits
+        .iter()
+        .position(|hit| hit.source == 1 && hit.key == "note3.md")
+        .unwrap();
+    rig.app.selected = at;
+    fs::write(
+        rig.dir.join("c.md"),
+        "zebra zebra zebra zebra zebra zebra zebra zebra",
+    )
+    .unwrap();
+    let changed = rig.rescan_until_changed();
+    assert_eq!(changed, ["c.md"]);
+    on_live_change(&mut rig.app, &rig.live, &changed);
+    assert_eq!(rig.app.hits.len(), 15);
+    let kept = &rig.app.hits[rig.app.selected];
+    assert_eq!((kept.source, kept.key.as_str()), (1, "note3.md"));
+    assert_ne!(rig.app.selected, at);
+}
+
+#[test]
+fn the_empty_query_clears_the_suggestions_and_the_problem() {
+    let mut rig = Rig::new("ui-clear");
+    rig.press(ctrl('t'));
+    rig.type_text("(zebra");
+    assert!(rig.app.problem.is_some());
+    rig.press(plain(KeyCode::Esc));
+    assert_eq!(rig.app.problem, None);
+    assert!(rig.app.suggestions.is_empty());
+    assert_eq!(rig.app.mode, Mode::Syntax);
 }

@@ -27,29 +27,55 @@ use ratatui::{
 use crate::{
     Exit,
     live::{self, Live},
-    lux::{Hit, LuxIndex},
+    lux::LuxIndex,
     manager::{IndexManager, Outcome},
     preview::build_preview,
+    shelf::{self, Found, Mode, Problem, Project, Reach, Shelf, Source, parse_request, sources},
     view::{
         Move, Opener, TerminalCleanup, centered_rect, compact_path, draw_manager, open_manager,
         sanitize_for_display,
     },
 };
 
+const HERE: usize = 0;
 const MAX_RESULTS: usize = 40;
+const MAX_SUGGESTIONS: usize = 8;
+const PALETTE: [Color; 6] = [
+    Color::Magenta,
+    Color::Blue,
+    Color::Yellow,
+    Color::LightRed,
+    Color::LightGreen,
+    Color::LightCyan,
+];
+const BAD_QUERY: &str = "LuxCore cannot read the query from the red mark";
 const GONE: &str = "The project folder is gone";
 /// The shortest time the Rescanning notice stays up.
 const RESCAN_NOTICE_MIN: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewKey {
+    source: usize,
+    key: String,
+    mode: Mode,
+    query: String,
+}
+
 pub(crate) struct App {
     query: String,
-    hits: Vec<Hit>,
+    mode: Mode,
+    reach: Reach,
+    pub(super) shelf: Shelf,
+    project: Project,
+    suggestions: Vec<String>,
+    problem: Option<Problem>,
+    hits: Vec<Found>,
     selected: usize,
     total_files: usize,
     pub(super) root: PathBuf,
     pub(super) status: Status,
     overlay: Overlay,
-    preview_for: Option<(String, String)>,
+    preview_for: Option<PreviewKey>,
     preview: Vec<Line<'static>>,
     live: String,
 }
@@ -58,6 +84,12 @@ impl App {
     pub(crate) fn new(root: PathBuf, total_files: usize, status: String) -> Self {
         Self {
             query: String::new(),
+            mode: Mode::default(),
+            reach: Reach::default(),
+            shelf: Shelf::default(),
+            project: Project::at(root.clone()),
+            suggestions: Vec::new(),
+            problem: None,
             hits: Vec::new(),
             selected: 0,
             total_files,
@@ -126,6 +158,9 @@ enum Edit {
     Wipe,
     DropWord,
     Type(char),
+    Accept,
+    ToggleMode,
+    ToggleReach,
 }
 
 type RecallTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -153,7 +188,7 @@ fn event_loop(
             redraw = true;
         }
         if redraw {
-            terminal.draw(|frame| draw(frame, app))?;
+            terminal.draw(|frame| draw(frame, app, live.index()))?;
             redraw = false;
         }
         if !event::poll(live.poll_wait())? {
@@ -230,6 +265,9 @@ fn search_action(code: KeyCode, ctrl: bool) -> Action {
         KeyCode::Char('u') if ctrl => Action::Edit(Edit::Wipe),
         KeyCode::Char('w') if ctrl => Action::Edit(Edit::DropWord),
         KeyCode::Char('o' | 'O') if ctrl => Action::SwitchProject,
+        KeyCode::Char('t' | 'T') if ctrl => Action::Edit(Edit::ToggleMode),
+        KeyCode::Char('e' | 'E') if ctrl => Action::Edit(Edit::ToggleReach),
+        KeyCode::Tab => Action::Edit(Edit::Accept),
         KeyCode::Char(ch) if !ctrl => Action::Edit(Edit::Type(ch)),
         KeyCode::Up => Action::Move(Move::Up(1)),
         KeyCode::PageUp => Action::Move(Move::Up(8)),
@@ -259,6 +297,25 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
         }
         Action::Edit(edit) => {
             match edit {
+                Edit::Accept => {
+                    let tail = shelf::ghost(&app.query, &app.suggestions).to_owned();
+                    if tail.is_empty() {
+                        return None;
+                    }
+                    app.query.push_str(&tail);
+                }
+                Edit::ToggleMode => {
+                    app.mode = match app.mode {
+                        Mode::Fuzzy => Mode::Syntax,
+                        Mode::Syntax => Mode::Fuzzy,
+                    };
+                }
+                Edit::ToggleReach => {
+                    app.reach = match app.reach {
+                        Reach::Here => Reach::Everywhere,
+                        Reach::Everywhere => Reach::Here,
+                    };
+                }
                 Edit::Cancel | Edit::Wipe => app.query.clear(),
                 Edit::Backspace => {
                     app.query.pop();
@@ -272,7 +329,7 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
             }
         }
         Action::Move(step) => app.go(step),
-        Action::OpenFile => open_selected(app),
+        Action::OpenFile => open_selected(app, live.index()),
     }
     None
 }
@@ -308,78 +365,174 @@ fn remove_last_word(query: &mut String) {
 
 fn on_live_change(app: &mut App, live: &Live, changed: &[String]) {
     app.total_files = live.indexed_files();
-    let keep = app.hits.get(app.selected).map(|hit| hit.key.clone());
-    if keep.as_ref().is_some_and(|key| changed.contains(key)) {
+    let keep = app
+        .hits
+        .get(app.selected)
+        .map(|hit| (hit.source, hit.key.clone()));
+    if keep
+        .as_ref()
+        .is_some_and(|(source, key)| *source == HERE && changed.contains(key))
+    {
         app.preview_for = None;
     }
-    run_query(app, live.index(), keep.as_deref());
+    run_query(app, live.index(), keep);
 }
 
 fn refresh_hits(app: &mut App, index: &LuxIndex) {
     run_query(app, index, None);
 }
 
-fn run_query(app: &mut App, index: &LuxIndex, keep: Option<&str>) {
+fn run_query(app: &mut App, index: &LuxIndex, keep: Option<(usize, String)>) {
     if app.query.trim().is_empty() {
         app.hits.clear();
+        app.suggestions.clear();
+        app.problem = None;
         app.selected = 0;
         app.preview_for = None;
         app.preview.clear();
         app.status = format!("Indexed {} files · type a query", app.total_files).into();
         return;
     }
-    match index.search(&app.query, MAX_RESULTS) {
-        Ok(hits) => {
-            let found = hits.len();
-            app.hits = hits;
-            let moved_to = keep.and_then(|key| app.hits.iter().position(|hit| hit.key == key));
-            app.selected = moved_to
-                .unwrap_or(app.selected)
-                .min(app.hits.len().saturating_sub(1));
-            sync_preview(app, index);
-            app.status = format!(
-                "{found} results · {} indexed · Enter opens selected file",
-                app.total_files
-            )
-            .into();
-        }
-        Err(error) => app.status = error.to_string().into(),
-    }
+    let (outcome, suggestions) = {
+        let all = sources(Some((&app.project, index)), &app.shelf);
+        let request = parse_request(&app.query, app.mode, app.reach);
+        (
+            shelf::search(&all, &request, MAX_RESULTS),
+            shelf::suggest(&all, &request, MAX_SUGGESTIONS),
+        )
+    };
+    app.hits = outcome.found;
+    app.suggestions = suggestions;
+    app.problem = outcome.problem;
+    let moved_to = keep.and_then(|(source, key)| {
+        app.hits
+            .iter()
+            .position(|hit| hit.source == source && hit.key == key)
+    });
+    app.selected = moved_to
+        .unwrap_or(app.selected)
+        .min(app.hits.len().saturating_sub(1));
+    sync_preview(app, index);
+    let found = app.hits.len();
+    app.status = if app.problem.is_some() {
+        BAD_QUERY.into()
+    } else if outcome.searched > 1 {
+        format!(
+            "{found} results across {} projects · Enter opens selected file",
+            outcome.searched
+        )
+        .into()
+    } else {
+        format!(
+            "{found} results · {} indexed · Enter opens selected file",
+            app.total_files
+        )
+        .into()
+    };
 }
 
 fn sync_preview(app: &mut App, index: &LuxIndex) {
-    let wanted = app
-        .hits
-        .get(app.selected)
-        .map(|hit| (hit.key.clone(), app.query.clone()));
+    let wanted = app.hits.get(app.selected).map(|hit| PreviewKey {
+        source: hit.source,
+        key: hit.key.clone(),
+        mode: app.mode,
+        query: app.query.clone(),
+    });
     if wanted == app.preview_for {
         return;
     }
-    app.preview = match &wanted {
-        Some((key, query)) => build_preview(index, key, query),
-        None => Vec::new(),
-    };
+    let lines = wanted.as_ref().and_then(|wanted| {
+        let all = sources(Some((&app.project, index)), &app.shelf);
+        let request = parse_request(&wanted.query, wanted.mode, app.reach);
+        Some(build_preview(
+            all.get(wanted.source)?,
+            &wanted.key,
+            &request,
+        ))
+    });
+    app.preview = lines.unwrap_or_default();
     app.preview_for = wanted;
 }
 
-fn open_selected(app: &mut App) {
+fn target_path(all: &[Source], found: &Found) -> Option<PathBuf> {
+    Some(all.get(found.source)?.project.root.join(&found.key))
+}
+
+fn open_selected(app: &mut App, index: &LuxIndex) {
     let Some(hit) = app.hits.get(app.selected) else {
         return;
     };
-    let path = app.root.join(&hit.key);
+    let all = sources(Some((&app.project, index)), &app.shelf);
+    let Some(path) = target_path(&all, hit) else {
+        return;
+    };
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe").arg(&path).spawn();
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg(&path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = Command::new("xdg-open").arg(&path).spawn();
-    app.status = match result {
-        Ok(_) => format!("Opened {}", hit.key).into(),
-        Err(error) => format!("Could not open file: {error}").into(),
+    let status = match result {
+        Ok(_) => format!("Opened {}", hit.key),
+        Err(error) => format!("Could not open file: {error}"),
     };
+    app.status = status.into();
 }
 
-fn draw(frame: &mut Frame, app: &App) {
+fn clamp_to_boundary(text: &str, offset: usize) -> usize {
+    let mut at = offset.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+fn query_line(app: &App) -> Line<'static> {
+    if app.query.is_empty() {
+        return Line::from(Span::styled(
+            "Search terms, a phrase, or a code symbol…",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let split = app.problem.map_or(app.query.len(), |problem| {
+        clamp_to_boundary(&app.query, problem.offset)
+    });
+    let (good, bad) = app.query.split_at(split);
+    let mut spans = vec![Span::styled(
+        sanitize_for_display(good),
+        Style::default().fg(Color::White),
+    )];
+    if !bad.is_empty() {
+        spans.push(Span::styled(
+            sanitize_for_display(bad),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let ghost = shelf::ghost(&app.query, &app.suggestions);
+    if !ghost.is_empty() {
+        spans.push(Span::styled(
+            sanitize_for_display(ghost),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+    Line::from(spans)
+}
+
+fn box_title(app: &App) -> String {
+    let reach = match app.reach {
+        Reach::Here => "",
+        Reach::Everywhere => " · everywhere",
+    };
+    let mode = match app.mode {
+        Mode::Fuzzy => "",
+        Mode::Syntax => " · syntax",
+    };
+    format!(" ✦ RECALL · {}{reach}{mode} ", compact_path(&app.root, 48))
+}
+
+fn draw(frame: &mut Frame, app: &App, index: &LuxIndex) {
+    let all = sources(Some((&app.project, index)), &app.shelf);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -388,25 +541,8 @@ fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(2),
         ])
         .split(frame.area());
-    let query = if app.query.is_empty() {
-        Line::from(Span::styled(
-            "Search terms, a phrase, or a code symbol…",
-            Style::default().fg(Color::DarkGray),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled(
-                sanitize_for_display(&app.query),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled("▏", Style::default().fg(Color::Cyan)),
-        ])
-    };
-    let search = Paragraph::new(query).block(
-        Block::default()
-            .title(format!(" ✦ RECALL · {} ", compact_path(&app.root, 48)))
-            .borders(Borders::ALL),
-    );
+    let search = Paragraph::new(query_line(app))
+        .block(Block::default().title(box_title(app)).borders(Borders::ALL));
     frame.render_widget(search, sections[0]);
 
     let content = Layout::default()
@@ -423,6 +559,21 @@ fn draw(frame: &mut Frame, app: &App) {
                     .and_then(|name| name.to_str())
                     .unwrap_or(&hit.key),
             );
+            let key = Span::styled(
+                sanitize_for_display(&hit.key),
+                Style::default().fg(Color::DarkGray),
+            );
+            let place = match all.get(hit.source) {
+                Some(source) if !source.here => vec![
+                    Span::styled(
+                        sanitize_for_display(&source.project.name),
+                        Style::default().fg(PALETTE[hit.source % PALETTE.len()]),
+                    ),
+                    Span::styled(" › ", Style::default().fg(Color::DarkGray)),
+                    key,
+                ],
+                _ => vec![key],
+            };
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(
@@ -437,10 +588,7 @@ fn draw(frame: &mut Frame, app: &App) {
                         Style::default().fg(Color::Green),
                     ),
                 ]),
-                Line::from(Span::styled(
-                    sanitize_for_display(&hit.key),
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Line::from(place),
             ])
         })
         .collect();
@@ -495,7 +643,17 @@ fn draw(frame: &mut Frame, app: &App) {
         ]
     });
     let title = selected
-        .map(|hit| format!(" {} · {:.3} ", sanitize_for_display(&hit.key), hit.score))
+        .map(|hit| {
+            let key = sanitize_for_display(&hit.key);
+            match all.get(hit.source) {
+                Some(source) if !source.here => format!(
+                    " {} › {key} · {:.3} ",
+                    sanitize_for_display(&source.project.name),
+                    hit.score
+                ),
+                _ => format!(" {key} · {:.3} ", hit.score),
+            }
+        })
         .unwrap_or_else(|| " Preview ".into());
     frame.render_widget(
         Paragraph::new(preview)
@@ -513,7 +671,7 @@ fn draw(frame: &mut Frame, app: &App) {
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
-                "↑/↓ move  Enter open  Esc clear  Ctrl-O project  F2 indexes  F1 help  Ctrl-Q quit",
+                "Tab complete  Ctrl-E all  Ctrl-T syntax  Enter open  Ctrl-O project  F1 help  Ctrl-Q quit",
                 Style::default().fg(Color::DarkGray),
             )),
         ])
@@ -538,15 +696,16 @@ fn draw_help(frame: &mut Frame) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("Search by words, filenames, or exact code symbols."),
-            Line::from("BM25 ranks results, tolerates typos, and stays current as files change."),
+            Line::from("Type to search as you go. Typos are forgiven; files stay current."),
             Line::from(""),
-            Line::from("Type       Search as you go"),
             Line::from("↑ / ↓      Move through results (mouse wheel works too)"),
             Line::from("PgUp / PgDn  Jump through results faster"),
-            Line::from("Enter      Open selected file"),
-            Line::from("Esc        Clear search"),
+            Line::from("Enter      Open selected file    Esc clear search"),
             Line::from("Ctrl-W     Delete last word    Ctrl-U clear all"),
+            Line::from("Tab        Accept the grey completion"),
+            Line::from("Ctrl-E     Search every saved project, or only this one"),
+            Line::from("Ctrl-T     Switch between fuzzy and query syntax"),
+            Line::from("@name      At the start: only saved projects whose name has it"),
             Line::from("Ctrl-O     Switch to another project"),
             Line::from("Ctrl-R     Rescan the project now"),
             Line::from("F2         Saved indexes: see and delete them"),

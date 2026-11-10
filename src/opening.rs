@@ -20,8 +20,9 @@ use ratatui::{
 };
 
 use crate::{
-    App, Session,
+    App, Session, cache,
     live::{Live, Mode, Progress, Summary},
+    shelf::Shelf,
     view::{TerminalCleanup, compact_path, sanitize_for_display},
 };
 
@@ -54,7 +55,11 @@ pub fn open_project(root: PathBuf, library_path: &Path) -> Result<Opened, Box<dy
         return Ok(Opened::Cancelled);
     }
     let status = format!("{} · F1 help", describe_startup(&live.summary()));
-    let app = App::new(root, live.indexed_files(), status);
+    let shelf = cache::default_dir()
+        .map(|dir| Shelf::load(&dir, library_path, Some(&root)))
+        .unwrap_or_default();
+    let mut app = App::new(root, live.indexed_files(), status);
+    app.shelf = shelf;
     Ok(Opened::Ready(Box::new(Session { live, app })))
 }
 
