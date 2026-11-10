@@ -26,6 +26,7 @@ pub struct SearchOptions {
 pub enum Command {
     Search(SearchOptions),
     Projects,
+    Help,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +84,17 @@ fn value_of<'a>(
     rest.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 
+fn is_help(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h")
+}
+
+fn help() -> Invocation {
+    Invocation {
+        command: Command::Help,
+        library: None,
+    }
+}
+
 pub fn parse(args: &[String]) -> Result<Invocation, String> {
     let (name, rest) = args.split_first().ok_or("missing command")?;
     let mut rest = rest.iter();
@@ -92,6 +104,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
             while let Some(arg) = rest.next() {
                 if arg == "--lib" {
                     library = Some(PathBuf::from(value_of("--lib", &mut rest)?));
+                } else if is_help(arg) {
+                    return Ok(help());
                 } else {
                     return Err(format!("projects does not take {arg}"));
                 }
@@ -122,6 +136,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
                             })?;
                     }
                     "--" => words.extend(rest.by_ref().map(String::as_str)),
+                    flag if is_help(flag) => return Ok(help()),
                     flag if flag.starts_with("--") => {
                         return Err(format!("unknown option {flag}"));
                     }
@@ -129,7 +144,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
                 }
             }
             let query = words.join(" ");
-            if query.trim().is_empty() {
+            if shelf::parse_request(&query, mode, Reach::Everywhere)
+                .text
+                .trim()
+                .is_empty()
+            {
                 return Err("search needs a query".into());
             }
             Ok(Invocation {
@@ -301,6 +320,16 @@ pub fn search_report(sources: &[Source], options: &SearchOptions) -> Report {
     report_of(sources, options, &request, &outcome)
 }
 
+fn usage_report() -> Report {
+    Report::out(
+        format!(
+            "{USAGE}
+"
+        ),
+        Exit::Matched,
+    )
+}
+
 pub fn run(command: &Command, cache_dir: &Path, library: &Path) -> Report {
     let shelf = Shelf::load(cache_dir, library, None);
     let all = shelf::sources(None, &shelf);
@@ -316,6 +345,7 @@ pub fn run(command: &Command, cache_dir: &Path, library: &Path) -> Report {
     match command {
         Command::Projects => Report::out(render_projects(&all), Exit::Matched),
         Command::Search(options) => search_report(&all, options),
+        Command::Help => usage_report(),
     }
 }
 
@@ -326,6 +356,9 @@ fn report_for(args: &[String]) -> Report {
             return Report::err(format!("recall: {message}\n{USAGE}\n"), Exit::Usage);
         }
     };
+    if invocation.command == Command::Help {
+        return usage_report();
+    }
     let library = resolve_library(invocation.library);
     if !library.is_file() {
         return Report::err(
@@ -370,7 +403,7 @@ mod tests {
     fn search_options(list: &[&str]) -> SearchOptions {
         match parse(&args(list)).unwrap().command {
             Command::Search(options) => options,
-            Command::Projects => panic!("expected a search"),
+            Command::Projects | Command::Help => panic!("expected a search"),
         }
     }
 
@@ -462,6 +495,55 @@ mod tests {
         }
         assert!(parse(&args(&["search", "x", "--limit", "0"])).is_err());
         assert!(parse(&args(&["search", "x", "--limit", "-1"])).is_err());
+    }
+
+    #[test]
+    fn a_query_of_only_scopes_is_a_usage_error() {
+        for list in [
+            &["search", "@name"][..],
+            &["search", "@a", "@b"],
+            &["search", "@a", " "],
+        ] {
+            assert_eq!(
+                parse(&args(list)),
+                Err("search needs a query".to_owned()),
+                "{list:?}"
+            );
+        }
+        assert!(parse(&args(&["search", "@"])).is_ok());
+        assert!(parse(&args(&["search", "@name", "text"])).is_ok());
+        let done = report_for(&args(&["search", "@name"]));
+        assert_eq!(done.exit, Exit::Usage);
+        assert!(done.stderr.starts_with(
+            "recall: search needs a query
+"
+        ));
+    }
+
+    #[test]
+    fn help_after_a_command_prints_the_usage_and_exits_zero() {
+        for list in [
+            &["search", "--help"][..],
+            &["search", "-h"],
+            &["search", "watcher", "--help"],
+            &["projects", "--help"],
+            &["projects", "-h"],
+        ] {
+            let parsed = parse(&args(list)).unwrap_or_else(|error| panic!("{list:?}: {error}"));
+            assert_eq!(parsed.command, Command::Help, "{list:?}");
+            let done = report_for(&args(list));
+            assert_eq!(done.exit, Exit::Matched, "{list:?}");
+            assert_eq!(
+                done.stdout,
+                format!(
+                    "{USAGE}
+"
+                ),
+                "{list:?}"
+            );
+            assert!(done.stderr.is_empty(), "{list:?}");
+        }
+        assert_eq!(search_options(&["search", "--", "--help"]).query, "--help");
     }
 
     #[test]
