@@ -1,31 +1,37 @@
 # Recall
 
-Recall is a small, local-first project-memory TUI built to dogfood [LuxCore](../LuxCore). It indexes a repository’s readable source and documentation files through LuxCore’s C API, then lets you search while you type.
+Recall indexes a project's readable source and documentation files through [LuxCore](https://github.com/Flame338/LuxCore), then lets you search as you type. A small background daemon watches your project folders, so edits become searchable within about a second and reopening a project catches up on only what changed. It uses lexical BM25 search with typo tolerance and no embeddings. Recall is built and tested on Windows.
 
 ## Build and run
 
-Build LuxCore’s shared C library first:
+Clone [LuxCore](https://github.com/Flame338/LuxCore) next to this repository and build its shared C library:
 
 ```powershell
-cd F:\LuxCore
+cd ..\LuxCore
 make shared MODE=release
 ```
 
-Then launch Recall:
+Then launch Recall from this repository:
 
 ```powershell
-cd F:\LuxCoreTUI
-$env:LUXCORE_LIB = 'F:\LuxCore\build\release\libluxcore.dll'
+cd ..\recall-tui
 cargo run --release
+```
+
+Recall looks for `..\LuxCore\build\release\libluxcore.dll` by default. Set `LUXCORE_LIB` or pass `--lib PATH` to use another shared library.
+
+The tests load the same library, so run them with `LUXCORE_LIB` set to its path:
+
+```powershell
+$env:LUXCORE_LIB = '..\LuxCore\build\release\libluxcore.dll'
+cargo test
 ```
 
 Without a repository argument, Recall opens a folder picker at the current directory. Use the arrows to choose a folder and Enter to browse it; choose `..` or press Backspace to go up. At a Windows drive root, other available drives are listed. Press `S` to index the folder currently shown, or `P` to type or edit a path directly (`Ctrl-A` clears it). `Esc` or `Q` goes back, which quits when no project is open yet, and `Ctrl-Q` always quits. You can also pass a repository path to skip the picker:
 
 ```powershell
-cargo run --release -- 'F:\path\to\project'
+cargo run --release -- 'C:\path\to\project'
 ```
-
-The app defaults to `F:\LuxCore\build\debug\libluxcore.dll`. Set `LUXCORE_LIB` or pass `--lib PATH` to choose another shared library.
 
 ## Using Recall
 

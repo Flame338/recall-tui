@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (root, library_path) = parse_args()?;
     if !library_path.is_file() {
         return Err(format!(
-            "LuxCore shared library not found at {}. Build it with `make shared` in F:\\LuxCore or pass --lib PATH.",
+            "LuxCore shared library not found at {}. Build LuxCore with `make shared MODE=release`, then set LUXCORE_LIB or pass --lib PATH.",
             library_path.display()
         )
         .into());
@@ -127,7 +127,9 @@ fn recover_open_failure(
 fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     let mut root = None;
-    let mut library = env::var_os("LUXCORE_LIB").map(PathBuf::from);
+    let mut library = env::var_os("LUXCORE_LIB")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
     while let Some(arg) = args.next() {
         if arg == "--lib" {
             library = Some(PathBuf::from(args.next().ok_or("--lib needs a path")?));

@@ -7,7 +7,7 @@ use std::{
 
 use libloading::Library;
 
-pub const DEFAULT_LIBRARY: &str = r"F:\LuxCore\build\debug\libluxcore.dll";
+pub const DEFAULT_LIBRARY: &str = "../LuxCore/build/release/libluxcore.dll";
 pub const MARK_START: char = '\u{E000}';
 pub const MARK_END: char = '\u{E001}';
 
