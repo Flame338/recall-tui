@@ -43,6 +43,7 @@ use ratatui::{
 };
 
 const MAX_RESULTS: usize = 40;
+const GONE: &str = "The project folder is gone";
 
 struct App {
     query: String,
@@ -50,7 +51,7 @@ struct App {
     selected: usize,
     total_files: usize,
     root: PathBuf,
-    status: String,
+    status: Status,
     overlay: Overlay,
     preview_for: Option<(String, String)>,
     preview: Vec<Line<'static>>,
@@ -65,7 +66,7 @@ impl App {
             selected: 0,
             total_files,
             root,
-            status,
+            status: status.into(),
             overlay: Overlay::None,
             preview_for: None,
             preview: Vec::new(),
@@ -87,6 +88,27 @@ impl App {
 struct Session {
     live: Live,
     app: App,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Status {
+    Notice(String),
+    Rescanning,
+}
+
+impl Status {
+    fn text(&self) -> &str {
+        match self {
+            Status::Notice(text) => text,
+            Status::Rescanning => "Rescanning the project…",
+        }
+    }
+}
+
+impl<T: Into<String>> From<T> for Status {
+    fn from(text: T) -> Self {
+        Status::Notice(text.into())
+    }
 }
 
 #[derive(Default)]
@@ -252,7 +274,7 @@ fn recover_open_failure(
     let Some(previous) = session.as_mut() else {
         return Err(error);
     };
-    previous.app.status = format!("Could not open {}: {error}", compact_path(root, 48));
+    previous.app.status = format!("Could not open {}: {error}", compact_path(root, 48)).into();
     Ok(flow::Event::OpenCancelled)
 }
 
@@ -643,6 +665,7 @@ fn event_loop(
                 on_live_change(app, live, &tick.changed);
                 redraw = true;
             }
+            redraw |= finish_rescan(app, live);
             continue;
         }
         redraw = true;
@@ -730,9 +753,9 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
         Action::Rescan => {
             live.rescan();
             app.status = if *live.mode() == live::Mode::Gone {
-                "The project folder is gone".into()
+                GONE.into()
             } else {
-                "Rescanning the project…".into()
+                Status::Rescanning
             };
         }
         Action::Edit(edit) => {
@@ -753,6 +776,24 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
         Action::OpenFile => open_selected(app),
     }
     None
+}
+
+fn finish_rescan(app: &mut App, live: &Live) -> bool {
+    if app.status != Status::Rescanning {
+        return false;
+    }
+    let done = match live.mode() {
+        live::Mode::Connecting | live::Mode::Scanning { .. } => false,
+        _ => live.pending() == 0,
+    };
+    if !done {
+        return false;
+    }
+    app.status = match live.mode() {
+        live::Mode::Gone => GONE.into(),
+        _ => format!("Rescan finished · {} files indexed", live.indexed_files()).into(),
+    };
+    true
 }
 
 fn remove_last_word(query: &mut String) {
@@ -782,7 +823,7 @@ fn run_query(app: &mut App, index: &LuxIndex, keep: Option<&str>) {
         app.selected = 0;
         app.preview_for = None;
         app.preview.clear();
-        app.status = format!("Indexed {} files · type a query", app.total_files);
+        app.status = format!("Indexed {} files · type a query", app.total_files).into();
         return;
     }
     match index.search(&app.query, MAX_RESULTS) {
@@ -797,9 +838,10 @@ fn run_query(app: &mut App, index: &LuxIndex, keep: Option<&str>) {
             app.status = format!(
                 "{found} results · {} indexed · Enter opens selected file",
                 app.total_files
-            );
+            )
+            .into();
         }
-        Err(error) => app.status = error.to_string(),
+        Err(error) => app.status = error.to_string().into(),
     }
 }
 
@@ -838,8 +880,8 @@ fn open_selected(app: &mut App) {
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = Command::new("xdg-open").arg(&path).spawn();
     app.status = match result {
-        Ok(_) => format!("Opened {}", hit.key),
-        Err(error) => format!("Could not open file: {error}"),
+        Ok(_) => format!("Opened {}", hit.key).into(),
+        Err(error) => format!("Could not open file: {error}").into(),
     };
 }
 
@@ -973,7 +1015,7 @@ fn draw(frame: &mut Frame, app: &App) {
     } else {
         Paragraph::new(vec![
             Line::from(Span::styled(
-                format!("{} · {}", app.status, app.live),
+                format!("{} · {}", app.status.text(), app.live),
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
@@ -1197,7 +1239,7 @@ mod tests {
         assert_eq!(event, flow::Event::OpenCancelled);
         let current = session.unwrap();
         assert_eq!(current.app.root, PathBuf::from("F:/old"));
-        let status = current.app.status;
+        let status = current.app.status.text().to_owned();
         assert!(
             status.contains("F:/gone") && status.contains("folder vanished"),
             "status was {status:?}"
@@ -1357,22 +1399,11 @@ mod tests {
     }
 
     fn app_with_help(show_help: bool) -> App {
-        App {
-            query: String::new(),
-            hits: Vec::new(),
-            selected: 0,
-            total_files: 0,
-            root: PathBuf::from("root"),
-            status: String::new(),
-            overlay: if show_help {
-                Overlay::Help
-            } else {
-                Overlay::None
-            },
-            preview_for: None,
-            preview: Vec::new(),
-            live: String::new(),
+        let mut app = App::new(PathBuf::from("root"), 0, String::new());
+        if show_help {
+            app.overlay = Overlay::Help;
         }
+        app
     }
 
     fn screen_text(app: &App, width: u16, height: u16) -> String {
@@ -1676,7 +1707,7 @@ mod tests {
         rig.show(Shown::Help);
         assert_eq!(rig.press(plain(KeyCode::Enter)), None);
         assert_eq!(shown(&rig.app), Shown::Nothing);
-        assert_eq!(rig.app.status, "ready");
+        assert_eq!(rig.app.status.text(), "ready");
     }
 
     #[test]
@@ -1718,7 +1749,7 @@ mod tests {
             assert!(matches!(rig.live.mode(), live::Mode::Live { .. }));
             assert_eq!(rig.press(ctrl('r')), None, "{wanted:?}");
             assert_eq!(rig.live.mode(), &live::Mode::Connecting, "{wanted:?}");
-            assert_eq!(rig.app.status, "Rescanning the project…", "{wanted:?}");
+            assert_eq!(rig.app.status, Status::Rescanning, "{wanted:?}");
             assert_eq!(shown(&rig.app), wanted);
         }
     }
@@ -1742,9 +1773,9 @@ mod tests {
         assert_eq!(rig.app.query, "zebr");
         assert_eq!(rig.app.hits.len(), 12);
         assert!(
-            rig.app.status.starts_with("12 results"),
+            rig.app.status.text().starts_with("12 results"),
             "{}",
-            rig.app.status
+            rig.app.status.text()
         );
         rig.press(plain(KeyCode::Backspace));
         assert_eq!(rig.app.query, "zeb");
@@ -1758,7 +1789,7 @@ mod tests {
         assert_eq!(rig.press(plain(KeyCode::Esc)), None);
         assert_eq!(rig.app.query, "");
         assert!(rig.app.hits.is_empty());
-        assert_eq!(rig.app.status, "Search cleared");
+        assert_eq!(rig.app.status.text(), "Search cleared");
     }
 
     #[test]
@@ -1773,7 +1804,11 @@ mod tests {
         rig.press(ctrl('u'));
         assert_eq!(rig.app.query, "");
         assert!(rig.app.hits.is_empty());
-        assert!(rig.app.status.starts_with("Indexed"), "{}", rig.app.status);
+        assert!(
+            rig.app.status.text().starts_with("Indexed"),
+            "{}",
+            rig.app.status.text()
+        );
     }
 
     #[test]
@@ -1844,7 +1879,7 @@ mod tests {
     fn enter_with_no_results_opens_nothing() {
         let mut rig = Rig::new("pin-enter-empty");
         assert_eq!(rig.press(plain(KeyCode::Enter)), None);
-        assert_eq!(rig.app.status, "ready");
+        assert_eq!(rig.app.status.text(), "ready");
     }
 
     #[test]
@@ -1902,6 +1937,53 @@ mod tests {
         rig.event(wheel(MouseEventKind::ScrollDown));
         assert_eq!(rig.app.selected, 3);
         assert_eq!(shown(&rig.app), Shown::Help);
+    }
+
+    impl Rig {
+        fn tick_until_quiet(&mut self) {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while matches!(
+                self.live.mode(),
+                live::Mode::Connecting | live::Mode::Scanning { .. }
+            ) || self.live.pending() > 0
+            {
+                self.live.tick();
+                assert!(std::time::Instant::now() < end, "the rescan never ended");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn the_rescanning_notice_ends_with_a_rescan_that_finds_nothing() {
+        let mut rig = Rig::new("pin-rescan-ends");
+        rig.press(ctrl('r'));
+        assert_eq!(rig.app.status, Status::Rescanning);
+        assert!(!finish_rescan(&mut rig.app, &rig.live));
+        assert_eq!(rig.app.status, Status::Rescanning);
+        rig.tick_until_quiet();
+        assert!(finish_rescan(&mut rig.app, &rig.live));
+        assert_eq!(rig.app.status.text(), "Rescan finished · 12 files indexed");
+        assert!(!finish_rescan(&mut rig.app, &rig.live));
+    }
+
+    #[test]
+    fn a_newer_notice_is_not_overwritten_when_the_rescan_ends() {
+        let mut rig = Rig::new("pin-rescan-newer");
+        rig.press(ctrl('r'));
+        rig.type_text("zebra");
+        let shown = rig.app.status.clone();
+        assert!(shown.text().starts_with("12 results"), "{shown:?}");
+        rig.tick_until_quiet();
+        assert!(!finish_rescan(&mut rig.app, &rig.live));
+        assert_eq!(rig.app.status, shown);
+    }
+
+    #[test]
+    fn finishing_a_rescan_that_never_started_changes_nothing() {
+        let mut rig = Rig::new("pin-rescan-none");
+        assert!(!finish_rescan(&mut rig.app, &rig.live));
+        assert_eq!(rig.app.status.text(), "ready");
     }
 
     fn picker_rig(name: &str) -> (DirectoryPicker, PathBuf) {
