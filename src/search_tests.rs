@@ -320,7 +320,7 @@ fn ctrl_r_rescans_under_every_overlay_and_leaves_the_overlay_alone() {
         assert!(matches!(rig.live.mode(), live::Mode::Manual { .. }));
         assert_eq!(rig.press(ctrl('r')), None, "{wanted:?}");
         assert_eq!(rig.live.mode(), &live::Mode::Connecting, "{wanted:?}");
-        assert_eq!(rig.app.status, Status::Rescanning, "{wanted:?}");
+        assert!(rescanning(&rig.app.status), "{wanted:?}");
         assert_eq!(shown(&rig.app), wanted);
     }
 }
@@ -525,17 +525,42 @@ impl Rig {
     }
 }
 
+fn rescanning(status: &Status) -> bool {
+    matches!(status, Status::Rescanning { .. })
+}
+
+fn started_long_ago(app: &mut App) {
+    app.status = Status::Rescanning {
+        since: Instant::now() - RESCAN_NOTICE_MIN * 2,
+    };
+}
+
 #[test]
 fn the_rescanning_notice_ends_with_a_rescan_that_finds_nothing() {
     let mut rig = Rig::new("pin-rescan-ends");
     rig.press(ctrl('r'));
-    assert_eq!(rig.app.status, Status::Rescanning);
+    assert!(rescanning(&rig.app.status));
     assert!(!finish_rescan(&mut rig.app, &rig.live));
-    assert_eq!(rig.app.status, Status::Rescanning);
+    assert!(rescanning(&rig.app.status));
     rig.tick_until_quiet();
+    started_long_ago(&mut rig.app);
     assert!(finish_rescan(&mut rig.app, &rig.live));
     assert_eq!(rig.app.status.text(), "Rescan finished · 12 files indexed");
     assert!(!finish_rescan(&mut rig.app, &rig.live));
+}
+
+#[test]
+fn the_notice_does_not_end_before_the_rescan_could_have_started() {
+    let mut rig = Rig::new("pin-rescan-early");
+    rig.press(ctrl('r'));
+    rig.tick_until_quiet();
+    rig.press(ctrl('r'));
+    assert!(
+        matches!(rig.live.mode(), live::Mode::Live { .. }) && rig.live.pending() == 0,
+        "a quiet Live looks finished the moment Ctrl-R is pressed"
+    );
+    assert!(!finish_rescan(&mut rig.app, &rig.live));
+    assert!(rescanning(&rig.app.status));
 }
 
 #[test]

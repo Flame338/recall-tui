@@ -4,6 +4,7 @@ use std::{
     mem,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -37,6 +38,8 @@ use crate::{
 
 const MAX_RESULTS: usize = 40;
 const GONE: &str = "The project folder is gone";
+/// The shortest time the Rescanning notice stays up.
+const RESCAN_NOTICE_MIN: Duration = Duration::from_secs(1);
 
 pub(crate) struct App {
     query: String,
@@ -81,14 +84,14 @@ impl App {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Status {
     Notice(String),
-    Rescanning,
+    Rescanning { since: Instant },
 }
 
 impl Status {
     pub(super) fn text(&self) -> &str {
         match self {
             Status::Notice(text) => text,
-            Status::Rescanning => "Rescanning the project…",
+            Status::Rescanning { .. } => "Rescanning the project…",
         }
     }
 }
@@ -249,7 +252,9 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
             app.status = if *live.mode() == live::Mode::Gone {
                 GONE.into()
             } else {
-                Status::Rescanning
+                Status::Rescanning {
+                    since: Instant::now(),
+                }
             };
         }
         Action::Edit(edit) => {
@@ -273,13 +278,16 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
 }
 
 fn finish_rescan(app: &mut App, live: &Live) -> bool {
-    if app.status != Status::Rescanning {
+    let Status::Rescanning { since } = app.status else {
         return false;
-    }
-    let done = match live.mode() {
-        live::Mode::Connecting | live::Mode::Scanning { .. } => false,
-        _ => live.pending() == 0,
     };
+    // A rescan sends no update when nothing changed, so nothing observable
+    // marks its start. Before the minimum, a quiet Live may just be waiting.
+    let done = since.elapsed() >= RESCAN_NOTICE_MIN
+        && match live.mode() {
+            live::Mode::Connecting | live::Mode::Scanning { .. } => false,
+            _ => live.pending() == 0,
+        };
     if !done {
         return false;
     }

@@ -41,7 +41,7 @@ Type words, a phrase, or a code symbol. Results update as you type. Use the arro
 - `F2`: manage saved indexes
 - `Ctrl-Q`: quit
 
-Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. Recall saves the index and a file manifest under `%LOCALAPPDATA%\Recall` (or `~/.cache/recall`), one pair per folder: a `.lux` index and a `.manifest` that records the folder path and a stamp for each file. At the next launch it loads the saved index and catches up on what changed (see Live updates). A different LuxCore library file, a change to the scan rules, or an index saved by an older version of Recall rebuilds the index from scratch.
+Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. Recall saves the index and a file manifest under `%LOCALAPPDATA%\Recall` (or `$XDG_CACHE_HOME/recall`, or `~/.cache/recall`), one pair per folder: a `.lux` index and a `.manifest` that records the folder path and a stamp for each file. At the next launch it loads the saved index and catches up on what changed (see Live updates). A different LuxCore library file, a change to the scan rules, or an index saved by an older version of Recall rebuilds the index from scratch.
 
 ## Live updates
 
@@ -49,6 +49,7 @@ Recall keeps the index current while it runs. On Windows it watches the project 
 
 The watcher runs in a small background daemon, started the first time you open a project. It keeps watching after you quit, so the next launch only catches up on what changed meanwhile, and several terminals share one watcher. The daemon is not started at logon, so after a reboot the first open of each project scans once.
 
+- `recall daemon start`: start the daemon if it is not running (Recall does this itself when you open a project)
 - `recall daemon status`: list the projects the daemon watches
 - `recall daemon stop`: stop the daemon
 - `RECALL_DAEMON=0`: skip the daemon and watch inside the Recall process itself, for debugging
