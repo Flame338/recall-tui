@@ -1330,6 +1330,226 @@ mod tests {
         in_process(root, have)
     }
 
+    mod lifecycle {
+        use super::*;
+        use std::cell::RefCell;
+
+        thread_local! {
+            static HANDED: RefCell<Option<(Sender<Update>, Receiver<Cmd>)>> =
+                const { RefCell::new(None) };
+        }
+
+        fn hand_fed(_: &Path, _: Option<Cursor>) -> Feed {
+            let (commands, command_rx) = channel();
+            let (updates, update_rx) = channel();
+            HANDED.with(|handed| *handed.borrow_mut() = Some((updates, command_rx)));
+            Feed {
+                link: (commands, update_rx),
+                via: Via::InProcess,
+                engine: None,
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Start {
+            Linked,
+            Unlinked,
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Event {
+            Scan(usize),
+            Snapshot,
+            Delta,
+            Manual,
+            Gone,
+            /// The watcher's side of the update channel closes.
+            Stop,
+            /// The watcher's side of the command channel closes.
+            Deaf,
+            /// Live walks the folder itself.
+            Walk,
+            CtrlR,
+        }
+        use Event::*;
+
+        struct Driver {
+            _project: Project,
+            live: Live,
+            updates: Option<Sender<Update>>,
+            commands: Option<Receiver<Cmd>>,
+            asked: usize,
+        }
+
+        impl Driver {
+            fn new(start: Start) -> Self {
+                let project = Project::new(&format!("lifecycle-{:?}", thread::current().id()));
+                let mut live = Live::build(&project.root, &lux::library_path(), None, |have| {
+                    matches!(start, Start::Linked).then(|| hand_fed(&project.root, have))
+                })
+                .expect("build libluxcore");
+                live.connector = hand_fed;
+                let mut driver = Self {
+                    _project: project,
+                    live,
+                    updates: None,
+                    commands: None,
+                    asked: 0,
+                };
+                driver.take_handed();
+                driver
+            }
+
+            fn take_handed(&mut self) {
+                if let Some((updates, commands)) = HANDED.with(|handed| handed.borrow_mut().take()) {
+                    self.updates = Some(updates);
+                    self.commands = Some(commands);
+                }
+            }
+
+            fn send(&mut self, update: Update) {
+                self.updates.as_ref().expect("a link").send(update).unwrap();
+                self.live.tick();
+            }
+
+            fn apply(&mut self, event: Event) {
+                match event {
+                    Scan(found) => self.send(Update::Scanning { found }),
+                    Snapshot => self.send(snapshot(&BTreeMap::new(), 1)),
+                    Delta => self.send(delta(0, 1, Vec::new())),
+                    Manual => self.send(Update::Manual {
+                        reason: "cannot watch".into(),
+                    }),
+                    Gone => self.send(Update::Gone),
+                    Stop => {
+                        self.updates = None;
+                        self.live.tick();
+                    }
+                    Deaf => self.commands = None,
+                    Walk => assert!(self.live.settle(|_| Ok(true)).unwrap()),
+                    CtrlR => {
+                        self.live.rescan();
+                        let commands = self.commands.as_ref();
+                        if commands.is_some_and(|commands| matches!(commands.try_recv(), Ok(Cmd::Rescan))) {
+                            self.asked += 1;
+                        }
+                        self.take_handed();
+                    }
+                }
+            }
+        }
+
+        fn live() -> Mode {
+            Mode::Live {
+                via: Via::InProcess,
+            }
+        }
+
+        fn manual(reason: &str) -> Mode {
+            Mode::Manual {
+                reason: reason.into(),
+            }
+        }
+
+        fn run(start: Start, events: &[Event]) -> Driver {
+            let mut driver = Driver::new(start);
+            for event in events {
+                driver.apply(*event);
+            }
+            driver
+        }
+
+        /// Rows follow the reachable states and labelled steps of the
+        /// LiveFeed statechart: (mode, synced, link).
+        #[test]
+        fn the_feed_lifecycle_follows_the_statechart() {
+            let connecting = (Mode::Connecting, "… connecting");
+            let live = (live(), "● live");
+            let manual_watch = (manual("cannot watch"), "○ manual (Ctrl-R)");
+            let manual_stopped = (manual("watcher stopped"), "○ manual (Ctrl-R)");
+            let gone = (Mode::Gone, "○ project gone");
+            let rows = vec![
+                ("connecting, unsynced, attached", Start::Linked, vec![], connecting.clone()),
+                ("connecting, unsynced, lost", Start::Unlinked, vec![], connecting.clone()),
+                (
+                    "scanning, unsynced, attached",
+                    Start::Linked,
+                    vec![Scan(3)],
+                    (Mode::Scanning { found: 3 }, "scanning 3"),
+                ),
+                (
+                    "a later scan count replaces the first",
+                    Start::Linked,
+                    vec![Scan(3), Scan(9)],
+                    (Mode::Scanning { found: 9 }, "scanning 9"),
+                ),
+                ("live, synced, attached", Start::Linked, vec![Snapshot], live.clone()),
+                ("a delta syncs too", Start::Linked, vec![Delta], live.clone()),
+                ("scanning then a snapshot", Start::Linked, vec![Scan(3), Snapshot], live.clone()),
+                ("a scan is ignored once synced", Start::Linked, vec![Snapshot, Scan(5)], live.clone()),
+                ("manual, unsynced, attached", Start::Linked, vec![Manual], manual_watch.clone()),
+                ("a scan is ignored in manual", Start::Linked, vec![Manual, Scan(2)], manual_watch.clone()),
+                ("manual while scanning", Start::Linked, vec![Scan(2), Manual], manual_watch.clone()),
+                ("gone, unsynced, attached", Start::Linked, vec![Gone], gone.clone()),
+                ("a scan is ignored when gone", Start::Linked, vec![Gone, Scan(1)], gone.clone()),
+                ("a manual update leaves gone", Start::Linked, vec![Gone, Manual], manual_watch.clone()),
+                ("manual, unsynced, lost", Start::Linked, vec![Stop], manual_stopped.clone()),
+                ("scanning, then the watcher stops", Start::Linked, vec![Scan(3), Stop], manual_stopped.clone()),
+                ("manual, synced, attached", Start::Linked, vec![Snapshot, Manual], manual_watch.clone()),
+                ("a snapshot keeps manual", Start::Linked, vec![Manual, Snapshot], manual_watch.clone()),
+                ("a delta keeps manual", Start::Linked, vec![Manual, Delta], manual_watch.clone()),
+                ("gone, synced, attached", Start::Linked, vec![Snapshot, Gone], gone.clone()),
+                ("a snapshot keeps gone", Start::Linked, vec![Gone, Snapshot], gone.clone()),
+                ("manual, synced, lost", Start::Linked, vec![Snapshot, Stop], manual_stopped.clone()),
+                ("a stop keeps the manual reason", Start::Linked, vec![Manual, Stop], manual_watch.clone()),
+                ("an own walk keeps manual", Start::Linked, vec![Stop, Walk], manual_stopped.clone()),
+                ("gone, unsynced, lost", Start::Linked, vec![Gone, Stop], gone.clone()),
+                ("gone, synced, lost", Start::Linked, vec![Snapshot, Gone, Stop], gone.clone()),
+                ("Ctrl-R after a stop reconnects", Start::Linked, vec![Stop, CtrlR], connecting.clone()),
+                ("Ctrl-R with no link connects", Start::Unlinked, vec![CtrlR], connecting.clone()),
+                (
+                    "a reconnect waits for a new snapshot",
+                    Start::Linked,
+                    vec![Snapshot, Stop, CtrlR, Scan(4)],
+                    (Mode::Scanning { found: 4 }, "scanning 4"),
+                ),
+                ("a reconnect goes live again", Start::Linked, vec![Snapshot, Stop, CtrlR, Snapshot], live.clone()),
+                ("Ctrl-R after an own walk reconnects", Start::Linked, vec![Stop, Walk, CtrlR], connecting.clone()),
+                ("Ctrl-R asks a live watcher", Start::Linked, vec![Snapshot, CtrlR], live.clone()),
+                ("Ctrl-R asks a manual watcher", Start::Linked, vec![Manual, CtrlR], manual_watch.clone()),
+                ("Ctrl-R reconnects a deaf watcher", Start::Linked, vec![Snapshot, Deaf, CtrlR], connecting.clone()),
+                ("gone ignores Ctrl-R", Start::Linked, vec![Gone, CtrlR], gone.clone()),
+                ("gone and lost ignores Ctrl-R", Start::Linked, vec![Gone, Stop, CtrlR], gone.clone()),
+            ];
+            for (name, start, events, (mode, status)) in rows {
+                let driver = run(start, &events);
+                assert_eq!((driver.live.mode(), driver.live.status().as_str()), (&mode, status), "{name}: {events:?}");
+            }
+        }
+
+        #[test]
+        fn ctrl_r_asks_an_attached_watcher_and_reconnects_a_lost_one() {
+            for (events, asked) in [
+                (vec![Snapshot, CtrlR], 1),
+                (vec![Manual, CtrlR], 1),
+                (vec![Snapshot, Deaf, CtrlR, CtrlR], 1),
+                (vec![Stop, CtrlR, CtrlR], 1),
+                (vec![Gone, CtrlR], 0),
+            ] {
+                assert_eq!(run(Start::Linked, &events).asked, asked, "{events:?}");
+            }
+        }
+
+        /// The one combination the statechart forbids: live with no watcher.
+        /// It is reachable only when Live starts with no feed and walks.
+        #[test]
+        fn an_own_walk_with_no_feed_goes_live() {
+            let driver = run(Start::Unlinked, &[Walk]);
+            assert_eq!(driver.live.mode(), &live());
+            assert_eq!(driver.live.status(), "● live");
+        }
+    }
+
     #[test]
     fn a_file_that_cannot_be_read_by_permission_is_unindexed_not_retried() {
         let project = Project::new("denied");
