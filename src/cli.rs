@@ -265,18 +265,40 @@ pub fn exit_for(outcome: &Outcome) -> Exit {
     }
 }
 
+pub fn failure_note(outcome: &Outcome) -> String {
+    match outcome.failed.len() {
+        0 => String::new(),
+        count => format!("recall: {count} project(s) could not be searched\n"),
+    }
+}
+
+fn report_of(
+    sources: &[Source],
+    options: &SearchOptions,
+    request: &shelf::Request,
+    outcome: &Outcome,
+) -> Report {
+    let note = failure_note(outcome);
+    if let Some(problem) = outcome.problem {
+        let stderr = render_problem(&options.query, problem.offset) + &note;
+        return Report::err(stderr, Exit::Usage);
+    }
+    let stdout = if options.json {
+        render_json(sources, outcome)
+    } else {
+        render_text(sources, request, outcome)
+    };
+    Report {
+        stdout,
+        stderr: note,
+        exit: exit_for(outcome),
+    }
+}
+
 pub fn search_report(sources: &[Source], options: &SearchOptions) -> Report {
     let request = shelf::parse_request(&options.query, options.mode, Reach::Everywhere);
     let outcome = shelf::search(sources, &request, options.limit);
-    if let Some(problem) = outcome.problem {
-        return Report::err(render_problem(&options.query, problem.offset), Exit::Usage);
-    }
-    let stdout = if options.json {
-        render_json(sources, &outcome)
-    } else {
-        render_text(sources, &request, &outcome)
-    };
-    Report::out(stdout, exit_for(&outcome))
+    report_of(sources, options, &request, &outcome)
 }
 
 pub fn run(command: &Command, cache_dir: &Path, library: &Path) -> Report {
@@ -568,6 +590,47 @@ mod tests {
     fn the_caret_counts_characters_not_bytes() {
         let text = render_problem("é(", 2);
         assert_eq!(text.lines().nth(2), Some("   ^"));
+    }
+
+    #[test]
+    fn a_failed_source_is_named_on_stderr_without_changing_the_exit() {
+        let shelf = corpus();
+        let all = shelf::sources(None, &shelf);
+        let opts = options("watcher", Mode::Fuzzy, false);
+        let request = shelf::parse_request(&opts.query, opts.mode, Reach::Everywhere);
+        let mut outcome = shelf::search(&all, &request, opts.limit);
+        let clean = report_of(&all, &opts, &request, &outcome);
+        assert!(clean.stderr.is_empty());
+
+        outcome.failed = vec![1];
+        let matched = report_of(&all, &opts, &request, &outcome);
+        assert_eq!(
+            matched.stderr,
+            "recall: 1 project(s) could not be searched
+"
+        );
+        assert_eq!(
+            (matched.stdout, matched.exit),
+            (clean.stdout, Exit::Matched)
+        );
+
+        outcome.failed = vec![0, 1];
+        outcome.found.clear();
+        let nothing = report_of(&all, &opts, &request, &outcome);
+        assert_eq!(
+            nothing.stderr,
+            "recall: 2 project(s) could not be searched
+"
+        );
+        assert_eq!(nothing.exit, Exit::Nothing);
+
+        outcome.problem = Some(shelf::Problem { offset: 0 });
+        let usage = report_of(&all, &opts, &request, &outcome);
+        assert!(usage.stderr.ends_with(
+            "recall: 2 project(s) could not be searched
+"
+        ));
+        assert_eq!(usage.exit, Exit::Usage);
     }
 
     #[test]

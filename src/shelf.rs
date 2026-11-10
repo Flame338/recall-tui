@@ -182,7 +182,8 @@ pub struct Problem {
 pub struct Outcome {
     pub found: Vec<Found>,
     pub problem: Option<Problem>,
-    pub searched: usize,
+    pub searched: Vec<usize>,
+    pub failed: Vec<usize>,
 }
 
 fn in_scope(source: &Source, request: &Request) -> bool {
@@ -222,13 +223,17 @@ fn query(source: &Source, request: &Request, limit: usize) -> Result<Vec<Hit>, Q
 }
 
 pub fn search(sources: &[Source], request: &Request, limit: usize) -> Outcome {
+    let in_scope: Vec<(usize, &Source)> = in_scope_sources(sources, request).collect();
+    let searched: Vec<usize> = in_scope.iter().map(|(position, _)| *position).collect();
     if request.text.trim().is_empty() {
-        return Outcome::default();
+        return Outcome {
+            searched,
+            ..Outcome::default()
+        };
     }
     let mut found = Vec::new();
-    let mut searched = 0;
-    for (position, source) in in_scope_sources(sources, request) {
-        searched += 1;
+    let mut failed = Vec::new();
+    for (position, source) in in_scope {
         match query(source, request, limit) {
             Ok(hits) => found.extend(hits.into_iter().map(|hit| Found {
                 source: position,
@@ -242,9 +247,10 @@ pub fn search(sources: &[Source], request: &Request, limit: usize) -> Outcome {
                         offset: request.text_offset + offset,
                     }),
                     searched,
+                    failed,
                 };
             }
-            Err(QueryFailure::Other(_)) => {}
+            Err(QueryFailure::Other(_)) => failed.push(position),
         }
     }
     found.sort_by(order);
@@ -253,6 +259,7 @@ pub fn search(sources: &[Source], request: &Request, limit: usize) -> Outcome {
         found,
         problem: None,
         searched,
+        failed,
     }
 }
 
@@ -466,7 +473,7 @@ mod tests {
         let (here, shelf) = corpus();
         let all = sources(Some((&here.project, &here.index)), &shelf);
         let outcome = search(&all, &request("watcher", Mode::Fuzzy, Reach::Here), 10);
-        assert_eq!(outcome.searched, 1);
+        assert_eq!(outcome.searched, [0]);
         assert_eq!(found(&outcome), [(0, "a.md")]);
     }
 
@@ -479,7 +486,7 @@ mod tests {
             &request("watcher", Mode::Fuzzy, Reach::Everywhere),
             10,
         );
-        assert_eq!(outcome.searched, 3);
+        assert_eq!(outcome.searched, [0, 1, 2]);
         assert_eq!(found(&outcome), [(0, "a.md"), (1, "a.md"), (2, "a.md")]);
     }
 
@@ -489,10 +496,10 @@ mod tests {
         let all = sources(Some((&here.project, &here.index)), &shelf);
         for reach in [Reach::Here, Reach::Everywhere] {
             let outcome = search(&all, &request("@ALP watcher", Mode::Fuzzy, reach), 10);
-            assert_eq!(outcome.searched, 1, "{reach:?}");
+            assert_eq!(outcome.searched, [1], "{reach:?}");
             assert_eq!(found(&outcome), [(1, "a.md")], "{reach:?}");
             let outcome = search(&all, &request("@he @bet watcher", Mode::Fuzzy, reach), 10);
-            assert_eq!(outcome.searched, 2, "{reach:?}");
+            assert_eq!(outcome.searched, [0, 2], "{reach:?}");
             assert_eq!(found(&outcome), [(0, "a.md"), (2, "a.md")], "{reach:?}");
             let outcome = search(&all, &request("@nothing watcher", Mode::Fuzzy, reach), 10);
             assert_eq!(outcome, Outcome::default(), "{reach:?}");
@@ -550,17 +557,28 @@ mod tests {
         let all = sources(None, &shelf);
         let outcome = search(&all, &request("watcher", Mode::Fuzzy, Reach::Everywhere), 3);
         assert_eq!(outcome.found.len(), 3);
-        assert_eq!(outcome.searched, 2);
+        assert_eq!(outcome.searched, [0, 1]);
     }
 
     #[test]
-    fn blank_text_searches_nothing() {
+    fn blank_text_finds_nothing_but_still_names_the_sources_in_scope() {
         let (here, shelf) = corpus();
         let all = sources(Some((&here.project, &here.index)), &shelf);
-        for input in ["", "   ", "@alpha", "@alpha   "] {
+        let cases: [(&str, Reach, &[usize]); 5] = [
+            ("", Reach::Everywhere, &[0, 1, 2]),
+            ("   ", Reach::Here, &[0]),
+            ("@alpha", Reach::Everywhere, &[1]),
+            ("@alpha   ", Reach::Here, &[1]),
+            ("@nothing", Reach::Everywhere, &[]),
+        ];
+        for (input, reach, expected) in cases {
             for mode in [Mode::Fuzzy, Mode::Syntax] {
-                let outcome = search(&all, &request(input, mode, Reach::Everywhere), 10);
-                assert_eq!(outcome, Outcome::default(), "{input:?}");
+                let outcome = search(&all, &request(input, mode, reach), 10);
+                let wanted = Outcome {
+                    searched: expected.to_vec(),
+                    ..Outcome::default()
+                };
+                assert_eq!(outcome, wanted, "{input:?} {mode:?} {reach:?}");
             }
         }
     }

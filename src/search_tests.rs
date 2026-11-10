@@ -933,3 +933,125 @@ fn the_empty_query_clears_the_suggestions_and_the_problem() {
     assert!(rig.app.suggestions.is_empty());
     assert_eq!(rig.app.mode, Mode::Syntax);
 }
+
+fn status_of(rig: &Rig) -> &str {
+    rig.app.status.text()
+}
+
+#[test]
+fn a_scope_that_matches_nothing_says_so_with_or_without_query_text() {
+    let mut rig = Rig::shelved("status-nomatch");
+    rig.type_text("@zzz @Yyy");
+    assert_eq!(status_of(&rig), "No saved project matches @zzz @yyy");
+    rig.type_text(" zebra");
+    assert_eq!(status_of(&rig), "No saved project matches @zzz @yyy");
+    assert!(rig.app.hits.is_empty());
+}
+
+#[test]
+fn scopes_without_query_text_name_the_projects_they_pick() {
+    let mut rig = Rig::shelved("status-scope-only");
+    rig.type_text("@alp");
+    assert_eq!(status_of(&rig), "Searching alpha · type a query");
+    rig.type_text(" @bet");
+    assert_eq!(status_of(&rig), "Searching alpha, beta · type a query");
+}
+
+#[test]
+fn a_search_of_one_other_project_names_it() {
+    let mut rig = Rig::shelved("status-other");
+    rig.type_text("@alp zebra");
+    assert_eq!(
+        status_of(&rig),
+        "2 results in alpha · Enter opens selected file"
+    );
+}
+
+#[test]
+fn a_search_of_only_the_open_project_keeps_its_file_count() {
+    let mut rig = Rig::shelved("status-here");
+    rig.type_text("@recall zebra");
+    assert_eq!(
+        status_of(&rig),
+        "12 results · 12 indexed · Enter opens selected file"
+    );
+    rig.press(ctrl('u'));
+    rig.type_text("zebra");
+    assert_eq!(
+        status_of(&rig),
+        "12 results · 12 indexed · Enter opens selected file"
+    );
+    rig.press(ctrl('u'));
+    assert_eq!(status_of(&rig), "Indexed 12 files · type a query");
+}
+
+#[test]
+fn a_search_of_several_projects_counts_them() {
+    let mut rig = Rig::shelved("status-many");
+    rig.press(ctrl('e'));
+    rig.type_text("zebra");
+    assert_eq!(
+        status_of(&rig),
+        "14 results across 3 projects · Enter opens selected file"
+    );
+}
+
+fn status_sources() -> (Shard, Shelf) {
+    let blank = |name: &str| Shard {
+        project: Project::at(format!("F:/work/{name}")),
+        index: LuxIndex::load(&lux::library_path()).expect("build libluxcore"),
+    };
+    (
+        blank("here"),
+        Shelf::from_shards(vec![blank("alpha"), blank("beta")]),
+    )
+}
+
+fn outcome_of(found: usize, searched: &[usize], failed: &[usize]) -> shelf::Outcome {
+    shelf::Outcome {
+        found: (0..found)
+            .map(|n| Found {
+                source: searched.first().copied().unwrap_or(HERE),
+                key: format!("{n}.md"),
+                score: 1.0,
+            })
+            .collect(),
+        problem: None,
+        searched: searched.to_vec(),
+        failed: failed.to_vec(),
+    }
+}
+
+#[test]
+fn the_status_says_how_many_projects_could_not_be_searched() {
+    let (here, shelf) = status_sources();
+    let all = sources(Some((&here.project, &here.index)), &shelf);
+    let request = parse_request("zebra", Mode::Fuzzy, Reach::Everywhere);
+    let text = |outcome: &shelf::Outcome| status_text(&request, outcome, &all, 7);
+    assert_eq!(
+        text(&outcome_of(3, &[0, 1, 2], &[2])),
+        "3 results across 3 projects · Enter opens selected file · 1 could not be searched"
+    );
+    assert_eq!(
+        text(&outcome_of(0, &[1], &[1])),
+        "0 results in alpha · Enter opens selected file · 1 could not be searched"
+    );
+    assert_eq!(
+        text(&outcome_of(2, &[0, 1, 2], &[1, 2])),
+        "2 results across 3 projects · Enter opens selected file · 2 could not be searched"
+    );
+    assert_eq!(
+        text(&outcome_of(1, &[0, 1], &[])),
+        "1 results across 2 projects · Enter opens selected file"
+    );
+}
+
+#[test]
+fn a_query_problem_wins_over_the_counts() {
+    let (here, shelf) = status_sources();
+    let all = sources(Some((&here.project, &here.index)), &shelf);
+    let request = parse_request("(", Mode::Syntax, Reach::Everywhere);
+    let mut outcome = outcome_of(0, &[0, 1, 2], &[]);
+    outcome.problem = Some(Problem { offset: 0 });
+    assert_eq!(status_text(&request, &outcome, &all, 7), BAD_QUERY);
+}
