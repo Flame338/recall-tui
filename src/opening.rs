@@ -20,9 +20,9 @@ use ratatui::{
 };
 
 use crate::{
-    App, Session, TerminalCleanup, compact_path,
+    App, Session,
     live::{Live, Mode, Progress, Summary},
-    sanitize_for_display,
+    view::{TerminalCleanup, compact_path, sanitize_for_display},
 };
 
 pub enum Opened {

@@ -13,7 +13,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::{cache, cache::CacheEntry, compact_path, sanitize_for_display};
+use crate::{
+    cache::{self, CacheEntry},
+    view::{compact_path, sanitize_for_display},
+};
 
 const PAGE: usize = 8;
 const LABEL_LIMIT: usize = 60;

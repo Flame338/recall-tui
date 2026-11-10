@@ -10,11 +10,11 @@ use std::{
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        self, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, enable_raw_mode},
 };
 mod cache;
 mod daemon;
@@ -26,6 +26,7 @@ mod manager;
 mod opening;
 mod scan;
 mod truth;
+mod view;
 mod watch;
 
 use flow::Screen;
@@ -36,10 +37,14 @@ use opening::{Opened, open_project};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+};
+use view::{
+    Move, Opener, TerminalCleanup, centered_rect, compact_path, draw_manager, open_manager,
+    sanitize_for_display,
 };
 
 const MAX_RESULTS: usize = 40;
@@ -135,14 +140,6 @@ enum Edit {
     Wipe,
     DropWord,
     Type(char),
-}
-
-#[derive(Clone, Copy)]
-enum Move {
-    Up(usize),
-    Down(usize),
-    Home,
-    End,
 }
 
 struct DirectoryPicker {
@@ -319,12 +316,6 @@ fn choose_root(start: PathBuf) -> Result<Choice, Box<dyn Error>> {
         }
     }
 }
-
-fn open_manager(root: Option<PathBuf>) -> IndexManager {
-    IndexManager::open(cache::default_dir(), root)
-}
-
-type Opener<'a> = &'a dyn Fn(Option<PathBuf>) -> IndexManager;
 
 fn picker_event(picker: &mut DirectoryPicker, event: Event, open: Opener) -> Option<Choice> {
     match event {
@@ -632,15 +623,6 @@ fn run_tui(app: &mut App, live: &mut Live) -> Result<Exit, Box<dyn Error>> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
     event_loop(&mut terminal, app, live)
-}
-
-struct TerminalCleanup;
-
-impl Drop for TerminalCleanup {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
-    }
 }
 
 fn event_loop(
@@ -1069,10 +1051,6 @@ fn draw_help(frame: &mut Frame) {
     }
 }
 
-fn draw_manager(frame: &mut Frame, manager: &IndexManager) {
-    manager.draw(frame, centered_rect(80, 70, frame.area()));
-}
-
 fn preview_lines(marked: &str) -> Vec<Line<'static>> {
     let numbered = marked.lines().enumerate();
     let matching: Vec<(usize, &str)> = numbered
@@ -1140,40 +1118,6 @@ fn match_span(text: String, marked: bool) -> Span<'static> {
     }
 }
 
-const TAB_WIDTH: usize = 4;
-
-fn sanitize_for_display(text: &str) -> String {
-    let mut clean = String::with_capacity(text.len());
-    let mut column = 0;
-    for ch in text.chars() {
-        match ch {
-            '\t' => {
-                let pad = TAB_WIDTH - column % TAB_WIDTH;
-                clean.extend(std::iter::repeat_n(' ', pad));
-                column += pad;
-            }
-            MARK_START | MARK_END => clean.push(ch),
-            ch if ch.is_control() || is_invisible_format(ch) => {}
-            ch => {
-                clean.push(ch);
-                column += 1;
-            }
-        }
-    }
-    clean
-}
-
-fn is_invisible_format(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FEFF}'
-    )
-}
-
 fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
@@ -1185,42 +1129,10 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
     &text[..boundary]
 }
 
-fn compact_path(path: &Path, max_chars: usize) -> String {
-    let raw = path.to_string_lossy();
-    let value = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= max_chars {
-        return value.to_owned();
-    }
-    let tail: String = chars[chars.len().saturating_sub(max_chars - 1)..]
-        .iter()
-        .collect();
-    format!("…{tail}")
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height) / 2),
-            Constraint::Percentage(height),
-            Constraint::Percentage((100 - height) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width) / 2),
-            Constraint::Percentage(width),
-            Constraint::Percentage((100 - width) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{buffer::Buffer, widgets::Widget};
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
     fn session_for(root: &str) -> Session {
         let live = Live::detached(Path::new(root), &lux::library_path()).expect("build libluxcore");
@@ -1388,14 +1300,6 @@ mod tests {
             seen.iter().any(|(text, hot)| *hot && text == "testing"),
             "expected `testing` highlighted, got {seen:?}"
         );
-    }
-
-    #[test]
-    fn tabs_expand_to_the_next_stop_and_invisibles_vanish() {
-        assert_eq!(sanitize_for_display("\tx"), "    x");
-        assert_eq!(sanitize_for_display("ab\tx"), "ab  x");
-        assert_eq!(sanitize_for_display("\u{FEFF}a\u{FE0F}\u{200D}b\x1b"), "ab");
-        assert_eq!(sanitize_for_display("naïve → ✓"), "naïve → ✓");
     }
 
     fn app_with_help(show_help: bool) -> App {
