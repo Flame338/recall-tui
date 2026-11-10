@@ -1746,7 +1746,7 @@ mod tests {
         for wanted in EVERY_OVERLAY {
             let mut rig = Rig::new("pin-rescan");
             rig.show(wanted);
-            assert!(matches!(rig.live.mode(), live::Mode::Live { .. }));
+            assert!(matches!(rig.live.mode(), live::Mode::Manual { .. }));
             assert_eq!(rig.press(ctrl('r')), None, "{wanted:?}");
             assert_eq!(rig.live.mode(), &live::Mode::Connecting, "{wanted:?}");
             assert_eq!(rig.app.status, Status::Rescanning, "{wanted:?}");
