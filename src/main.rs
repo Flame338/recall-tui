@@ -5,6 +5,7 @@ use std::{
 };
 
 mod cache;
+mod cli;
 mod daemon;
 mod flow;
 mod ipc;
@@ -45,6 +46,12 @@ enum Exit {
 fn main() -> Result<(), Box<dyn Error>> {
     if env::args_os().nth(1).is_some_and(|arg| arg == "daemon") {
         return daemon_command(&env::args().skip(2).collect::<Vec<_>>());
+    }
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "search" || arg == "projects")
+    {
+        cli::main(&env::args().skip(1).collect::<Vec<_>>());
     }
     let (root, library_path) = parse_args()?;
     if !library_path.is_file() {
@@ -136,7 +143,7 @@ fn parse_args() -> Result<(Option<PathBuf>, PathBuf), Box<dyn Error>> {
             library = Some(PathBuf::from(args.next().ok_or("--lib needs a path")?));
         } else if arg == "--help" || arg == "-h" {
             println!(
-                "Recall — local project memory powered by LuxCore\n\nUsage: recall [ROOT] [--lib PATH]\n\nThe library path can also come from LUXCORE_LIB."
+                "Recall — local project memory powered by LuxCore\n\nUsage: recall [ROOT] [--lib PATH]\n       recall search [--syntax] [--limit N] [--json] [--lib PATH] QUERY...\n       recall projects [--lib PATH]\n       recall daemon run|start|status|stop\n\nsearch and projects query every saved project without opening the interface. daemon manages the background indexer.\nThe library path can also come from LUXCORE_LIB."
             );
             std::process::exit(0);
         } else if root.is_none() {
