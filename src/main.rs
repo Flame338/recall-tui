@@ -13,6 +13,7 @@ mod lux;
 mod manager;
 mod opening;
 mod picker;
+mod preview;
 mod scan;
 mod search;
 #[cfg(test)]
