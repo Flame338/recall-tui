@@ -57,6 +57,31 @@ type IndexSnippet = unsafe extern "C" fn(
     *const SnippetOptions,
     *mut *mut c_void,
 ) -> i32;
+type IndexSearchQuery = unsafe extern "C" fn(
+    *const c_void,
+    *const c_char,
+    usize,
+    usize,
+    *mut *mut c_void,
+    *mut usize,
+) -> i32;
+type IndexSnippetQuery = unsafe extern "C" fn(
+    *const c_void,
+    *const c_char,
+    usize,
+    *const c_char,
+    usize,
+    *const c_char,
+    usize,
+    *const SnippetOptions,
+    *mut *mut c_void,
+    *mut usize,
+) -> i32;
+type IndexSuggest =
+    unsafe extern "C" fn(*const c_void, *const c_char, usize, usize, *mut *mut c_void) -> i32;
+type StringsCount = unsafe extern "C" fn(*const c_void) -> usize;
+type StringsGet = unsafe extern "C" fn(*const c_void, usize, *mut usize) -> *const c_char;
+type StringsFree = unsafe extern "C" fn(*mut c_void);
 type HitsCount = unsafe extern "C" fn(*const c_void) -> usize;
 type HitsKey = unsafe extern "C" fn(*const c_void, usize, *mut usize) -> *const c_char;
 type HitsScore = unsafe extern "C" fn(*const c_void, usize) -> f64;
@@ -75,6 +100,12 @@ struct LuxFns {
     save: IndexSave,
     load: IndexLoad,
     snippet: IndexSnippet,
+    search_query: IndexSearchQuery,
+    snippet_query: IndexSnippetQuery,
+    suggest: IndexSuggest,
+    strings_count: StringsCount,
+    strings_get: StringsGet,
+    strings_free: StringsFree,
     hits_count: HitsCount,
     hits_key: HitsKey,
     hits_score: HitsScore,
@@ -105,6 +136,12 @@ impl LuxIndex {
                 save: *library.get(b"lux_index_save\0")?,
                 load: *library.get(b"lux_index_load\0")?,
                 snippet: *library.get(b"lux_index_snippet\0")?,
+                search_query: *library.get(b"lux_index_search_query\0")?,
+                snippet_query: *library.get(b"lux_index_snippet_query\0")?,
+                suggest: *library.get(b"lux_index_suggest\0")?,
+                strings_count: *library.get(b"lux_strings_count\0")?,
+                strings_get: *library.get(b"lux_strings_get\0")?,
+                strings_free: *library.get(b"lux_strings_free\0")?,
                 hits_count: *library.get(b"lux_hits_count\0")?,
                 hits_key: *library.get(b"lux_hits_key\0")?,
                 hits_score: *library.get(b"lux_hits_score\0")?,
@@ -181,6 +218,57 @@ impl LuxIndex {
             )
         };
         check_status(status, "searching")?;
+        self.take_hits(hits)
+    }
+
+    pub fn search_query(&self, query: &str, limit: usize) -> Result<Vec<Hit>, QueryFailure> {
+        let mut hits = ptr::null_mut();
+        let mut offset = 0;
+        let status = unsafe {
+            (self.fns.search_query)(
+                self.raw,
+                query.as_ptr().cast(),
+                query.len(),
+                limit,
+                &mut hits,
+                &mut offset,
+            )
+        };
+        check_query(status, offset, "searching")?;
+        Ok(self.take_hits(hits)?)
+    }
+
+    pub fn suggest(&self, query: &str, limit: usize) -> Result<Vec<String>, Box<dyn Error>> {
+        let mut strings = ptr::null_mut();
+        let status = unsafe {
+            (self.fns.suggest)(
+                self.raw,
+                query.as_ptr().cast(),
+                query.len(),
+                limit,
+                &mut strings,
+            )
+        };
+        check_status(status, "suggesting completions")?;
+        if strings.is_null() {
+            return Err("LuxCore returned a null suggestion handle".into());
+        }
+        let count = unsafe { (self.fns.strings_count)(strings) };
+        let mut result = Vec::with_capacity(count);
+        for position in 0..count {
+            let mut length = 0;
+            let data = unsafe { (self.fns.strings_get)(strings, position, &mut length) };
+            if data.is_null() {
+                continue;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) };
+            result.push(String::from_utf8_lossy(bytes).into_owned());
+        }
+        unsafe { (self.fns.strings_free)(strings) };
+        Ok(result)
+    }
+
+    fn take_hits(&self, hits: *mut c_void) -> Result<Vec<Hit>, Box<dyn Error>> {
         if hits.is_null() {
             return Err("LuxCore returned a null result handle".into());
         }
@@ -225,21 +313,8 @@ impl LuxIndex {
         query: &str,
         length: usize,
     ) -> Result<String, Box<dyn Error>> {
-        let mut start = [0u8; 4];
-        let mut end = [0u8; 4];
-        let start = MARK_START.encode_utf8(&mut start);
-        let end = MARK_END.encode_utf8(&mut end);
-        let options = SnippetOptions {
-            length,
-            start_marker: start.as_ptr().cast(),
-            start_marker_length: start.len(),
-            end_marker: end.as_ptr().cast(),
-            end_marker_length: end.len(),
-            ellipsis: start.as_ptr().cast(),
-            ellipsis_length: 0,
-        };
         let mut text = ptr::null_mut();
-        let status = unsafe {
+        let status = with_markers(length, |options| unsafe {
             (self.fns.snippet)(
                 self.raw,
                 key.as_ptr().cast(),
@@ -248,12 +323,39 @@ impl LuxIndex {
                 field.len(),
                 query.as_ptr().cast(),
                 query.len(),
-                &options,
+                options,
                 &mut text,
             )
-        };
+        });
         check_status(status, "building a snippet")?;
         self.take_text(text)
+    }
+
+    pub fn snippet_query(
+        &self,
+        key: &str,
+        field: &str,
+        query: &str,
+        length: usize,
+    ) -> Result<String, QueryFailure> {
+        let mut text = ptr::null_mut();
+        let mut offset = 0;
+        let status = with_markers(length, |options| unsafe {
+            (self.fns.snippet_query)(
+                self.raw,
+                key.as_ptr().cast(),
+                key.len(),
+                field.as_ptr().cast(),
+                field.len(),
+                query.as_ptr().cast(),
+                query.len(),
+                options,
+                &mut text,
+                &mut offset,
+            )
+        });
+        check_query(status, offset, "building a snippet")?;
+        Ok(self.take_text(text)?)
     }
 
     fn take_text(&self, text: *mut c_void) -> Result<String, Box<dyn Error>> {
@@ -293,6 +395,55 @@ fn check_status(status: i32, action: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
+const INVALID_QUERY: i32 = 7;
+
+#[derive(Debug)]
+pub enum QueryFailure {
+    Invalid { offset: usize },
+    Other(Box<dyn Error>),
+}
+
+impl std::fmt::Display for QueryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryFailure::Invalid { offset } => write!(f, "invalid query at byte {offset}"),
+            QueryFailure::Other(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for QueryFailure {}
+
+impl From<Box<dyn Error>> for QueryFailure {
+    fn from(error: Box<dyn Error>) -> Self {
+        QueryFailure::Other(error)
+    }
+}
+
+fn check_query(status: i32, offset: usize, action: &str) -> Result<(), QueryFailure> {
+    if status == INVALID_QUERY {
+        return Err(QueryFailure::Invalid { offset });
+    }
+    Ok(check_status(status, action)?)
+}
+
+fn with_markers(length: usize, call: impl FnOnce(&SnippetOptions) -> i32) -> i32 {
+    let mut start = [0u8; 4];
+    let mut end = [0u8; 4];
+    let start = MARK_START.encode_utf8(&mut start);
+    let end = MARK_END.encode_utf8(&mut end);
+    call(&SnippetOptions {
+        length,
+        start_marker: start.as_ptr().cast(),
+        start_marker_length: start.len(),
+        end_marker: end.as_ptr().cast(),
+        end_marker_length: end.len(),
+        ellipsis: start.as_ptr().cast(),
+        ellipsis_length: 0,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
     pub key: String,
     pub score: f64,
@@ -303,4 +454,58 @@ pub fn library_path() -> std::path::PathBuf {
     std::env::var_os("LUXCORE_LIB")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_LIBRARY))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notes() -> LuxIndex {
+        let mut index = LuxIndex::load(&library_path()).expect("build libluxcore");
+        index
+            .add("a.md", "a.md", "the watcher debounces bursts of changes")
+            .unwrap();
+        index
+            .add("b.md", "b.md", "a debt is paid down by the watcher")
+            .unwrap();
+        index
+    }
+
+    #[test]
+    fn suggest_completes_the_unfinished_last_word() {
+        let words = notes().suggest("watcher deb", 5).unwrap();
+        assert!(words.iter().any(|word| word == "debt"), "{words:?}");
+        assert!(words.iter().all(|word| word.starts_with("deb")), "{words:?}");
+    }
+
+    #[test]
+    fn query_syntax_requires_and_excludes_words() {
+        let hits = notes().search_query("+watcher -debt", 5).unwrap();
+        let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
+        assert_eq!(keys, ["a.md"]);
+    }
+
+    #[test]
+    fn a_malformed_query_reports_the_byte_luxcore_rejected() {
+        let index = notes();
+        let failure = index.search_query("watcher AND (debt", 5).unwrap_err();
+        assert!(
+            matches!(failure, QueryFailure::Invalid { offset: 12 }),
+            "{failure:?}"
+        );
+        let failure = index.snippet_query("a.md", "body", "(debt", 80).unwrap_err();
+        assert!(
+            matches!(failure, QueryFailure::Invalid { offset: 0 }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn snippet_query_marks_the_words_of_the_query() {
+        let marked = notes().snippet_query("b.md", "body", "debt", 80).unwrap();
+        assert!(
+            marked.contains(&format!("{MARK_START}debt{MARK_END}")),
+            "{marked:?}"
+        );
+    }
 }
