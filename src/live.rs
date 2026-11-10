@@ -107,10 +107,186 @@ impl SavePolicy {
     }
 }
 
-struct Feed {
+/// A source of updates. The engine is set when Live runs one in process.
+struct Watcher {
     link: Link,
     via: Via,
     engine: Option<Engine>,
+    /// When the last update arrived, or the link was made.
+    heard: Instant,
+}
+
+impl Watcher {
+    fn new(link: Link, via: Via, engine: Option<Engine>) -> Self {
+        Self {
+            link,
+            via,
+            engine,
+            heard: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        if let Some(engine) = &self.engine {
+            let _ = engine.cmd.send(Cmd::Stop);
+        }
+    }
+}
+
+/// Where Live is in following the watcher. `synced` means a snapshot or
+/// delta was applied, by the watcher or by Live's own walk.
+enum Feed {
+    /// Waiting for the first update. With no watcher, Live walks the project.
+    Connecting(Option<Watcher>),
+    Scanning {
+        watcher: Watcher,
+        found: usize,
+    },
+    Live(Watcher),
+    /// Ctrl-R refreshes. A later snapshot or delta does not leave it.
+    Manual {
+        reason: String,
+        synced: bool,
+        watcher: Option<Watcher>,
+    },
+    /// Nothing but a manual update leaves it, and Ctrl-R is ignored.
+    Gone {
+        synced: bool,
+        watcher: Option<Watcher>,
+    },
+}
+
+impl Feed {
+    fn mode(&self) -> Mode {
+        match self {
+            Feed::Connecting(_) => Mode::Connecting,
+            Feed::Scanning { found, .. } => Mode::Scanning { found: *found },
+            Feed::Live(watcher) => Mode::Live { via: watcher.via },
+            Feed::Manual { reason, .. } => Mode::Manual {
+                reason: reason.clone(),
+            },
+            Feed::Gone { .. } => Mode::Gone,
+        }
+    }
+
+    fn watcher(&self) -> Option<&Watcher> {
+        match self {
+            Feed::Scanning { watcher, .. } | Feed::Live(watcher) => Some(watcher),
+            Feed::Connecting(watcher)
+            | Feed::Manual { watcher, .. }
+            | Feed::Gone { watcher, .. } => watcher.as_ref(),
+        }
+    }
+
+    fn watcher_mut(&mut self) -> Option<&mut Watcher> {
+        match self {
+            Feed::Scanning { watcher, .. } | Feed::Live(watcher) => Some(watcher),
+            Feed::Connecting(watcher)
+            | Feed::Manual { watcher, .. }
+            | Feed::Gone { watcher, .. } => watcher.as_mut(),
+        }
+    }
+
+    fn is_synced(&self) -> bool {
+        match self {
+            Feed::Connecting(_) | Feed::Scanning { .. } => false,
+            Feed::Live(_) => true,
+            Feed::Manual { synced, .. } | Feed::Gone { synced, .. } => *synced,
+        }
+    }
+
+    fn into_parts(self) -> (bool, Option<Watcher>) {
+        let synced = self.is_synced();
+        let watcher = match self {
+            Feed::Scanning { watcher, .. } | Feed::Live(watcher) => Some(watcher),
+            Feed::Connecting(watcher)
+            | Feed::Manual { watcher, .. }
+            | Feed::Gone { watcher, .. } => watcher,
+        };
+        (synced, watcher)
+    }
+
+    /// Whether Live must walk the project itself: nothing will send a
+    /// snapshot, or a manual watcher has been silent for `MANUAL_GRACE`.
+    fn stranded(&self) -> bool {
+        match self {
+            Feed::Connecting(watcher) => watcher.is_none(),
+            Feed::Manual {
+                synced: false,
+                watcher,
+                ..
+            } => watcher
+                .as_ref()
+                .is_none_or(|watcher| watcher.heard.elapsed() >= MANUAL_GRACE),
+            _ => false,
+        }
+    }
+
+    fn scanning(self, found: usize) -> Feed {
+        match self {
+            Feed::Connecting(Some(watcher)) | Feed::Scanning { watcher, .. } => {
+                Feed::Scanning { watcher, found }
+            }
+            other => other,
+        }
+    }
+
+    fn synced(self) -> Feed {
+        match self {
+            Feed::Connecting(Some(watcher))
+            | Feed::Scanning { watcher, .. }
+            | Feed::Live(watcher) => Feed::Live(watcher),
+            Feed::Connecting(None) => Feed::Manual {
+                reason: "no watcher".into(),
+                synced: true,
+                watcher: None,
+            },
+            Feed::Manual { reason, watcher, .. } => Feed::Manual {
+                reason,
+                synced: true,
+                watcher,
+            },
+            Feed::Gone { watcher, .. } => Feed::Gone {
+                synced: true,
+                watcher,
+            },
+        }
+    }
+
+    fn manual(self, reason: String) -> Feed {
+        let (synced, watcher) = self.into_parts();
+        Feed::Manual {
+            reason,
+            synced,
+            watcher,
+        }
+    }
+
+    fn gone(self) -> Feed {
+        let (synced, watcher) = self.into_parts();
+        Feed::Gone { synced, watcher }
+    }
+
+    fn lost(self) -> Feed {
+        match self {
+            Feed::Manual { reason, synced, .. } => Feed::Manual {
+                reason,
+                synced,
+                watcher: None,
+            },
+            Feed::Gone { synced, .. } => Feed::Gone {
+                synced,
+                watcher: None,
+            },
+            waiting_or_live => Feed::Manual {
+                reason: "watcher stopped".into(),
+                synced: waiting_or_live.is_synced(),
+                watcher: None,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,20 +362,16 @@ pub struct Live {
     committed: Option<Cursor>,
     received: Option<Cursor>,
     want: BTreeMap<String, Pending>,
-    link: Option<Link>,
-    engine: Option<Engine>,
-    via: Via,
+    feed: Feed,
+    /// `feed.mode()`, kept so `mode()` can lend it. Only `shift` writes it.
     mode: Mode,
-    synced: bool,
-    last_feed: Instant,
     save: SavePolicy,
     backoff: Duration,
-    manual_grace: Duration,
     jobs: usize,
     current: String,
     summary: Summary,
-    /// How `rescan` gets a new feed after the old one was lost.
-    connector: fn(&Path, Option<Cursor>) -> Feed,
+    /// How `rescan` gets a new watcher after the old one was lost.
+    connector: fn(&Path, Option<Cursor>) -> Watcher,
 }
 
 impl Live {
@@ -215,7 +387,7 @@ impl Live {
         root: &Path,
         library: &Path,
         cache_dir: Option<PathBuf>,
-        feed: impl FnOnce(Option<Cursor>) -> Option<Feed>,
+        watcher: impl FnOnce(Option<Cursor>) -> Option<Watcher>,
     ) -> Result<Live, Box<dyn Error>> {
         let mut index = LuxIndex::load(library)?;
         let files = cache_dir.map(|dir| cache::cache_files(&dir, root));
@@ -238,10 +410,7 @@ impl Live {
             Some(files) if reused => Store::Saved(files),
             Some(files) => Store::Unsaved(files),
         };
-        let (link, engine, via) = match feed(committed) {
-            Some(feed) => (Some(feed.link), feed.engine, feed.via),
-            None => (None, None, Via::InProcess),
-        };
+        let feed = Feed::Connecting(watcher(committed));
         Ok(Live {
             root: root.to_path_buf(),
             index,
@@ -252,16 +421,11 @@ impl Live {
             committed,
             received: None,
             want: BTreeMap::new(),
-            link,
-            engine,
-            via,
-            mode: Mode::Connecting,
-            synced: false,
-            last_feed: Instant::now(),
+            mode: feed.mode(),
+            feed,
             save: SavePolicy::new(),
             connector: connect,
             backoff: BACKOFF,
-            manual_grace: MANUAL_GRACE,
             jobs: 0,
             current: String::new(),
             summary: Summary {
@@ -309,16 +473,16 @@ impl Live {
 
     pub fn status(&self) -> String {
         let pending = self.pending();
-        match &self.mode {
-            Mode::Connecting => "… connecting".to_owned(),
-            Mode::Scanning { found } => format!("scanning {found}"),
-            Mode::Live { .. } if pending > 0 => format!("● live, updating {pending}"),
-            Mode::Live { .. } => "● live".to_owned(),
-            Mode::Manual { .. } if pending > 0 => {
+        match &self.feed {
+            Feed::Connecting(_) => "… connecting".to_owned(),
+            Feed::Scanning { found, .. } => format!("scanning {found}"),
+            Feed::Live(_) if pending > 0 => format!("● live, updating {pending}"),
+            Feed::Live(_) => "● live".to_owned(),
+            Feed::Manual { .. } if pending > 0 => {
                 format!("○ manual (Ctrl-R), updating {pending}")
             }
-            Mode::Manual { .. } => "○ manual (Ctrl-R)".to_owned(),
-            Mode::Gone => "○ project gone".to_owned(),
+            Feed::Manual { .. } => "○ manual (Ctrl-R)".to_owned(),
+            Feed::Gone { .. } => "○ project gone".to_owned(),
         }
     }
 
@@ -346,7 +510,8 @@ impl Live {
             if !walked {
                 return Ok(false);
             }
-            if self.mode == Mode::Gone || self.synced && self.pending() <= WARM_LIMIT {
+            let gone = matches!(self.feed, Feed::Gone { .. });
+            if gone || self.feed.is_synced() && self.pending() <= WARM_LIMIT {
                 break;
             }
             self.work(SETTLE_SLICE);
@@ -390,25 +555,19 @@ impl Live {
     /// Ctrl-R. Works in every mode. With no engine left to ask, it walks the
     /// project itself.
     pub fn rescan(&mut self) {
-        if self.mode == Mode::Gone {
+        if matches!(self.feed, Feed::Gone { .. }) {
             return;
         }
         let asked = self
-            .link
-            .as_ref()
-            .is_some_and(|(cmd, _)| cmd.send(Cmd::Rescan).is_ok());
+            .feed
+            .watcher()
+            .is_some_and(|watcher| watcher.link.0.send(Cmd::Rescan).is_ok());
         if asked {
             return;
         }
         // The daemon stopped or crashed. This starts it again, on the user's ask.
-        self.lose_feed();
-        let feed = (self.connector)(&self.root, self.received);
-        self.link = Some(feed.link);
-        self.engine = feed.engine;
-        self.via = feed.via;
-        self.mode = Mode::Connecting;
-        self.synced = false;
-        self.last_feed = Instant::now();
+        let watcher = (self.connector)(&self.root, self.received);
+        self.shift(|_| Feed::Connecting(Some(watcher)));
     }
 
     /// Saves what is applied. Jobs still queued are not run: they come back
@@ -421,7 +580,10 @@ impl Live {
     }
 
     fn recv(&self, wait: Duration) -> Result<Option<Update>, ()> {
-        let Some((_, updates)) = &self.link else {
+        let Some(Watcher {
+            link: (_, updates), ..
+        }) = self.feed.watcher()
+        else {
             return Ok(None);
         };
         if wait.is_zero() {
@@ -447,28 +609,23 @@ impl Live {
                     self.accept(update);
                 }
                 Ok(None) => return,
-                Err(()) => return self.lose_feed(),
+                Err(()) => return self.shift(Feed::lost),
             }
         }
     }
 
-    fn lose_feed(&mut self) {
-        self.link = None;
-        if !matches!(self.mode, Mode::Gone | Mode::Manual { .. }) {
-            self.mode = Mode::Manual {
-                reason: "watcher stopped".into(),
-            };
-        }
+    fn shift(&mut self, step: impl FnOnce(Feed) -> Feed) {
+        let feed = std::mem::replace(&mut self.feed, Feed::Connecting(None));
+        self.feed = step(feed);
+        self.mode = self.feed.mode();
     }
 
     fn accept(&mut self, update: Update) {
-        self.last_feed = Instant::now();
+        if let Some(watcher) = self.feed.watcher_mut() {
+            watcher.heard = Instant::now();
+        }
         match update {
-            Update::Scanning { found } => {
-                if !self.synced && matches!(self.mode, Mode::Connecting | Mode::Scanning { .. }) {
-                    self.mode = Mode::Scanning { found };
-                }
-            }
+            Update::Scanning { found } => self.shift(|feed| feed.scanning(found)),
             Update::Snapshot { at, files } => self.take_snapshot(&files, Some(at)),
             Update::Delta { at, changes, .. } => {
                 let plan = cache::plan(&self.records, Seen::Changes(&changes));
@@ -481,10 +638,10 @@ impl Live {
                     .collect();
                 self.queue(plan, before);
                 self.received = Some(at);
-                self.synced();
+                self.shift(Feed::synced);
             }
-            Update::Manual { reason } => self.mode = Mode::Manual { reason },
-            Update::Gone => self.mode = Mode::Gone,
+            Update::Manual { reason } => self.shift(|feed| feed.manual(reason)),
+            Update::Gone => self.shift(Feed::gone),
         }
     }
 
@@ -496,14 +653,7 @@ impl Live {
         if at.is_none() {
             self.committed = None;
         }
-        self.synced();
-    }
-
-    fn synced(&mut self) {
-        self.synced = true;
-        if !matches!(self.mode, Mode::Manual { .. } | Mode::Gone) {
-            self.mode = Mode::Live { via: self.via };
-        }
+        self.shift(Feed::synced);
     }
 
     /// `before` holds the queued jobs this update replaces.
@@ -665,9 +815,7 @@ impl Live {
         &mut self,
         tick: impl FnMut(usize, &str) -> Result<bool, Box<dyn Error>>,
     ) -> Result<bool, Box<dyn Error>> {
-        let silent = matches!(self.mode, Mode::Manual { .. })
-            && self.last_feed.elapsed() >= self.manual_grace;
-        if self.synced || self.mode == Mode::Gone || !(silent || self.link.is_none()) {
+        if !self.feed.stranded() {
             return Ok(true);
         }
         self.walk_project(tick)
@@ -692,15 +840,7 @@ impl Live {
     }
 }
 
-impl Drop for Live {
-    fn drop(&mut self) {
-        if let Some(engine) = &self.engine {
-            let _ = engine.cmd.send(Cmd::Stop);
-        }
-    }
-}
-
-fn connect(root: &Path, have: Option<Cursor>) -> Feed {
+fn connect(root: &Path, have: Option<Cursor>) -> Watcher {
     if env::var_os("RECALL_DAEMON").is_some_and(|value| value == "0") {
         return in_process(root, have);
     }
@@ -711,26 +851,18 @@ fn connect(root: &Path, have: Option<Cursor>) -> Feed {
         other => other.ok(),
     };
     match attached {
-        Some(link) => Feed {
-            link,
-            via: Via::Daemon,
-            engine: None,
-        },
+        Some(link) => Watcher::new(link, Via::Daemon, None),
         None => in_process(root, have),
     }
 }
 
-fn in_process(root: &Path, have: Option<Cursor>) -> Feed {
+fn in_process(root: &Path, have: Option<Cursor>) -> Watcher {
     let engine = Engine::spawn(EngineConfig {
         root: root.to_path_buf(),
         debounce: Debounce::default(),
         buffer_bytes: WATCH_BUFFER_BYTES,
     });
-    Feed {
-        link: engine.subscribe(have),
-        via: Via::InProcess,
-        engine: Some(engine),
-    }
+    Watcher::new(engine.subscribe(have), Via::InProcess, Some(engine))
 }
 
 #[cfg(test)]
@@ -790,13 +922,7 @@ mod tests {
                 &self.root,
                 &lux::library_path(),
                 cache.map(Path::to_path_buf),
-                move |_| {
-                    Some(Feed {
-                        link: (commands, update_rx),
-                        via: Via::InProcess,
-                        engine: None,
-                    })
-                },
+                move |_| Some(Watcher::new((commands, update_rx), Via::InProcess, None)),
             )
             .expect("build libluxcore");
             Rig {
@@ -1370,7 +1496,6 @@ mod tests {
         let project = Project::new("manual-walk");
         project.write("a.md", "alpha");
         let mut rig = project.rig(None);
-        rig.live.manual_grace = Duration::ZERO;
         rig.send(Update::Manual {
             reason: "no watcher".into(),
         });
@@ -1395,7 +1520,7 @@ mod tests {
         } = rig;
         drop(commands);
         drop(updates);
-        live.connector = in_process_feed;
+        live.connector = in_process;
         live.rescan();
         assert_eq!(live.mode(), &Mode::Connecting);
         let end = Instant::now() + Duration::from_secs(6);
@@ -1404,10 +1529,6 @@ mod tests {
             assert!(Instant::now() < end, "never reconnected: {:?}", live.mode());
             thread::sleep(Duration::from_millis(10));
         }
-    }
-
-    fn in_process_feed(root: &Path, have: Option<Cursor>) -> Feed {
-        in_process(root, have)
     }
 
     mod lifecycle {
@@ -1419,15 +1540,11 @@ mod tests {
                 const { RefCell::new(None) };
         }
 
-        fn hand_fed(_: &Path, _: Option<Cursor>) -> Feed {
+        fn hand_fed(_: &Path, _: Option<Cursor>) -> Watcher {
             let (commands, command_rx) = channel();
             let (updates, update_rx) = channel();
             HANDED.with(|handed| *handed.borrow_mut() = Some((updates, command_rx)));
-            Feed {
-                link: (commands, update_rx),
-                via: Via::InProcess,
-                engine: None,
-            }
+            Watcher::new((commands, update_rx), Via::InProcess, None)
         }
 
         #[derive(Clone, Copy, Debug)]
@@ -1620,13 +1737,14 @@ mod tests {
             }
         }
 
-        /// The one combination the statechart forbids: live with no watcher.
-        /// It is reachable only when Live starts with no feed and walks.
+        /// Live with no watcher is the combination the statechart forbids.
         #[test]
-        fn an_own_walk_with_no_feed_goes_live() {
+        fn an_own_walk_with_no_feed_is_manual_not_live() {
             let driver = run(Start::Unlinked, &[Walk]);
-            assert_eq!(driver.live.mode(), &live());
-            assert_eq!(driver.live.status(), "● live");
+            assert_eq!(driver.live.mode(), &manual("no watcher"));
+            assert_eq!(driver.live.status(), "○ manual (Ctrl-R)");
+            let driver = run(Start::Unlinked, &[Walk, CtrlR, Snapshot]);
+            assert_eq!(driver.live.mode(), &live(), "Ctrl-R connects it");
         }
     }
 
@@ -1764,7 +1882,7 @@ mod tests {
         let (root, build) = (project.root.clone(), ipc::build_id().to_owned());
         let mut live = Live::build(&root, &lux::library_path(), None, |have| {
             let link = ipc::connect_to(&name, &build, &root, have).expect("connect");
-            Some(Feed { link, via: Via::Daemon, engine: None })
+            Some(Watcher::new(link, Via::Daemon, None))
         })
         .expect("build libluxcore");
         assert!(live.settle(|_| Ok(true)).unwrap());
@@ -1891,11 +2009,7 @@ mod tests {
                     Some(project.cache.clone()),
                     move |have| {
                         let link = ipc::connect_to(&name, &build, &root, have).expect("connect");
-                        Some(Feed {
-                            link,
-                            via: Via::Daemon,
-                            engine: None,
-                        })
+                        Some(Watcher::new(link, Via::Daemon, None))
                     },
                 )
                 .expect("build libluxcore")
