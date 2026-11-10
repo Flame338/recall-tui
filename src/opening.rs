@@ -25,7 +25,12 @@ use crate::{
     sanitize_for_display,
 };
 
-pub fn open_project(root: PathBuf, library_path: &Path) -> Result<Option<Session>, Box<dyn Error>> {
+pub enum Opened {
+    Ready(Box<Session>),
+    Cancelled,
+}
+
+pub fn open_project(root: PathBuf, library_path: &Path) -> Result<Opened, Box<dyn Error>> {
     let root = root.canonicalize()?;
     if !root.is_dir() {
         return Err(format!("Not a directory: {}", root.display()).into());
@@ -35,7 +40,7 @@ pub fn open_project(root: PathBuf, library_path: &Path) -> Result<Option<Session
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
-    terminal.draw(|frame| draw_scanning(frame, &root, 0, ""))?;
+    terminal.draw(|frame| draw_scanning(frame, &root, 0))?;
 
     let mut live = Live::open(&root, library_path)?;
     let finished = live.settle(|progress| {
@@ -46,11 +51,11 @@ pub fn open_project(root: PathBuf, library_path: &Path) -> Result<Option<Session
         Ok(true)
     })?;
     if !finished {
-        return Ok(None);
+        return Ok(Opened::Cancelled);
     }
     let status = format!("{} · F1 help", describe_startup(&live.summary()));
     let app = App::new(root, live.indexed_files(), status);
-    Ok(Some(Session { live, app }))
+    Ok(Opened::Ready(Box::new(Session { live, app })))
 }
 
 fn describe_startup(summary: &Summary) -> String {
@@ -88,8 +93,8 @@ fn cancel_requested() -> Result<bool, Box<dyn Error>> {
 
 fn draw_progress(frame: &mut Frame, root: &Path, progress: &Progress) {
     match progress.mode {
-        Mode::Scanning { found } => draw_scanning(frame, root, *found, ""),
-        _ if progress.total == 0 => draw_scanning(frame, root, 0, ""),
+        Mode::Scanning { found } => draw_scanning(frame, root, *found),
+        _ if progress.total == 0 => draw_scanning(frame, root, 0),
         _ => draw_indexing(frame, root, progress.done, progress.total, progress.current),
     }
 }
@@ -125,7 +130,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, detail: &str) {
     );
 }
 
-fn draw_scanning(frame: &mut Frame, root: &Path, found: usize, latest: &str) {
+fn draw_scanning(frame: &mut Frame, root: &Path, found: usize) {
     let area = indexing_layout(frame, root);
     frame.render_widget(
         Paragraph::new(format!("{found} files found so far")).block(
@@ -135,30 +140,20 @@ fn draw_scanning(frame: &mut Frame, root: &Path, found: usize, latest: &str) {
         ),
         area[1],
     );
-    let detail = if latest.is_empty() {
-        "Looking for files…".to_owned()
-    } else {
-        format!("Found {latest}")
-    };
-    draw_detail(frame, area[2], &detail);
+    draw_detail(frame, area[2], "Looking for files…");
 }
 
 fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize, current: &str) {
     let area = indexing_layout(frame, root);
-    let ratio = if total == 0 {
-        1.0
-    } else {
-        (completed as f64 / total as f64).clamp(0.0, 1.0)
-    };
+    let ratio = (completed as f64 / total as f64).clamp(0.0, 1.0);
     let gauge = Gauge::default()
         .block(Block::default().title(" Progress ").borders(Borders::ALL))
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
         .ratio(ratio)
-        .label(if total == 0 {
-            "No matching files".to_owned()
-        } else {
-            format!("{:.0}% · {completed} / {total} files", ratio * 100.0)
-        });
+        .label(format!(
+            "{:.0}% · {completed} / {total} files",
+            ratio * 100.0
+        ));
     frame.render_widget(gauge, area[1]);
 
     let detail = if current.is_empty() {
