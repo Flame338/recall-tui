@@ -37,6 +37,7 @@ impl Stamp {
     }
 }
 
+/// One manifest row as the file stores it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub stamp: Stamp,
@@ -44,6 +45,53 @@ pub struct Entry {
 }
 
 pub type Manifest = BTreeMap<String, Entry>;
+
+/// A row stores an unread file's stamp as all ones, so the format stays `recall-cache 3`.
+const UNREAD: Stamp = Stamp {
+    size: u64::MAX,
+    modified: u64::MAX,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Content {
+    Read(Stamp),
+    /// Reading it kept failing. Every plan reads it again.
+    Unread,
+}
+
+/// What the index holds for one file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Record {
+    pub content: Content,
+    pub indexed: bool,
+}
+
+pub type Records = BTreeMap<String, Record>;
+
+impl Record {
+    fn from_row(entry: Entry) -> Self {
+        let content = if entry.stamp == UNREAD {
+            Content::Unread
+        } else {
+            Content::Read(entry.stamp)
+        };
+        Record {
+            content,
+            indexed: entry.indexed,
+        }
+    }
+
+    fn row(self) -> Entry {
+        let stamp = match self.content {
+            Content::Read(stamp) => stamp,
+            Content::Unread => UNREAD,
+        };
+        Entry {
+            stamp,
+            indexed: self.indexed,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Seen<'a> {
@@ -61,22 +109,25 @@ pub struct Plan {
 }
 
 impl Plan {
-    fn present(&mut self, cached: &Manifest, key: &str, stamp: Stamp) {
-        if cached.get(key).is_none_or(|entry| entry.stamp != stamp) {
+    fn present(&mut self, cached: &Records, key: &str, stamp: Stamp) {
+        if cached
+            .get(key)
+            .is_none_or(|record| record.content != Content::Read(stamp))
+        {
             self.to_read.push((key.to_owned(), stamp));
         }
     }
 
-    fn vanished(&mut self, cached: &Manifest, key: &str) {
+    fn vanished(&mut self, cached: &Records, key: &str) {
         match cached.get(key) {
-            Some(entry) if entry.indexed => self.to_remove.push(key.to_owned()),
+            Some(record) if record.indexed => self.to_remove.push(key.to_owned()),
             Some(_) => self.to_forget.push(key.to_owned()),
             None => {}
         }
     }
 }
 
-pub fn plan(cached: &Manifest, seen: Seen) -> Plan {
+pub fn plan(cached: &Records, seen: Seen) -> Plan {
     let mut plan = Plan::default();
     match seen {
         Seen::All(files) => {
@@ -386,7 +437,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 pub struct Loaded {
-    pub manifest: Manifest,
+    pub records: Records,
     pub cursor: Option<Cursor>,
 }
 
@@ -400,8 +451,11 @@ pub fn load(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Opti
         return None;
     }
     index.restore(&files.index).ok()?;
-    paired().then_some(Loaded {
-        manifest,
+    paired().then(|| Loaded {
+        records: manifest
+            .into_iter()
+            .map(|(key, entry)| (key, Record::from_row(entry)))
+            .collect(),
         cursor: header.cursor,
     })
 }
@@ -412,7 +466,7 @@ pub fn save(
     files: &CacheFiles,
     fingerprint: &str,
     cursor: Option<Cursor>,
-    manifest: &Manifest,
+    records: &Records,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(dir) = files.index.parent() {
         fs::create_dir_all(dir)?;
@@ -424,8 +478,12 @@ pub fn save(
         index: saved,
         cursor,
     };
+    let manifest: Manifest = records
+        .iter()
+        .map(|(key, record)| (key.clone(), record.row()))
+        .collect();
     write_atomic(&files.manifest, |path| {
-        Ok(fs::write(path, serialize(&header, manifest))?)
+        Ok(fs::write(path, serialize(&header, &manifest))?)
     })?;
     Ok(())
 }
@@ -509,6 +567,13 @@ mod tests {
             .collect()
     }
 
+    fn records(entries: &[(&str, Stamp, bool)]) -> Records {
+        cached(entries)
+            .into_iter()
+            .map(|(key, entry)| (key, Record::from_row(entry)))
+            .collect()
+    }
+
     fn header(root: &str, cursor: Option<Cursor>) -> Header {
         Header {
             fingerprint: "fp".into(),
@@ -563,7 +628,7 @@ mod tests {
 
     #[test]
     fn plan_reads_new_and_changed_files_and_drops_every_vanished_one() {
-        let old = cached(&[
+        let old = records(&[
             ("same", stamp(1, 1), true),
             ("changed", stamp(1, 1), true),
             ("gone", stamp(1, 1), true),
@@ -588,7 +653,7 @@ mod tests {
 
     #[test]
     fn plan_of_changes_touches_only_the_named_keys() {
-        let old = cached(&[
+        let old = records(&[
             ("same", stamp(1, 1), true),
             ("changed", stamp(1, 1), true),
             ("gone", stamp(1, 1), true),
@@ -611,6 +676,19 @@ mod tests {
                 to_forget: keys(&["skipped-gone"]),
             }
         );
+    }
+
+    #[test]
+    fn plan_always_reads_an_unread_file_again() {
+        let old = Records::from([(
+            "locked".to_owned(),
+            Record {
+                content: Content::Unread,
+                indexed: true,
+            },
+        )]);
+        let now = scanned(&[("locked", stamp(5, 5))]);
+        assert_eq!(plan(&old, Seen::All(&now)).to_read, [("locked".into(), stamp(5, 5))]);
     }
 
     #[test]
@@ -669,22 +747,22 @@ mod tests {
 
     fn run_in(workspace: &Workspace, dir: &Path, fingerprint: &str) -> LuxIndex {
         let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
-        let mut manifest = Manifest::new();
+        let mut records = Records::new();
         for (key, stamp) in workspace.scan() {
             let body = fs::read_to_string(workspace.src().join(&key));
             if let Ok(body) = &body {
                 index.add(&key, &key, body).unwrap();
             }
-            manifest.insert(
+            records.insert(
                 key,
-                Entry {
-                    stamp,
+                Record {
+                    content: Content::Read(stamp),
                     indexed: body.is_ok(),
                 },
             );
         }
         let files = cache_files(dir, &workspace.0);
-        save(&index, &files, fingerprint, None, &manifest).unwrap();
+        save(&index, &files, fingerprint, None, &records).unwrap();
         index
     }
 
@@ -938,14 +1016,34 @@ mod tests {
             epoch: Epoch(7),
             generation: Gen(3),
         };
-        let manifest = cached(&[("a.md", stamp(5, 1), true)]);
-        save(&index, &files, "fp", Some(cursor), &manifest).unwrap();
+        let records = records(&[("a.md", stamp(5, 1), true)]);
+        save(&index, &files, "fp", Some(cursor), &records).unwrap();
 
         let mut restored = LuxIndex::load(&lux::library_path()).unwrap();
         let loaded = load(&mut restored, &files, "fp").unwrap();
         assert_eq!(loaded.cursor, Some(cursor));
-        assert_eq!(loaded.manifest, manifest);
+        assert_eq!(loaded.records, records);
         assert_eq!(found(&restored, "alpha"), ["a.md"]);
         assert!(load(&mut restored, &files, "other library").is_none());
+    }
+
+    #[test]
+    fn an_unread_file_keeps_its_row_shape_on_disk_and_comes_back_unread() {
+        let workspace = Workspace::new("unread");
+        workspace.write("a.md", b"alpha");
+        let index = run(&workspace, "fp");
+        let files = workspace.files();
+        let unread = Record {
+            content: Content::Unread,
+            indexed: false,
+        };
+        let records = Records::from([("a.md".to_owned(), unread)]);
+        save(&index, &files, "fp", None, &records).unwrap();
+
+        let text = fs::read_to_string(&files.manifest).unwrap();
+        assert!(text.starts_with("recall-cache 3\n"));
+        assert!(text.ends_with("\n18446744073709551615\t18446744073709551615\t0\ta.md\n"), "{text}");
+        let mut restored = LuxIndex::load(&lux::library_path()).unwrap();
+        assert_eq!(load(&mut restored, &files, "fp").unwrap().records, records);
     }
 }

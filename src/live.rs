@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    cache::{self, CacheFiles, Entry, Manifest, Plan, Seen, Stamp},
+    cache::{self, CacheFiles, Content, Plan, Record, Records, Seen, Stamp},
     daemon, ipc,
     lux::LuxIndex,
     scan,
@@ -29,11 +29,6 @@ const BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const MANUAL_GRACE: Duration = Duration::from_secs(1);
 const WATCH_BUFFER_BYTES: usize = 256 * 1024;
-
-const UNREAD: Stamp = Stamp {
-    size: u64::MAX,
-    modified: u64::MAX,
-};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -128,7 +123,7 @@ pub struct Live {
     index: LuxIndex,
     files: Option<CacheFiles>,
     fingerprint: String,
-    manifest: Manifest,
+    records: Records,
     indexed: usize,
     committed: Option<Cursor>,
     received: Option<Cursor>,
@@ -177,12 +172,12 @@ impl Live {
             index = LuxIndex::load(library)?;
         }
         let reused = loaded.is_some();
-        let (manifest, mut committed) =
-            loaded.map_or_else(Default::default, |loaded| (loaded.manifest, loaded.cursor));
-        if manifest.values().any(|entry| entry.stamp == UNREAD) {
+        let (records, mut committed) =
+            loaded.map_or_else(Default::default, |loaded| (loaded.records, loaded.cursor));
+        if records.values().any(|record| record.content == Content::Unread) {
             committed = None;
         }
-        let indexed = manifest.values().filter(|entry| entry.indexed).count();
+        let indexed = records.values().filter(|record| record.indexed).count();
         let (link, engine, via) = match feed(committed) {
             Some(feed) => (Some(feed.link), feed.engine, feed.via),
             None => (None, None, Via::InProcess),
@@ -192,7 +187,7 @@ impl Live {
             index,
             files,
             fingerprint,
-            manifest,
+            records,
             indexed,
             committed,
             received: None,
@@ -418,7 +413,7 @@ impl Live {
             }
             Update::Snapshot { at, files } => self.take_snapshot(&files, Some(at)),
             Update::Delta { at, changes, .. } => {
-                let plan = cache::plan(&self.manifest, Seen::Changes(&changes));
+                let plan = cache::plan(&self.records, Seen::Changes(&changes));
                 let replaced = changes
                     .iter()
                     .map(|change| match change {
@@ -436,7 +431,7 @@ impl Live {
     }
 
     fn take_snapshot(&mut self, files: &BTreeMap<String, Stamp>, at: Option<Cursor>) {
-        let plan = cache::plan(&self.manifest, Seen::All(files));
+        let plan = cache::plan(&self.records, Seen::All(files));
         let replaced = std::mem::take(&mut self.want);
         self.queue(plan, replaced);
         self.received = at;
@@ -516,7 +511,7 @@ impl Live {
     }
 
     fn run_job(&mut self, key: &str, job: Option<Stamp>, last_try: bool) -> Step {
-        let was_indexed = self.manifest.get(key).is_some_and(|entry| entry.indexed);
+        let was_indexed = self.records.get(key).is_some_and(|record| record.indexed);
         let Some(stamp) = job else {
             self.drop_document(key, was_indexed);
             self.record(key, None);
@@ -524,10 +519,10 @@ impl Live {
                 changed: was_indexed,
             };
         };
-        let unindexed = |stamp| {
-            Some(Entry {
-                stamp,
-                indexed: false,
+        let read = |indexed| {
+            Some(Record {
+                content: Content::Read(stamp),
+                indexed,
             })
         };
         match fs::read_to_string(self.root.join(key)) {
@@ -537,7 +532,7 @@ impl Live {
                 if !indexed {
                     self.drop_document(key, was_indexed);
                 }
-                self.record(key, Some(Entry { stamp, indexed }));
+                self.record(key, read(indexed));
                 Step::Done {
                     changed: indexed || was_indexed,
                 }
@@ -550,7 +545,7 @@ impl Live {
                 ) =>
             {
                 self.drop_document(key, was_indexed);
-                self.record(key, unindexed(stamp));
+                self.record(key, read(false));
                 Step::Done {
                     changed: was_indexed,
                 }
@@ -559,8 +554,8 @@ impl Live {
                 if last_try {
                     self.record(
                         key,
-                        Some(Entry {
-                            stamp: UNREAD,
+                        Some(Record {
+                            content: Content::Unread,
                             indexed: was_indexed,
                         }),
                     );
@@ -576,12 +571,12 @@ impl Live {
         }
     }
 
-    fn record(&mut self, key: &str, entry: Option<Entry>) {
-        let was = self.manifest.get(key).is_some_and(|entry| entry.indexed);
-        let now = entry.is_some_and(|entry| entry.indexed);
-        match entry {
-            Some(entry) => self.manifest.insert(key.to_owned(), entry),
-            None => self.manifest.remove(key),
+    fn record(&mut self, key: &str, record: Option<Record>) {
+        let was = self.records.get(key).is_some_and(|record| record.indexed);
+        let now = record.is_some_and(|record| record.indexed);
+        match record {
+            Some(record) => self.records.insert(key.to_owned(), record),
+            None => self.records.remove(key),
         };
         self.indexed = self.indexed - usize::from(was) + usize::from(now);
     }
@@ -606,7 +601,7 @@ impl Live {
             files,
             &self.fingerprint,
             self.committed,
-            &self.manifest,
+            &self.records,
         )
         .is_ok();
         self.save.last_save = Instant::now();
@@ -879,7 +874,7 @@ mod tests {
         cold.send(snapshot(&after, 1));
         cold.drive();
 
-        assert_eq!(warm.live.manifest, cold.live.manifest);
+        assert_eq!(warm.live.records, cold.live.records);
         assert_eq!(warm.live.indexed_files(), cold.live.indexed_files());
         for query in ["alpha", "beta", "gamma", "delta", "rewritten", "first"] {
             assert_eq!(
@@ -941,7 +936,7 @@ mod tests {
         );
 
         rig.drive();
-        assert_eq!(rig.live.manifest["a.md"].stamp, new);
+        assert_eq!(rig.live.records["a.md"].content, Content::Read(new));
 
         rig.send(delta(2, 3, vec![upsert("a.md", old)]));
         rig.send(delta(3, 4, vec![Change::Remove("a.md".into())]));
@@ -953,7 +948,7 @@ mod tests {
         );
         rig.drive();
         assert!(found(&rig.live, "alpha").is_empty());
-        assert!(rig.live.manifest.is_empty());
+        assert!(rig.live.records.is_empty());
     }
 
     #[cfg(windows)]
@@ -983,13 +978,12 @@ mod tests {
         assert_eq!(rig.live.attempts["a.md"].0, 1);
 
         let end = Instant::now() + Duration::from_secs(10);
-        while rig.live.manifest.get("a.md").map(|entry| entry.stamp) != Some(UNREAD) {
+        while rig.live.records.get("a.md").map(|record| record.content) != Some(Content::Unread) {
             rig.live.tick();
             assert!(Instant::now() < end, "never marked unread");
             thread::sleep(Duration::from_millis(1));
         }
-        let entry = rig.live.manifest["a.md"];
-        assert_eq!((entry.stamp, entry.indexed), (UNREAD, false));
+        assert!(!rig.live.records["a.md"].indexed);
         assert!(found(&rig.live, "alpha").is_empty());
         assert_eq!(rig.live.pending(), 1, "it keeps being retried");
 
@@ -998,7 +992,7 @@ mod tests {
         rig.live.attempts.get_mut("a.md").unwrap().1 = Instant::now();
         rig.drive();
         assert_eq!(found(&rig.live, "alpha"), ["a.md"]);
-        assert!(rig.live.manifest["a.md"].indexed);
+        assert!(rig.live.records["a.md"].indexed);
     }
 
     #[test]
@@ -1011,8 +1005,8 @@ mod tests {
         rig.drive();
         rig.live.record(
             "a.md",
-            Some(Entry {
-                stamp: UNREAD,
+            Some(Record {
+                content: Content::Unread,
                 indexed: false,
             }),
         );
@@ -1077,7 +1071,7 @@ mod tests {
 
         let reopened = project.rig(Some(&project.cache));
         assert_eq!(reopened.live.committed, Some(cursor(5)));
-        assert!(reopened.live.manifest.contains_key("b.md"));
+        assert!(reopened.live.records.contains_key("b.md"));
         assert_eq!(found(&reopened.live, "bravo"), ["b.md"]);
     }
 
@@ -1228,7 +1222,7 @@ mod tests {
         let tick = rig.live.tick();
         assert_eq!(tick.changed, ["a.md"], "an unreadable file changes nothing");
         assert_eq!(tick.pending, 0);
-        assert!(!rig.live.manifest["bad.txt"].indexed);
+        assert!(!rig.live.records["bad.txt"].indexed);
         assert_eq!(rig.live.indexed_files(), 1);
     }
 
@@ -1239,12 +1233,12 @@ mod tests {
         let mut rig = project.rig(None);
         rig.send(snapshot(&project.walk(), 1));
         rig.drive();
-        assert!(rig.live.manifest.contains_key("c.txt"));
+        assert!(rig.live.records.contains_key("c.txt"));
 
         rig.send(delta(1, 2, vec![Change::Remove("c.txt".into())]));
         rig.live.drain(Duration::ZERO);
         assert_eq!(rig.live.pending(), 0);
-        assert!(rig.live.manifest.is_empty());
+        assert!(rig.live.records.is_empty());
     }
 
     #[test]
@@ -1563,8 +1557,8 @@ mod tests {
         rig.send(snapshot(&files, 1));
         rig.drive();
         assert_eq!(rig.live.pending(), 0, "it is not retried");
-        let entry = rig.live.manifest["denied.md"];
-        assert_eq!((entry.stamp, entry.indexed), (stamp, false));
+        let record = rig.live.records["denied.md"];
+        assert_eq!((record.content, record.indexed), (Content::Read(stamp), false));
         assert_eq!(found(&rig.live, "alpha"), ["ok.md"]);
         rig.settled();
         assert_eq!(rig.live.committed, Some(cursor(1)), "the cursor still advances");
@@ -1766,7 +1760,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
             assert!(found(&live, "lockedtoken").is_empty());
-            assert_eq!(live.manifest["a.md"].stamp, UNREAD, "a close or crash re-reads it");
+            assert_eq!(live.records["a.md"].content, Content::Unread, "a close or crash re-reads it");
             drop(lock);
             tick_until(&mut live, "a.md is searchable after the unlock", |live| {
                 found(live, "lockedtoken") == ["a.md"]
