@@ -951,6 +951,43 @@ mod tests {
         assert!(rig.live.records.is_empty());
     }
 
+    fn tries(live: &Live, key: &str) -> Option<u8> {
+        live.attempts.get(key).map(|(tries, _)| *tries)
+    }
+
+    #[test]
+    fn a_requeued_job_keeps_its_backoff_only_while_the_job_is_the_same() {
+        let project = Project::new("backoff");
+        let (old, new) = (Stamp { size: 1, modified: 1 }, Stamp { size: 2, modified: 2 });
+        let ghost = BTreeMap::from([("ghost.md".to_owned(), old)]);
+        let mut rig = project.rig(None);
+        rig.live.backoff = Duration::from_secs(60);
+        rig.send(snapshot(&ghost, 1));
+        rig.live.tick();
+        assert_eq!(tries(&rig.live, "ghost.md"), Some(1), "a missing file is retried");
+        assert!(rig.live.poll_wait() > Duration::ZERO, "the retry is not due yet");
+
+        rig.send(snapshot(&ghost, 2));
+        rig.send(delta(2, 3, vec![upsert("ghost.md", old)]));
+        rig.live.tick();
+        assert_eq!(tries(&rig.live, "ghost.md"), Some(1), "the same job keeps its backoff");
+
+        rig.send(delta(3, 4, vec![upsert("ghost.md", new)]));
+        rig.live.drain(Duration::ZERO);
+        assert_eq!(tries(&rig.live, "ghost.md"), None, "a new job starts over");
+        assert_eq!(rig.live.poll_wait(), Duration::ZERO);
+        rig.live.tick();
+        assert_eq!(tries(&rig.live, "ghost.md"), Some(1));
+
+        rig.send(delta(4, 5, vec![upsert("ghost.md", new), upsert("ghost.md", old), upsert("ghost.md", new)]));
+        rig.live.drain(Duration::ZERO);
+        assert_eq!(tries(&rig.live, "ghost.md"), Some(1), "only the last change for a key counts");
+
+        rig.send(delta(5, 6, vec![Change::Remove("ghost.md".into())]));
+        rig.live.drain(Duration::ZERO);
+        assert_eq!((rig.live.pending(), tries(&rig.live, "ghost.md")), (0, None));
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_locked_file_is_retried_then_marked_unread_not_lost() {
