@@ -167,6 +167,7 @@ fn draw_indexing(frame: &mut Frame, root: &Path, completed: usize, total: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lux;
 
     fn summary(reused: bool, updated: usize, removed: usize, saved: bool) -> Summary {
         Summary {
@@ -196,5 +197,11 @@ mod tests {
             describe_startup(&summary(true, 3, 1, false)),
             "Cache refreshed: 3 changed, 1 removed · 12 files"
         );
+    }
+
+    #[test]
+    fn opening_a_missing_folder_is_an_error_not_a_panic() {
+        let missing = std::env::temp_dir().join("recall-missing-folder-xyz");
+        assert!(open_project(missing, &lux::library_path()).is_err());
     }
 }
