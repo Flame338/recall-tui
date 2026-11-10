@@ -4,15 +4,14 @@ use ratatui::{
 };
 
 use crate::{
-    lux::{LuxIndex, MARK_END, MARK_START},
+    lux::{MARK_END, MARK_START},
+    shelf::{self, Request, Source},
     view::sanitize_for_display,
 };
 
-pub(super) fn build_preview(index: &LuxIndex, key: &str, query: &str) -> Vec<Line<'static>> {
-    let body = index.stored(key, "body").unwrap_or_default();
-    let marked = index
-        .snippet(key, "body", query, body.len().max(1))
-        .unwrap_or(body);
+pub(super) fn build_preview(source: &Source, key: &str, request: &Request) -> Vec<Line<'static>> {
+    let body = source.index.stored(key, "body").unwrap_or_default();
+    let marked = shelf::snippet(source, key, request, body.len().max(1)).unwrap_or(body);
     preview_lines(&marked)
 }
 
@@ -97,7 +96,10 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lux;
+    use crate::{
+        lux::{self, LuxIndex},
+        shelf::{Mode, Project, Reach, parse_request},
+    };
     use ratatui::{
         buffer::Buffer,
         layout::Rect,
@@ -169,7 +171,14 @@ mod tests {
                 "first line\n\twhile we are testing grounds\nlast line\n",
             )
             .unwrap();
-        let lines = build_preview(&index, "note.md", "testin");
+        let project = Project::at("F:/work/note");
+        let source = Source {
+            project: &project,
+            index: &index,
+            here: true,
+        };
+        let request = parse_request("testin", Mode::Fuzzy, Reach::Here);
+        let lines = build_preview(&source, "note.md", &request);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans[0].content.trim(), "2 │");
         let seen = texts(&lines[0]);
