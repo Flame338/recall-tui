@@ -83,9 +83,16 @@ pub struct Shard {
     pub index: LuxIndex,
 }
 
+struct Origin {
+    cache_dir: PathBuf,
+    library: PathBuf,
+    except: Option<PathBuf>,
+}
+
 #[derive(Default)]
 pub struct Shelf {
     shards: Vec<Shard>,
+    origin: Option<Origin>,
 }
 
 fn same_root(left: &str, right: &str) -> bool {
@@ -100,6 +107,7 @@ fn same_root(left: &str, right: &str) -> bool {
 
 impl Shelf {
     pub fn load(cache_dir: &Path, library: &Path, except: Option<&Path>) -> Self {
+        let except_path = except.map(Path::to_path_buf);
         let except = except.map(|path| path.to_string_lossy().into_owned());
         let fingerprint = cache::fingerprint(library);
         let shards = cache::list_entries(cache_dir)
@@ -124,7 +132,14 @@ impl Shelf {
                 })
             })
             .collect();
-        Self::from_shards(shards)
+        Self {
+            origin: Some(Origin {
+                cache_dir: cache_dir.to_path_buf(),
+                library: library.to_path_buf(),
+                except: except_path,
+            }),
+            ..Self::from_shards(shards)
+        }
     }
 
     pub fn from_shards(mut shards: Vec<Shard>) -> Self {
@@ -135,7 +150,16 @@ impl Shelf {
                 shard.project.root.clone(),
             )
         });
-        Self { shards }
+        Self {
+            shards,
+            origin: None,
+        }
+    }
+
+    pub fn reload(&mut self) {
+        if let Some(origin) = self.origin.take() {
+            *self = Self::load(&origin.cache_dir, &origin.library, origin.except.as_deref());
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -845,6 +869,40 @@ mod tests {
                 .is_empty()
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_rereads_the_saved_indexes_from_where_the_shelf_was_loaded() {
+        let dir = temp_dir("reload");
+        let library = library_path();
+        let kept = project_dir(&dir, "kept");
+        let open = project_dir(&dir, "open");
+        let dropped = project_dir(&dir, "dropped");
+        save_current(&dir, &kept, "watcher");
+        save_current(&dir, &open, "watcher");
+        save_current(&dir, &dropped, "watcher");
+        let mut shelf = Shelf::load(&dir, &library, Some(&open));
+        assert_eq!(loaded_names(&shelf), ["dropped", "kept"]);
+
+        fs::remove_dir_all(&dropped).unwrap();
+        save_current(&dir, &project_dir(&dir, "added"), "watcher");
+        index_of(&"fresh body ".repeat(40))
+            .save(&cache::cache_files(&dir, &kept).index)
+            .unwrap();
+        shelf.reload();
+        assert_eq!(loaded_names(&shelf), ["added"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+        shelf.reload();
+        assert!(shelf.shards().is_empty());
+    }
+
+    #[test]
+    fn reloading_a_shelf_made_from_shards_changes_nothing() {
+        let mut shelf = Shelf::from_shards(vec![watchers("beta"), watchers("alpha")]);
+        shelf.reload();
+        assert_eq!(loaded_names(&shelf), ["alpha", "beta"]);
+        Shelf::default().reload();
     }
 
     #[test]

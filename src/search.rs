@@ -288,6 +288,9 @@ fn apply(app: &mut App, live: &mut Live, action: Action) -> Option<Exit> {
         Action::Quit => return Some(Exit::Quit),
         Action::SwitchProject => return Some(Exit::SwitchProject),
         Action::Rescan => {
+            app.shelf.reload();
+            app.preview_for = None;
+            refresh_hits(app, live.index());
             live.rescan();
             app.status = if *live.mode() == live::Mode::Gone {
                 GONE.into()

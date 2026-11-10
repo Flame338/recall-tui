@@ -1107,3 +1107,73 @@ fn enter_on_a_hit_whose_file_is_gone_says_so_instead_of_opening() {
     rig.press(plain(KeyCode::Enter));
     assert_eq!(status_of(&rig), "File is gone: far.md");
 }
+
+fn save_project(cache_dir: &Path, root: &Path, body: &str) {
+    let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+    index.add("a.md", "a.md", body).unwrap();
+    let files = crate::cache::cache_files(cache_dir, root);
+    let fingerprint = crate::cache::fingerprint(&lux::library_path());
+    crate::cache::save(&index, &files, &fingerprint, None, &Default::default()).unwrap();
+}
+
+#[test]
+fn ctrl_r_reloads_the_other_projects_and_reruns_the_query() {
+    let mut rig = Rig::new("reload-ui");
+    let base = picker_dir("reload-ui-saved");
+    let cache = base.join("cache");
+    let alpha = base.join("alpha");
+    let zeta = base.join("zeta");
+    for dir in [&cache, &alpha, &zeta] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    save_project(&cache, &alpha, "zebra alpha");
+    save_project(&cache, &zeta, "zebra zeta");
+    rig.app.shelf = Shelf::load(&cache, &lux::library_path(), None);
+    rig.press(ctrl('e'));
+    rig.type_text("zebra");
+    assert_eq!(rig.app.hits.len(), 14);
+    rig.app.selected = rig.app.hits.iter().position(|hit| hit.source == 2).unwrap();
+
+    fs::remove_dir_all(&zeta).unwrap();
+    assert_eq!(rig.press(ctrl('r')), None);
+    assert_eq!(rig.app.shelf.len(), 1);
+    assert_eq!(rig.app.hits.len(), 13);
+    assert!(rig.app.hits.iter().all(|hit| hit.source <= 1));
+    assert!(rig.app.selected < rig.app.hits.len());
+    assert!(rescanning(&rig.app.status));
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn ctrl_r_rebuilds_the_preview_of_a_hit_whose_source_position_now_holds_another_project() {
+    let mut rig = Rig::new("reload-preview");
+    let base = picker_dir("reload-preview-saved");
+    let cache = base.join("cache");
+    let first = base.join("pa_x");
+    let second = base.join("pb_x");
+    for dir in [&cache, &first, &second] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    save_project(&cache, &first, "zebra firstword");
+    save_project(&cache, &second, "zebra secondword");
+    rig.app.shelf = Shelf::load(&cache, &lux::library_path(), None);
+    rig.type_text("@_x zebra");
+    let preview = |rig: &Rig| {
+        rig.app
+            .preview
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<String>()
+    };
+    rig.app.selected = rig.app.hits.iter().position(|hit| hit.source == 1).unwrap();
+    rig.press(plain(KeyCode::Down));
+    rig.press(plain(KeyCode::Up));
+    assert!(preview(&rig).contains("firstword"), "{}", preview(&rig));
+
+    fs::remove_dir_all(&first).unwrap();
+    rig.press(ctrl('r'));
+    assert_eq!(rig.app.hits.len(), 1);
+    assert_eq!(rig.app.hits[0].source, 1);
+    assert!(preview(&rig).contains("secondword"), "{}", preview(&rig));
+    let _ = fs::remove_dir_all(&base);
+}
