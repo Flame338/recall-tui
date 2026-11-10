@@ -133,6 +133,7 @@ impl Shelf {
         Self { shards }
     }
 
+    #[cfg(test)]
     pub fn shards(&self) -> &[Shard] {
         &self.shards
     }
@@ -783,6 +784,6 @@ mod tests {
                 .shards()
                 .is_empty()
         );
-        fs::remove_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

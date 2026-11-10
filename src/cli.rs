@@ -631,7 +631,7 @@ mod tests {
             &library,
         );
         assert!(json.stdout.contains(r#""root": "F:/work/Zeta""#));
-        fs::remove_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -653,7 +653,7 @@ mod tests {
                 )
             );
         }
-        fs::remove_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
