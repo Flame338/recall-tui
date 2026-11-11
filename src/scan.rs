@@ -1,6 +1,21 @@
-use std::{collections::BTreeMap, error::Error, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    env,
+    error::Error,
+    fs::{self, File},
+    io::{self, BufRead, BufReader},
+    iter,
+    num::NonZero,
+    path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
 
-use ignore::WalkBuilder;
+use ignore::{
+    Match,
+    gitignore::{Gitignore, GitignoreBuilder, Glob},
+};
 
 use crate::{
     cache::Stamp,
@@ -12,74 +27,425 @@ const INDEX_EXTENSIONS: &[&str] = &[
     "js", "jsx", "ts", "tsx", "json", "toml", "yaml", "yml", "ini", "sh", "bat", "ps1", "html",
     "css", "sql", "cmake",
 ];
-const MAX_FILE_BYTES: u64 = 512 * 1024;
+pub const MAX_FILE_BYTES: u64 = 512 * 1024;
+// The daemon walks in the background while the user works, so the walk takes
+// at most half the logical CPUs. Past 4 threads, listing folders waits on the
+// file system: on C:\ 8 threads cut the walk 4.6 s to 3.6 s for 30% more CPU.
+const MAX_WALK_THREADS: usize = 4;
+const TICK_EVERY: Duration = Duration::from_millis(15);
 
+/// Lists the indexable files under `root` that `scope` covers, honouring
+/// `.gitignore`, `.ignore`, `.git/info/exclude`, the global git excludes file
+/// and the rule files of `root`'s parents. `tick` runs on the calling thread
+/// about every 15 ms with the count so far; `false` cancels the walk.
 pub fn walk(
     root: &Path,
     scope: &Scope,
+    tick: impl FnMut(usize, &str) -> Result<bool, Box<dyn Error>>,
+) -> Result<Option<Observed>, Box<dyn Error>> {
+    let cpus = thread::available_parallelism().map_or(1, NonZero::get);
+    walk_with(root, scope, (cpus / 2).clamp(1, MAX_WALK_THREADS), tick)
+}
+
+pub fn walk_with(
+    root: &Path,
+    scope: &Scope,
+    threads: usize,
     mut tick: impl FnMut(usize, &str) -> Result<bool, Box<dyn Error>>,
 ) -> Result<Option<Observed>, Box<dyn Error>> {
-    let prune_root = root.to_path_buf();
-    let prune_scope = scope.clone();
-    let walker = WalkBuilder::new(root)
-        .hidden(false)
-        .require_git(false)
-        .follow_links(false)
-        .filter_entry(move |entry| {
-            entry.depth() == 0
-                || !entry.file_type().is_some_and(|kind| kind.is_dir())
-                || entry.file_name().to_str().is_some_and(enters_dir)
-                    && key_of(&prune_root, entry.path()).is_some_and(|dir| prune_scope.enters(&dir))
-        })
-        .build();
-    let mut found = BTreeMap::new();
-    let mut latest = String::new();
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if walk_error_is_fatal(&error, root) => return Err(error.into()),
-            Err(_) => continue,
-        };
-        if !tick(found.len(), &latest)? {
-            return Ok(None);
+    let outside = Outside::of(root);
+    let queue = Queue::new(Dir {
+        path: root.to_path_buf(),
+        key: String::new(),
+        rules: None,
+    });
+    let (sender, inbox) = mpsc::channel();
+    let collected = thread::scope(|threads_scope| {
+        for _ in 0..threads.max(1) {
+            let sender = sender.clone();
+            let (queue, outside) = (&queue, &outside);
+            threads_scope.spawn(move || {
+                let walker = Walker {
+                    root,
+                    scope,
+                    outside,
+                };
+                walker.run(queue, &sender);
+            });
         }
-        let admitted = entry.file_type().is_some_and(|kind| kind.is_file())
-            && entry.file_name().to_str().is_some_and(is_indexable);
-        let Some(key) = admitted.then(|| key_of(root, entry.path())).flatten() else {
-            continue;
-        };
-        if !scope.covers(&key) {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.len() > MAX_FILE_BYTES {
-            continue;
-        }
-        found.insert(key.clone(), Stamp::of(&metadata));
-        latest = key;
-    }
-    Ok(Some(Observed {
+        drop(sender);
+        let collected = collect(&inbox, &mut tick);
+        queue.stop();
+        collected
+    })?;
+    Ok(collected.map(|found| Observed {
         scope: scope.clone(),
         found,
     }))
 }
 
-// Failing the walk keeps files under an unreadable folder in the index. A permission
-// error never clears on its own, so it counts as absent instead of stalling every walk.
-fn walk_error_is_fatal(error: &ignore::Error, root: &Path) -> bool {
-    match error.io_error().map(std::io::Error::kind) {
-        Some(std::io::ErrorKind::PermissionDenied) | None => false,
-        Some(std::io::ErrorKind::NotFound) => !root.exists(),
-        Some(_) => true,
+type Batch = Result<Vec<(String, Stamp)>, io::Error>;
+
+fn collect(
+    inbox: &mpsc::Receiver<Batch>,
+    tick: &mut impl FnMut(usize, &str) -> Result<bool, Box<dyn Error>>,
+) -> Result<Option<BTreeMap<String, Stamp>>, Box<dyn Error>> {
+    let mut found = BTreeMap::new();
+    let mut latest = String::new();
+    loop {
+        if !tick(found.len(), &latest)? {
+            return Ok(None);
+        }
+        let due = Instant::now() + TICK_EVERY;
+        loop {
+            match inbox.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                Ok(Ok(batch)) => {
+                    if let Some((key, _)) = batch.last() {
+                        latest.clone_from(key);
+                    }
+                    found.extend(batch);
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(Some(found)),
+            }
+        }
     }
 }
 
-fn key_of(root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root).ok()?;
-    let parts: Option<Vec<&str>> = relative.iter().map(|part| part.to_str()).collect();
-    Some(parts?.join("/"))
+struct Dir {
+    path: PathBuf,
+    key: String,
+    rules: Option<Arc<Level>>,
+}
+
+/// Rule files of one folder inside the root, linked to the nearest enclosing
+/// folder that has any. Folders without rule files add no level.
+struct Level {
+    rules: Rules,
+    parent: Option<Arc<Level>>,
+}
+
+struct Rules {
+    ignore: Gitignore,
+    git: Gitignore,
+    exclude: Gitignore,
+}
+
+impl Rules {
+    /// `listed` says whether the folder may hold an entry by that name. The
+    /// file is then opened by its lower-case name, so a case-insensitive disk
+    /// finds `.GITIGNORE` the way git does.
+    fn read(dir: &Path, listed: impl Fn(&str) -> bool) -> Rules {
+        let load = |name: &str| {
+            if listed(name) {
+                compile(dir, &dir.join(name))
+            } else {
+                Gitignore::empty()
+            }
+        };
+        let exclude = match listed(".git").then(|| git_dir(dir)).flatten() {
+            Some(git) => compile(dir, &git.join("info/exclude")),
+            None => Gitignore::empty(),
+        };
+        Rules {
+            ignore: load(".ignore"),
+            git: load(".gitignore"),
+            exclude,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ignore.is_empty() && self.git.is_empty() && self.exclude.is_empty()
+    }
+}
+
+fn compile(dir: &Path, file: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(dir);
+    builder.add(file);
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+/// The folder holding `info/exclude`: `.git` itself, or for a worktree whose
+/// `.git` is a file, the common dir its `gitdir:` line leads to.
+fn git_dir(dir: &Path) -> Option<PathBuf> {
+    let git = dir.join(".git");
+    if !git.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Some(git);
+    }
+    let first_line = |path: &Path| BufReader::new(File::open(path).ok()?).lines().next()?.ok();
+    let real = PathBuf::from(first_line(&git)?.strip_prefix("gitdir: ")?);
+    let common = first_line(&real.join("commondir"))?;
+    Some(if common.starts_with('.') {
+        real.join(common)
+    } else {
+        PathBuf::from(common)
+    })
+}
+
+/// Rules that come from outside the root: the root's parent folders,
+/// nearest first, and the global git excludes file.
+struct Outside {
+    canonical: PathBuf,
+    parents: Vec<Rules>,
+    global: Gitignore,
+}
+
+impl Outside {
+    fn of(root: &Path) -> Outside {
+        let canonical = root.canonicalize().ok();
+        let parents = canonical
+            .iter()
+            .flat_map(|path| path.ancestors().skip(1))
+            .map(|dir| Rules::read(dir, |_| true))
+            .filter(|rules| !rules.is_empty())
+            .collect();
+        let global = env::current_dir().map_or_else(
+            |_| Gitignore::empty(),
+            |cwd| GitignoreBuilder::new(cwd).build_global().0,
+        );
+        Outside {
+            canonical: canonical.unwrap_or_default(),
+            parents,
+            global,
+        }
+    }
+}
+
+struct Walker<'a> {
+    root: &'a Path,
+    scope: &'a Scope,
+    outside: &'a Outside,
+}
+
+impl Walker<'_> {
+    fn run(&self, queue: &Queue, sender: &mpsc::Sender<Batch>) {
+        // A thread that dies mid-folder never finishes it, so without this the
+        // others would wait for it forever instead of letting the panic surface.
+        struct StopOnPanic<'a>(&'a Queue);
+        impl Drop for StopOnPanic<'_> {
+            fn drop(&mut self) {
+                if thread::panicking() {
+                    self.0.stop();
+                }
+            }
+        }
+        let _guard = StopOnPanic(queue);
+        while let Some(dir) = queue.next() {
+            let mut subdirs = Vec::new();
+            let mut found = Vec::new();
+            let listed = self.list(&dir, &mut subdirs, &mut found);
+            queue.finish(subdirs);
+            let sent = match listed {
+                Err(error) => {
+                    queue.stop();
+                    sender.send(Err(error))
+                }
+                Ok(()) if found.is_empty() => Ok(()),
+                Ok(()) => sender.send(Ok(found)),
+            };
+            if sent.is_err() {
+                queue.stop();
+            }
+        }
+    }
+
+    fn list(
+        &self,
+        dir: &Dir,
+        subdirs: &mut Vec<Dir>,
+        found: &mut Vec<(String, Stamp)>,
+    ) -> Result<(), io::Error> {
+        let mut wanted = Vec::new();
+        let mut dotted = Vec::new();
+        for entry in self.check(fs::read_dir(&dir.path))?.into_iter().flatten() {
+            let Some(entry) = self.check(entry)? else {
+                continue;
+            };
+            let Some(kind) = self.check(entry.file_type())? else {
+                continue;
+            };
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                dotted.push(name.clone());
+            }
+            let admitted = if kind.is_dir() {
+                enters_dir(&name)
+            } else {
+                kind.is_file() && is_indexable(&name)
+            };
+            if admitted {
+                wanted.push((entry, kind, name));
+            }
+        }
+        let rules = Rules::read(&dir.path, |rule| {
+            dotted
+                .iter()
+                .any(|name| name.to_uppercase() == rule.to_uppercase())
+        });
+        let rules = if rules.is_empty() {
+            dir.rules.clone()
+        } else {
+            Some(Arc::new(Level {
+                rules,
+                parent: dir.rules.clone(),
+            }))
+        };
+        for (entry, kind, name) in wanted {
+            let key = if dir.key.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{}/{name}", dir.key)
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                if self.scope.enters(&key) && !self.ignored(rules.as_deref(), &path, true) {
+                    subdirs.push(Dir {
+                        path,
+                        key,
+                        rules: rules.clone(),
+                    });
+                }
+                continue;
+            }
+            if !self.scope.covers(&key) || self.ignored(rules.as_deref(), &path, false) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() <= MAX_FILE_BYTES {
+                found.push((key, Stamp::of(&metadata)));
+            }
+        }
+        Ok(())
+    }
+
+    fn check<T>(&self, result: io::Result<T>) -> io::Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if walk_error_is_fatal(&error, self.root) => Err(error),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The nearest rule wins within each source, and `.ignore` beats
+    /// `.gitignore`, which beats `.git/info/exclude`, which beats the global
+    /// excludes file.
+    fn ignored(&self, level: Option<&Level>, path: &Path, is_dir: bool) -> bool {
+        let mut outside_path = None;
+        let mut nearest = |source: fn(&Rules) -> &Gitignore| -> Match<&Glob> {
+            let levels = iter::successors(level, |level| level.parent.as_deref());
+            let inside = levels
+                .map(|level| source(&level.rules).matched(path, is_dir))
+                .find(|found| !found.is_none());
+            if let Some(found) = inside {
+                return found;
+            }
+            if self.outside.parents.is_empty() {
+                return Match::None;
+            }
+            let path = outside_path.get_or_insert_with(|| {
+                let relative = path.strip_prefix(self.root).unwrap_or(path);
+                self.outside.canonical.join(relative)
+            });
+            self.outside
+                .parents
+                .iter()
+                .map(|rules| source(rules).matched(&*path, is_dir))
+                .find(|found| !found.is_none())
+                .unwrap_or(Match::None)
+        };
+        let sources: [fn(&Rules) -> &Gitignore; 3] = [
+            |rules| &rules.ignore,
+            |rules| &rules.git,
+            |rules| &rules.exclude,
+        ];
+        sources
+            .into_iter()
+            .map(&mut nearest)
+            .find(|found| !found.is_none())
+            .unwrap_or_else(|| self.outside.global.matched(path, is_dir))
+            .is_ignore()
+    }
+}
+
+/// Folders waiting to be listed, shared by the walk's threads. The walk is
+/// over when nothing is waiting and no thread is listing.
+struct Queue {
+    state: Mutex<Waiting>,
+    wake: Condvar,
+}
+
+struct Waiting {
+    dirs: Vec<Dir>,
+    listing: usize,
+    stopped: bool,
+}
+
+impl Queue {
+    fn new(root: Dir) -> Queue {
+        Queue {
+            state: Mutex::new(Waiting {
+                dirs: vec![root],
+                listing: 0,
+                stopped: false,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Waiting> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn next(&self) -> Option<Dir> {
+        let mut state = self.lock();
+        loop {
+            if state.stopped {
+                return None;
+            }
+            if let Some(dir) = state.dirs.pop() {
+                state.listing += 1;
+                return Some(dir);
+            }
+            if state.listing == 0 {
+                return None;
+            }
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn finish(&self, subdirs: Vec<Dir>) {
+        let mut state = self.lock();
+        state.listing -= 1;
+        let woken = !subdirs.is_empty() || state.listing == 0;
+        state.dirs.extend(subdirs);
+        drop(state);
+        if woken {
+            self.wake.notify_all();
+        }
+    }
+
+    fn stop(&self) {
+        self.lock().stopped = true;
+        self.wake.notify_all();
+    }
+}
+
+// Failing the walk keeps files under an unreadable folder in the index. A permission
+// error never clears on its own, so it counts as absent instead of stalling every walk.
+fn walk_error_is_fatal(error: &io::Error, root: &Path) -> bool {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => false,
+        io::ErrorKind::NotFound => !root.exists(),
+        _ => true,
+    }
 }
 
 pub struct Disk<'a>(pub &'a Path);
@@ -145,10 +511,13 @@ mod tests {
     use std::{collections::BTreeSet, env, path::PathBuf, process, time::Instant};
 
     fn full_walk(root: &Path) -> BTreeMap<String, Stamp> {
-        walk(root, &Scope::ROOT, |_, _| Ok(true))
+        let found = walk(root, &Scope::ROOT, |_, _| Ok(true))
             .unwrap()
             .unwrap()
-            .found
+            .found;
+        let old = crate::bench::reference_walk(root).unwrap();
+        assert_eq!(found, old, "ORACLE");
+        found
     }
 
     struct Project(PathBuf);
@@ -229,6 +598,85 @@ mod tests {
         project.write("b.md", "b");
         let outcome = walk(&project.0, &Scope::ROOT, |_, _| Ok(false)).unwrap();
         assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn an_error_from_tick_fails_the_walk() {
+        let project = Project::new("tick-error");
+        project.write("a.md", "a");
+        assert!(walk(&project.0, &Scope::ROOT, |_, _| Err("stop".into())).is_err());
+    }
+
+    #[test]
+    fn a_walk_on_many_threads_finds_exactly_what_the_rules_allow() {
+        let project = Project::new("wide");
+        project.write(".gitignore", "d1*/\n*.log.md\n");
+        let mut expected = vec![".gitignore".to_owned()];
+        for n in 0..40 {
+            project.write(&format!("d{n:02}/x.md"), "x");
+            project.write(&format!("d{n:02}/x.log.md"), "log");
+            project.write(&format!("d{n:02}/deep/er/y.rs"), "y");
+            if !(10..20).contains(&n) {
+                expected.push(format!("d{n:02}/deep/er/y.rs"));
+                expected.push(format!("d{n:02}/x.md"));
+            }
+        }
+        expected.sort();
+        let mut counts = Vec::new();
+        let found = walk_with(&project.0, &Scope::ROOT, 8, |count, _| {
+            counts.push(count);
+            Ok(true)
+        })
+        .unwrap()
+        .unwrap()
+        .found;
+        assert_eq!(found.into_keys().collect::<Vec<_>>(), expected);
+        assert!(counts.is_sorted(), "{counts:?}");
+    }
+
+    #[test]
+    fn ignore_files_beat_gitignore_files() {
+        let project = Project::new("precedence");
+        project.write(".gitignore", "*.md\n");
+        project.write(".ignore", "!keep.md\n");
+        project.write("keep.md", "kept by .ignore");
+        project.write("drop.md", "dropped by .gitignore");
+        assert_eq!(project.scan(), [".gitignore", "keep.md"]);
+    }
+
+    #[test]
+    fn git_info_exclude_applies() {
+        let project = Project::new("exclude");
+        project.write(".git/info/exclude", "secret.md\n");
+        project.write("secret.md", "excluded");
+        project.write("keep.md", "kept");
+        assert_eq!(project.scan(), ["keep.md"]);
+    }
+
+    #[test]
+    fn a_worktree_applies_the_exclude_file_of_its_common_dir() {
+        let project = Project::new("worktree");
+        let common = project.0.join("repo.git");
+        let gitdir = common.join("worktrees/wt");
+        project.write("repo.git/info/exclude", "secret.md\n");
+        project.write("repo.git/worktrees/wt/commondir", "../..\n");
+        project.write("wt/.git", &format!("gitdir: {}\n", gitdir.display()));
+        project.write("wt/secret.md", "excluded");
+        project.write("wt/keep.md", "kept");
+        let found: Vec<String> = full_walk(&project.0.join("wt")).into_keys().collect();
+        assert_eq!(found, ["keep.md"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rule_file_named_in_another_case_applies() {
+        let project = Project::new("case");
+        project.write(".GITIGNORE", "private.md\n");
+        project.write("sub/.Ignore", "local.md\n");
+        project.write("private.md", "ignored");
+        project.write("sub/local.md", "ignored");
+        project.write("keep.md", "kept");
+        assert_eq!(project.scan(), ["keep.md"]);
     }
 
     #[test]

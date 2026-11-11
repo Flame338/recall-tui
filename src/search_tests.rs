@@ -159,7 +159,11 @@ impl Rig {
     }
 
     fn event(&mut self, event: Event) -> Option<Exit> {
-        handle_event(&mut self.app, &mut self.live, event, &no_disk)
+        let exit = handle_event(&mut self.app, &mut self.live, event, &no_disk);
+        if self.app.loading {
+            load_shelf(&mut self.app, self.live.index());
+        }
+        exit
     }
 
     fn press(&mut self, key: KeyEvent) -> Option<Exit> {
@@ -1027,7 +1031,14 @@ fn the_status_says_how_many_projects_could_not_be_searched() {
     let (here, shelf) = status_sources();
     let all = sources(Some((&here.project, &here.index)), &shelf);
     let request = parse_request("zebra", Mode::Fuzzy, Reach::Everywhere);
-    let text = |outcome: &shelf::Outcome| status_text(&request, outcome, &all, 7);
+    let text = |outcome: &shelf::Outcome| {
+        let scoped: Vec<&str> = outcome
+            .searched
+            .iter()
+            .map(|position| all[*position].project.name.as_str())
+            .collect();
+        status_text(&request, outcome, &all, &scoped, 7)
+    };
     assert_eq!(
         text(&outcome_of(3, &[0, 1, 2], &[2])),
         "3 results across 3 projects · Enter opens selected file · 1 could not be searched"
@@ -1053,7 +1064,8 @@ fn a_query_problem_wins_over_the_counts() {
     let request = parse_request("(", Mode::Syntax, Reach::Everywhere);
     let mut outcome = outcome_of(0, &[0, 1, 2], &[]);
     outcome.problem = Some(Problem { offset: 0 });
-    assert_eq!(status_text(&request, &outcome, &all, 7), BAD_QUERY);
+    let scoped = ["here", "alpha", "beta"];
+    assert_eq!(status_text(&request, &outcome, &all, &scoped, 7), BAD_QUERY);
 }
 
 #[test]
@@ -1122,6 +1134,7 @@ fn enter_on_a_hit_whose_file_is_gone_says_so_instead_of_opening() {
 fn save_project(cache_dir: &Path, root: &Path, body: &str) {
     let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
     index.add("a.md", "a.md", body).unwrap();
+    fs::write(root.join("a.md"), body).unwrap();
     let files = crate::cache::cache_files(cache_dir, root);
     let fingerprint = crate::cache::fingerprint(&lux::library_path());
     crate::cache::save(&index, &files, &fingerprint, None, &Default::default()).unwrap();
@@ -1139,7 +1152,7 @@ fn ctrl_r_reloads_the_other_projects_and_reruns_the_query() {
     }
     save_project(&cache, &alpha, "zebra alpha");
     save_project(&cache, &zeta, "zebra zeta");
-    rig.app.shelf = Shelf::load(&cache, &lux::library_path(), None);
+    rig.app.shelf = Shelf::list(&cache, &lux::library_path(), None);
     rig.press(ctrl('e'));
     rig.type_text("zebra");
     assert_eq!(rig.app.hits.len(), 14);
@@ -1167,7 +1180,7 @@ fn ctrl_r_rebuilds_the_preview_of_a_hit_whose_source_position_now_holds_another_
     }
     save_project(&cache, &first, "zebra firstword");
     save_project(&cache, &second, "zebra secondword");
-    rig.app.shelf = Shelf::load(&cache, &lux::library_path(), None);
+    rig.app.shelf = Shelf::list(&cache, &lux::library_path(), None);
     rig.type_text("@_x zebra");
     let preview = |rig: &Rig| {
         rig.app
@@ -1186,5 +1199,51 @@ fn ctrl_r_rebuilds_the_preview_of_a_hit_whose_source_position_now_holds_another_
     assert_eq!(rig.app.hits.len(), 1);
     assert_eq!(rig.app.hits[0].source, 1);
     assert!(preview(&rig).contains("secondword"), "{}", preview(&rig));
+    let _ = fs::remove_dir_all(&base);
+}
+
+fn saved_rig(name: &str) -> (Rig, PathBuf) {
+    let mut rig = Rig::new(name);
+    let base = picker_dir(&format!("{name}-saved"));
+    let cache = base.join("cache");
+    for (project, body) in [("alpha", "zebra alpha"), ("beta", "zebra beta")] {
+        let root = base.join(project);
+        fs::create_dir_all(&root).unwrap();
+        save_project(&cache, &root, body);
+    }
+    rig.app.shelf = Shelf::list(&cache, &lux::library_path(), None);
+    (rig, base)
+}
+
+#[test]
+fn a_scope_alone_names_saved_projects_without_reading_them() {
+    let (mut rig, base) = saved_rig("lazy-scope");
+    rig.type_text("@alp");
+    assert_eq!(status_of(&rig), "Searching alpha · type a query");
+    assert!(rig.app.shelf.loaded().is_empty());
+
+    rig.type_text("ha zebra");
+    assert_eq!(rig.app.shelf.loaded(), ["alpha"]);
+    assert_eq!(
+        status_of(&rig),
+        "1 results in alpha · Enter opens selected file"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn ctrl_e_says_it_is_loading_before_it_reads_the_saved_projects() {
+    let (mut rig, base) = saved_rig("lazy-loading");
+    rig.type_text("zebra");
+    assert!(rig.app.shelf.loaded().is_empty());
+    handle_event(&mut rig.app, &mut rig.live, Event::Key(ctrl('e')), &no_disk);
+    assert_eq!(status_of(&rig), "Loading 2 saved projects…");
+    assert_eq!(rig.app.hits.len(), 12);
+    load_shelf(&mut rig.app, rig.live.index());
+    assert_eq!(rig.app.shelf.loaded(), ["alpha", "beta"]);
+    assert_eq!(
+        status_of(&rig),
+        "14 results across 3 projects · Enter opens selected file"
+    );
     let _ = fs::remove_dir_all(&base);
 }

@@ -6,7 +6,7 @@ use std::{
 use crate::{
     cache,
     lux::{DEFAULT_LIBRARY, MARK_END, MARK_START},
-    shelf::{self, Mode, Outcome, Reach, Shelf, Source},
+    shelf::{self, Mode, Outcome, Project, Reach, Shelf, Source},
     view::plain_path,
 };
 
@@ -222,7 +222,10 @@ pub fn render_text(sources: &[Source], request: &shelf::Request, outcome: &Outco
             "{:>8.1}  {}/{}\n",
             found.score, source.project.name, found.key
         ));
-        let line = shelf::snippet(source, &found.key, request, SNIPPET_LENGTH)
+        let line = source
+            .read(&found.key)
+            .ok()
+            .and_then(|text| shelf::snippet(source, &text, request, SNIPPET_LENGTH))
             .map(|marked| one_line(&marked))
             .unwrap_or_default();
         if !line.is_empty() {
@@ -268,10 +271,10 @@ pub fn render_problem(query: &str, offset: usize) -> String {
     )
 }
 
-pub fn render_projects(sources: &[Source]) -> String {
-    sources
-        .iter()
-        .map(|source| format!("{}\n", plain_root(&source.project.root)))
+pub fn render_projects<'a>(projects: impl IntoIterator<Item = &'a Project>) -> String {
+    projects
+        .into_iter()
+        .map(|project| format!("{}\n", plain_root(&project.root)))
         .collect()
 }
 
@@ -332,9 +335,15 @@ fn usage_report() -> Report {
 }
 
 pub fn run(command: &Command, cache_dir: &Path, library: &Path) -> Report {
-    let shelf = Shelf::load(cache_dir, library, None);
-    let all = shelf::sources(None, &shelf);
-    if all.is_empty() {
+    let mut shelf = Shelf::list(cache_dir, library, None);
+    if let Command::Search(options) = command {
+        shelf.load_for(&shelf::parse_request(
+            &options.query,
+            options.mode,
+            Reach::Everywhere,
+        ));
+    }
+    if shelf.len() == 0 {
         return Report::err(
             format!(
                 "recall: no saved indexes in {}. Open a project in Recall first.\n",
@@ -344,8 +353,8 @@ pub fn run(command: &Command, cache_dir: &Path, library: &Path) -> Report {
         );
     }
     match command {
-        Command::Projects => Report::out(render_projects(&all), Exit::Matched),
-        Command::Search(options) => search_report(&all, options),
+        Command::Projects => Report::out(render_projects(shelf.projects()), Exit::Matched),
+        Command::Search(options) => search_report(&shelf::sources(None, &shelf), options),
         Command::Help => usage_report(),
     }
 }
@@ -394,7 +403,7 @@ mod tests {
     use crate::{
         cache::Records,
         lux::{LuxIndex, library_path},
-        shelf::{Project, Shard},
+        shelf::Shard,
     };
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -569,14 +578,38 @@ mod tests {
         ])
     }
 
+    /// `corpus`, with each project a folder under `dir` that holds its files.
+    fn corpus_in(dir: &Path) -> Shelf {
+        let docs = [
+            (
+                "alpha",
+                "a.md",
+                "the watcher debounces\n\n  bursts   of changes",
+            ),
+            ("beta", "b.md", "watcher watcher watcher"),
+        ];
+        let shards = docs.map(|(name, key, text)| {
+            let root = dir.join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(key), text).unwrap();
+            Shard {
+                project: Project::at(root),
+                ..shard(name, &[(key, text)])
+            }
+        });
+        Shelf::from_shards(shards.into())
+    }
+
     fn report(shelf: &Shelf, options: &SearchOptions) -> Report {
         search_report(&shelf::sources(None, shelf), options)
     }
 
     #[test]
     fn text_output_has_a_scored_line_and_a_clean_snippet_per_hit() {
-        let shelf = corpus();
+        let dir = temp_dir("text");
+        let shelf = corpus_in(&dir);
         let done = report(&shelf, &options("watcher", Mode::Fuzzy, false));
+        let _ = fs::remove_dir_all(&dir);
         assert_eq!(done.exit, Exit::Matched);
         assert!(done.stderr.is_empty());
         let lines: Vec<&str> = done.stdout.lines().collect();
@@ -599,6 +632,22 @@ mod tests {
             "{}",
             lines[3]
         );
+    }
+
+    #[test]
+    fn the_line_of_context_is_the_file_as_it_is_on_disk_and_a_missing_file_has_none() {
+        let dir = temp_dir("context");
+        let shelf = corpus_in(&dir);
+        fs::write(dir.join("alpha/a.md"), "an edited watcher line").unwrap();
+        fs::remove_file(dir.join("beta/b.md")).unwrap();
+        let done = report(&shelf, &options("watcher", Mode::Fuzzy, false));
+        let _ = fs::remove_dir_all(&dir);
+        let lines: Vec<&str> = done.stdout.lines().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].ends_with("  beta/b.md"), "{lines:?}");
+        assert!(lines[1].ends_with("  alpha/a.md"), "{lines:?}");
+        assert_eq!(lines[2].trim_start(), "an edited watcher line");
+        assert_eq!(done.exit, Exit::Matched);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod bench;
 mod cache;
 mod cli;
 mod daemon;
@@ -14,6 +15,7 @@ mod lux;
 mod manager;
 mod opening;
 mod picker;
+mod prepare;
 mod preview;
 mod scan;
 mod search;
@@ -44,6 +46,9 @@ enum Exit {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::args_os().nth(1).is_some_and(|arg| arg == "bench") {
+        return bench::main(&env::args().skip(2).collect::<Vec<_>>());
+    }
     if env::args_os().nth(1).is_some_and(|arg| arg == "daemon") {
         return daemon_command(&env::args().skip(2).collect::<Vec<_>>());
     }

@@ -151,8 +151,7 @@ impl IndexManager {
 
     fn is_open(&self, entry: &CacheEntry) -> bool {
         entry
-            .root
-            .as_deref()
+            .root()
             .zip(self.open_root.as_deref())
             .is_some_and(|(root, open)| Path::new(root) == open)
     }
@@ -304,7 +303,7 @@ impl IndexManager {
         let budget = width
             .saturating_sub(marker.chars().count() + stats.chars().count() + 2)
             .max(8);
-        let label = match &entry.root {
+        let label = match entry.root() {
             Some(root) => compact_path(Path::new(&sanitize_for_display(root)), budget),
             None => format!("{UNKNOWN_FOLDER} {}", entry.name),
         };
@@ -321,15 +320,15 @@ impl IndexManager {
 }
 
 fn label_of(entry: &CacheEntry) -> String {
-    match &entry.root {
-        Some(root) => root.clone(),
+    match entry.root() {
+        Some(root) => root.to_owned(),
         None => format!("{UNKNOWN_FOLDER} {}", entry.name),
     }
 }
 
 fn stats_of(entry: &CacheEntry) -> String {
     let mut parts = Vec::new();
-    if entry.root.is_some() {
+    if entry.root().is_some() {
         parts.push(format!(
             "{} {}",
             entry.files,

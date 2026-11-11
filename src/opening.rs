@@ -56,7 +56,7 @@ pub fn open_project(root: PathBuf, library_path: &Path) -> Result<Opened, Box<dy
     }
     let status = format!("{} · F1 help", describe_startup(&live.summary()));
     let shelf = cache::default_dir()
-        .map(|dir| Shelf::load(&dir, library_path, Some(&root)))
+        .map(|dir| Shelf::list(&dir, library_path, Some(&root)))
         .unwrap_or_default();
     let mut app = App::new(root, live.indexed_files(), status);
     app.shelf = shelf;

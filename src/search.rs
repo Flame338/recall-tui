@@ -80,6 +80,9 @@ pub(crate) struct App {
     preview_for: Option<PreviewKey>,
     preview: Vec<Line<'static>>,
     live: String,
+    /// The query needs saved projects read from disk first. The event loop
+    /// draws the Loading status before it blocks on `load_shelf`.
+    loading: bool,
 }
 
 impl App {
@@ -101,6 +104,7 @@ impl App {
             preview_for: None,
             preview: Vec::new(),
             live: String::new(),
+            loading: false,
         }
     }
 
@@ -192,6 +196,11 @@ fn event_loop(
         if redraw {
             terminal.draw(|frame| draw(frame, app, live.index()))?;
             redraw = false;
+        }
+        if app.loading {
+            load_shelf(app, live.index());
+            redraw = true;
+            continue;
         }
         if !event::poll(live.poll_wait())? {
             let tick = live.tick();
@@ -390,12 +399,43 @@ fn refresh_hits(app: &mut App, index: &LuxIndex) {
     run_query(app, index, None);
 }
 
+fn loading_status(waiting: &[&Project]) -> String {
+    match waiting {
+        [only] => format!("Loading {}…", only.name),
+        _ => format!("Loading {} saved projects…", waiting.len()),
+    }
+}
+
+/// Reads the saved projects the current query has in scope, then runs it.
+fn load_shelf(app: &mut App, index: &LuxIndex) {
+    let request = parse_request(&app.query, app.mode, app.reach);
+    app.shelf.load_for(&request);
+    app.loading = false;
+    app.preview_for = None;
+    // Ctrl-R re-reads the other projects here; its notice stays up until the rescan ends.
+    let rescan = matches!(app.status, Status::Rescanning { .. }).then(|| app.status.clone());
+    run_query(app, index, None);
+    if let Some(status) = rescan {
+        app.status = status;
+    }
+}
+
 fn run_query(app: &mut App, index: &LuxIndex, keep: Option<(usize, String)>) {
+    let request = parse_request(&app.query, app.mode, app.reach);
+    // Scopes alone search nothing, so `@c` on the way to `@comfy` reads no index.
+    if !request.text.trim().is_empty() {
+        let waiting = app.shelf.unloaded(&request);
+        if !waiting.is_empty() {
+            app.status = loading_status(&waiting).into();
+            app.loading = true;
+            return;
+        }
+    }
     let (outcome, suggestions, status) = {
         let all = sources(Some((&app.project, index)), &app.shelf);
-        let request = parse_request(&app.query, app.mode, app.reach);
+        let scoped = shelf::scoped_names(Some(&app.project), &app.shelf, &request);
         let outcome = shelf::search(&all, &request, MAX_RESULTS);
-        let status = status_text(&request, &outcome, &all, app.total_files);
+        let status = status_text(&request, &outcome, &all, &scoped, app.total_files);
         (
             outcome,
             shelf::suggest(&all, &request, MAX_SUGGESTIONS),
@@ -428,22 +468,20 @@ fn reach_status(reach: Reach, others: usize) -> String {
     }
 }
 
+/// `scoped` names the projects in scope from the shelf's listing, so a
+/// scope-only query names projects whose indexes are not loaded yet.
 fn status_text(
     request: &Request,
     outcome: &shelf::Outcome,
     sources: &[Source],
+    scoped: &[&str],
     total_files: usize,
 ) -> String {
     let blank = request.text.trim().is_empty();
     let found = outcome.found.len();
-    let name_of = |position: &usize| {
-        sources
-            .get(*position)
-            .map(|source| source.project.name.as_str())
-    };
     let mut text = match (request.scopes.as_slice(), outcome.searched.as_slice()) {
         ([], _) if blank => format!("Indexed {total_files} files · type a query"),
-        ([_, ..], []) => {
+        ([_, ..], _) if scoped.is_empty() => {
             let typed: Vec<String> = request
                 .scopes
                 .iter()
@@ -451,14 +489,11 @@ fn status_text(
                 .collect();
             format!("No saved project matches {}", typed.join(" "))
         }
-        (_, searched) if blank => {
-            let names: Vec<&str> = searched.iter().filter_map(name_of).collect();
-            format!("Searching {} · type a query", names.join(", "))
-        }
+        _ if blank => format!("Searching {} · type a query", scoped.join(", ")),
         _ if outcome.problem.is_some() => BAD_QUERY.into(),
         (_, [only]) if sources.get(*only).is_some_and(|source| !source.here) => format!(
             "{found} results in {} · Enter opens selected file",
-            name_of(only).unwrap_or_default()
+            sources[*only].project.name
         ),
         (_, [_, _, ..]) => format!(
             "{found} results across {} projects · Enter opens selected file",
