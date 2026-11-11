@@ -4,8 +4,7 @@ use std::{
     error::Error,
     fs, io,
     path::{Path, PathBuf},
-    process,
-    thread,
+    process, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +14,8 @@ use crate::{
 };
 
 const FORMAT: &str = "recall-cache 3";
-const RULES_VERSION: u32 = 1;
+// 2: the index stopped storing file bodies.
+const RULES_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
@@ -282,10 +282,16 @@ pub fn entry_files(dir: &Path, name: &str, root: &Path) -> CacheFiles {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheEntry {
     pub name: String,
-    pub root: Option<String>,
+    pub header: Option<Header>,
     pub files: usize,
     pub bytes: u64,
     pub modified: Option<SystemTime>,
+}
+
+impl CacheEntry {
+    pub fn root(&self) -> Option<&str> {
+        self.header.as_ref().map(|header| header.root.as_str())
+    }
 }
 
 #[derive(Default)]
@@ -371,7 +377,7 @@ pub fn list_entries(dir: &Path) -> Vec<CacheEntry> {
                         .filter(|entry| entry.indexed)
                         .count()
                 }),
-                root: parsed.map(|parsed| parsed.header.root),
+                header: parsed.map(|parsed| parsed.header),
                 bytes: slot.bytes,
                 modified: slot.modified,
             }
@@ -379,8 +385,8 @@ pub fn list_entries(dir: &Path) -> Vec<CacheEntry> {
         .collect();
     entries.sort_by_cached_key(|entry| {
         (
-            entry.root.is_none(),
-            entry.root.as_deref().unwrap_or_default().to_lowercase(),
+            entry.root().is_none(),
+            entry.root().unwrap_or_default().to_lowercase(),
             entry.name.clone(),
         )
     });
@@ -445,15 +451,21 @@ pub struct Loaded {
     pub cursor: Option<Cursor>,
 }
 
+/// Whether the pair a manifest header describes was saved with this library
+/// and is whole on disk, checked without reading the index.
+pub fn restorable(header: &Header, files: &CacheFiles, fingerprint: &str) -> bool {
+    header.fingerprint == fingerprint
+        && stamp_of(&files.index).is_some_and(|stamp| stamp == header.index)
+}
+
 pub fn restore(index: &mut LuxIndex, files: &CacheFiles, fingerprint: &str) -> Option<Parsed> {
     let text = fs::read_to_string(&files.manifest).ok()?;
     let parsed = parse_manifest(&text)?;
-    let paired = || stamp_of(&files.index).is_some_and(|stamp| stamp == parsed.header.index);
-    if parsed.header.fingerprint != fingerprint || !paired() {
+    if !restorable(&parsed.header, files, fingerprint) {
         return None;
     }
     index.restore(&files.index).ok()?;
-    paired().then_some(parsed)
+    restorable(&parsed.header, files, fingerprint).then_some(parsed)
 }
 
 /// Restores a saved pair, or `None` when it is missing, from another library,
@@ -697,7 +709,10 @@ mod tests {
             },
         )]);
         let now = scanned(&[("locked", stamp(5, 5))]);
-        assert_eq!(plan(&old, Seen::All(&now)).to_read, [("locked".into(), stamp(5, 5))]);
+        assert_eq!(
+            plan(&old, Seen::All(&now)).to_read,
+            [("locked".into(), stamp(5, 5))]
+        );
     }
 
     #[test]
@@ -855,7 +870,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.name, stem_of(&workspace, &dir));
-        assert_eq!(entry.root.as_deref(), workspace.0.to_str());
+        assert_eq!(entry.root(), workspace.0.to_str());
         assert_eq!(entry.files, 2);
         let on_disk: u64 = fs::read_dir(&dir)
             .unwrap()
@@ -880,7 +895,7 @@ mod tests {
         let entries = list_entries(&dir);
         let seen: Vec<(&str, Option<&str>, usize)> = entries
             .iter()
-            .map(|entry| (entry.name.as_str(), entry.root.as_deref(), entry.files))
+            .map(|entry| (entry.name.as_str(), entry.root(), entry.files))
             .collect();
         assert_eq!(
             seen,
@@ -1051,7 +1066,10 @@ mod tests {
 
         let text = fs::read_to_string(&files.manifest).unwrap();
         assert!(text.starts_with("recall-cache 3\n"));
-        assert!(text.ends_with("\n18446744073709551615\t18446744073709551615\t0\ta.md\n"), "{text}");
+        assert!(
+            text.ends_with("\n18446744073709551615\t18446744073709551615\t0\ta.md\n"),
+            "{text}"
+        );
         let mut restored = LuxIndex::load(&lux::library_path()).unwrap();
         assert_eq!(load(&mut restored, &files, "fp").unwrap().records, records);
     }

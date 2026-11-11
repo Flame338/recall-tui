@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
     error::Error,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     sync::mpsc::{RecvTimeoutError, TryRecvError},
     time::{Duration, Instant},
@@ -12,11 +12,15 @@ use crate::{
     cache::{self, CacheFiles, Content, Plan, Record, Records, Seen, Stamp},
     daemon, ipc,
     lux::LuxIndex,
+    prepare::{self, Body, Fetched, Pool},
     scan,
     truth::{Change, Cursor, Debounce, Scope, Update},
     watch::{Cmd, Engine, EngineConfig, Link},
 };
 
+/// A queue this short is small work: `settle` stops waiting for it, and the
+/// calling thread reads each file itself, so a saved file is searchable when
+/// its tick returns and no worker is woken.
 const WARM_LIMIT: usize = 64;
 const WORK_BUDGET: Duration = Duration::from_millis(25);
 const SETTLE_SLICE: Duration = Duration::from_millis(15);
@@ -29,19 +33,17 @@ const BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const MANUAL_GRACE: Duration = Duration::from_secs(1);
 const WATCH_BUFFER_BYTES: usize = 256 * 1024;
+/// How far the workers may run ahead of the index. Prepared files wait here
+/// for their turn, so both limits bound memory.
+const WINDOW_SLOTS: usize = 128;
+const WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     Connecting,
-    Scanning {
-        found: usize,
-    },
-    Live {
-        via: Via,
-    },
-    Manual {
-        reason: String,
-    },
+    Scanning { found: usize },
+    Live { via: Via },
+    Manual { reason: String },
     Gone,
 }
 
@@ -62,6 +64,21 @@ pub struct Progress<'a> {
     pub done: usize,
     pub total: usize,
     pub current: &'a str,
+}
+
+/// Where indexing time went, for `recall bench`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Spent {
+    /// Summed over the threads that read.
+    pub read: Duration,
+    /// Summed over the threads that tokenized.
+    pub prepare: Duration,
+    pub commit: Duration,
+    /// The calling thread, idle until a worker finished the next file.
+    pub wait: Duration,
+    pub save: Duration,
+    pub read_bytes: u64,
+    pub unreadable: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -243,7 +260,9 @@ impl Feed {
                 synced: true,
                 watcher: None,
             },
-            Feed::Manual { reason, watcher, .. } => Feed::Manual {
+            Feed::Manual {
+                reason, watcher, ..
+            } => Feed::Manual {
                 reason,
                 synced: true,
                 watcher,
@@ -306,21 +325,48 @@ struct Pending {
     job: Job,
     /// Set while the job is backing off after a failed read.
     retry: Option<Retry>,
+    /// The ticket of the slot that is running this job.
+    flight: Option<u64>,
 }
 
 impl Pending {
-    /// A job keeps its backoff only when the update asks for the same job again.
+    /// A job keeps its backoff and its flight only when the update asks for
+    /// the same job again.
     fn queue(job: Job, before: Option<Pending>) -> Pending {
-        let retry = before
-            .filter(|before| before.job == job)
-            .and_then(|before| before.retry);
-        Pending { job, retry }
+        let same = before.filter(|before| before.job == job);
+        Pending {
+            job,
+            retry: same.and_then(|same| same.retry),
+            flight: same.and_then(|same| same.flight),
+        }
     }
 }
 
 enum Step {
     Done { changed: bool },
     Retry,
+}
+
+/// What a dispatched job brings to the index.
+enum Landing {
+    Read(Stamp, Fetched),
+    Remove,
+}
+
+enum Flight {
+    /// A worker has the file.
+    Reading(Stamp),
+    Landed(Landing),
+}
+
+/// One dispatched job. Slots land in the order they were dispatched, which is
+/// what gives every file the same place in the index as a one-thread build.
+struct Slot {
+    ticket: u64,
+    key: String,
+    /// Counted against `WINDOW_BYTES` while the slot is in the window.
+    bytes: u64,
+    flight: Flight,
 }
 
 enum Store {
@@ -362,6 +408,11 @@ pub struct Live {
     committed: Option<Cursor>,
     received: Option<Cursor>,
     want: BTreeMap<String, Pending>,
+    window: VecDeque<Slot>,
+    window_bytes: u64,
+    next_ticket: u64,
+    workers: usize,
+    pool: Option<Pool>,
     feed: Feed,
     /// `feed.mode()`, kept so `mode()` can lend it. Only `shift` writes it.
     mode: Mode,
@@ -370,6 +421,7 @@ pub struct Live {
     jobs: usize,
     current: String,
     summary: Summary,
+    spent: Spent,
     /// How `rescan` gets a new watcher after the old one was lost.
     connector: fn(&Path, Option<Cursor>) -> Watcher,
 }
@@ -401,7 +453,10 @@ impl Live {
         let reused = loaded.is_some();
         let (records, mut committed) =
             loaded.map_or_else(Default::default, |loaded| (loaded.records, loaded.cursor));
-        if records.values().any(|record| record.content == Content::Unread) {
+        if records
+            .values()
+            .any(|record| record.content == Content::Unread)
+        {
             committed = None;
         }
         let indexed = records.values().filter(|record| record.indexed).count();
@@ -421,6 +476,11 @@ impl Live {
             committed,
             received: None,
             want: BTreeMap::new(),
+            window: VecDeque::new(),
+            window_bytes: 0,
+            next_ticket: 0,
+            workers: prepare::default_workers(),
+            pool: None,
             mode: feed.mode(),
             feed,
             save: SavePolicy::new(),
@@ -432,7 +492,42 @@ impl Live {
                 reused,
                 ..Summary::default()
             },
+            spent: Spent::default(),
         })
+    }
+
+    /// No watcher, so `settle` walks the project in process, and the cache
+    /// lives in `cache_dir`.
+    pub fn headless(
+        root: &Path,
+        library: &Path,
+        cache_dir: PathBuf,
+    ) -> Result<Live, Box<dyn Error>> {
+        Live::build(root, library, Some(cache_dir), |_| None)
+    }
+
+    pub fn spent(&self) -> Spent {
+        self.spent
+    }
+
+    /// How many threads may read and tokenize files at once. Takes effect
+    /// before the first large batch of jobs.
+    pub fn set_workers(&mut self, workers: usize) {
+        self.workers = workers;
+    }
+
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Runs every queued job that is due, then saves.
+    pub fn finish(&mut self) -> bool {
+        while self.pending() > 0 {
+            std::thread::sleep(self.poll_wait());
+            self.work(Duration::MAX);
+        }
+        self.commit_cursor();
+        self.save_now()
     }
 
     pub fn index(&self) -> &LuxIndex {
@@ -461,14 +556,17 @@ impl Live {
     /// How long the event loop may sleep: no time when a job can run now,
     /// otherwise until the next retry is due.
     pub fn poll_wait(&self) -> Duration {
-        let now = Instant::now();
-        self.want
-            .values()
-            .map(|pending| pending.retry.map_or(now, |retry| retry.due))
-            .min()
-            .map_or(IDLE_POLL, |due| {
-                due.saturating_duration_since(now).min(IDLE_POLL)
-            })
+        let mut soonest: Option<Instant> = None;
+        for pending in self.want.values() {
+            let (None, Some(retry)) = (pending.flight, pending.retry) else {
+                // Typically the first entry: stop without visiting the queue.
+                return Duration::ZERO;
+            };
+            soonest = Some(soonest.map_or(retry.due, |soonest| soonest.min(retry.due)));
+        }
+        soonest.map_or(IDLE_POLL, |due| {
+            due.saturating_duration_since(Instant::now()).min(IDLE_POLL)
+        })
     }
 
     pub fn status(&self) -> String {
@@ -673,90 +771,190 @@ impl Live {
         }
     }
 
-    fn next_job(&self) -> Option<(String, Pending)> {
+    /// The lowest key whose job is due and not yet dispatched, now flying
+    /// under `ticket`.
+    fn take_job(&mut self, ticket: u64) -> Option<(String, Job)> {
         let now = Instant::now();
-        self.want
-            .iter()
-            .find(|(_, pending)| pending.retry.is_none_or(|retry| retry.due <= now))
-            .map(|(key, pending)| (key.clone(), *pending))
+        let (key, pending) = self.want.iter_mut().find(|(_, pending)| {
+            pending.flight.is_none() && pending.retry.is_none_or(|retry| retry.due <= now)
+        })?;
+        pending.flight = Some(ticket);
+        Some((key.clone(), pending.job))
+    }
+
+    fn has_room(&self, inline: bool) -> bool {
+        if inline {
+            return self.window.is_empty();
+        }
+        self.window.len() < WINDOW_SLOTS
+            && (self.window.is_empty() || self.window_bytes < WINDOW_BYTES)
+    }
+
+    /// Moves due jobs into the window, lowest key first, while it has room.
+    fn dispatch(&mut self) {
+        let inline = self.want.len() <= WARM_LIMIT;
+        while self.has_room(inline) {
+            let Some((key, job)) = self.take_job(self.next_ticket) else {
+                return;
+            };
+            let ticket = self.next_ticket;
+            self.next_ticket += 1;
+            let (bytes, flight) = match job {
+                Job::Remove => (0, Flight::Landed(Landing::Remove)),
+                Job::Upsert(stamp) if inline => {
+                    let fetched = prepare::fetch(&self.index.preparer(), &self.root, &key);
+                    (0, Flight::Landed(Landing::Read(stamp, fetched)))
+                }
+                Job::Upsert(stamp) => {
+                    let pool = self.pool.get_or_insert_with(|| {
+                        Pool::new(self.root.clone(), self.index.preparer(), self.workers)
+                    });
+                    pool.ask(ticket, key.clone());
+                    (stamp.size, Flight::Reading(stamp))
+                }
+            };
+            self.window_bytes += bytes;
+            self.window.push_back(Slot {
+                ticket,
+                key,
+                bytes,
+                flight,
+            });
+        }
+    }
+
+    /// Puts every finished fetch into its slot, waiting up to `wait` for the
+    /// first. Returns whether one came.
+    fn collect(&mut self, mut wait: Duration) -> bool {
+        let Some(pool) = &mut self.pool else {
+            return false;
+        };
+        let waiting = Instant::now();
+        let mut came = false;
+        while let Some((ticket, fetched)) = pool.answer(wait) {
+            if !came && !wait.is_zero() {
+                self.spent.wait += waiting.elapsed();
+            }
+            came = true;
+            wait = Duration::ZERO;
+            // Tickets in the window run without gaps from the front slot's.
+            let slot = self
+                .window
+                .front()
+                .and_then(|front| ticket.checked_sub(front.ticket))
+                .and_then(|ahead| self.window.get_mut(ahead as usize));
+            if let Some(slot) = slot
+                && let Flight::Reading(stamp) = slot.flight
+            {
+                slot.flight = Flight::Landed(Landing::Read(stamp, fetched));
+            }
+        }
+        if !came && !wait.is_zero() {
+            self.spent.wait += waiting.elapsed();
+        }
+        came
     }
 
     fn work(&mut self, budget: Duration) -> Vec<String> {
         let start = Instant::now();
         let mut changed = Vec::new();
-        while let Some((key, Pending { job, retry })) = self.next_job() {
-            let tries = retry.map_or(0, |retry| retry.tries).saturating_add(1);
-            match self.run_job(&key, job, tries >= MAX_TRIES) {
-                Step::Done { changed: moved } => {
-                    self.want.remove(&key);
-                    self.jobs += 1;
-                    self.save.changed();
-                    match job {
-                        Job::Upsert(_) => self.summary.updated += 1,
-                        Job::Remove => self.summary.removed += 1,
-                    }
-                    if moved {
-                        changed.push(key.clone());
-                    }
-                    self.current = key;
-                }
-                Step::Retry => {
-                    let wait = (self.backoff * 2u32.pow(u32::from(tries.min(16)) - 1)).min(MAX_BACKOFF);
-                    let retry = Some(Retry {
-                        tries,
-                        due: Instant::now() + wait,
-                    });
-                    self.want.insert(key, Pending { job, retry });
-                }
-            }
-            if start.elapsed() >= budget {
+        loop {
+            self.dispatch();
+            self.collect(Duration::ZERO);
+            let Some(front) = self.window.pop_front() else {
                 break;
+            };
+            match front.flight {
+                Flight::Landed(landing) => {
+                    self.window_bytes -= front.bytes;
+                    self.land(front.ticket, front.key, landing, &mut changed);
+                    if start.elapsed() >= budget {
+                        break;
+                    }
+                }
+                Flight::Reading(_) => {
+                    self.window.push_front(front);
+                    let left = budget.saturating_sub(start.elapsed());
+                    if left.is_zero() || !self.collect(left) {
+                        break;
+                    }
+                }
             }
         }
         changed
     }
 
-    fn run_job(&mut self, key: &str, job: Job, last_try: bool) -> Step {
+    fn land(&mut self, ticket: u64, key: String, landing: Landing, changed: &mut Vec<String>) {
+        // An update replaced or dropped the job while it flew, so what the
+        // slot read is no longer wanted.
+        let Some(Pending { job, retry, .. }) = self
+            .want
+            .get(&key)
+            .copied()
+            .filter(|pending| pending.flight == Some(ticket))
+        else {
+            return;
+        };
+        let tries = retry.map_or(0, |retry| retry.tries).saturating_add(1);
+        match self.apply(&key, landing, tries >= MAX_TRIES) {
+            Step::Done { changed: moved } => {
+                self.want.remove(&key);
+                self.jobs += 1;
+                self.save.changed();
+                match job {
+                    Job::Upsert(_) => self.summary.updated += 1,
+                    Job::Remove => self.summary.removed += 1,
+                }
+                if moved {
+                    changed.push(key.clone());
+                }
+                self.current = key;
+            }
+            Step::Retry => {
+                let wait = (self.backoff * 2u32.pow(u32::from(tries.min(16)) - 1)).min(MAX_BACKOFF);
+                let retry = Some(Retry {
+                    tries,
+                    due: Instant::now() + wait,
+                });
+                let waiting = Pending {
+                    job,
+                    retry,
+                    flight: None,
+                };
+                self.want.insert(key, waiting);
+            }
+        }
+    }
+
+    fn apply(&mut self, key: &str, landing: Landing, last_try: bool) -> Step {
         let was_indexed = self.records.get(key).is_some_and(|record| record.indexed);
-        let Job::Upsert(stamp) = job else {
+        let Landing::Read(stamp, fetched) = landing else {
             self.drop_document(key, was_indexed);
             self.record(key, None);
             return Step::Done {
                 changed: was_indexed,
             };
         };
-        let read = |indexed| {
-            Some(Record {
-                content: Content::Read(stamp),
-                indexed,
-            })
-        };
-        match fs::read_to_string(self.root.join(key)) {
-            Ok(body) => {
-                let title = key.rsplit('/').next().unwrap_or(key);
-                let indexed = self.index.add(key, title, &body).is_ok();
-                if !indexed {
-                    self.drop_document(key, was_indexed);
-                }
-                self.record(key, read(indexed));
-                Step::Done {
-                    changed: indexed || was_indexed,
-                }
+        self.spent.read += fetched.read;
+        self.spent.prepare += fetched.prepare;
+        let indexed = match fetched.body {
+            Body::Ready { document, bytes } => {
+                self.spent.read_bytes += bytes;
+                let committing = Instant::now();
+                let committed = self.index.commit(key, document).is_ok();
+                self.spent.commit += committing.elapsed();
+                committed
+            }
+            Body::Refused { bytes } => {
+                self.spent.read_bytes += bytes;
+                false
             }
             // Access denied does not clear on its own, so it is not retried.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                self.drop_document(key, was_indexed);
-                self.record(key, read(false));
-                Step::Done {
-                    changed: was_indexed,
-                }
+            Body::Unread(io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied) => {
+                self.spent.unreadable += 1;
+                false
             }
-            Err(_) => {
+            Body::Unread(_) => {
                 if last_try {
                     self.record(
                         key,
@@ -766,8 +964,21 @@ impl Live {
                         }),
                     );
                 }
-                Step::Retry
+                return Step::Retry;
             }
+        };
+        if !indexed {
+            self.drop_document(key, was_indexed);
+        }
+        self.record(
+            key,
+            Some(Record {
+                content: Content::Read(stamp),
+                indexed,
+            }),
+        );
+        Step::Done {
+            changed: indexed || was_indexed,
         }
     }
 
@@ -794,6 +1005,7 @@ impl Live {
     }
 
     fn save_now(&mut self) -> bool {
+        let saving = Instant::now();
         let saved = self.store.save(|files| {
             self.save.last_save = Instant::now();
             cache::save(
@@ -805,6 +1017,7 @@ impl Live {
             )
             .is_ok()
         });
+        self.spent.save += saving.elapsed();
         if saved {
             self.save.unsaved = 0;
         }
@@ -873,7 +1086,7 @@ mod tests {
         truth::{Epoch, Gen},
     };
     use std::{
-        process,
+        fs, process,
         sync::mpsc::{Receiver, Sender, channel},
         thread,
     };
@@ -1113,7 +1326,11 @@ mod tests {
         rig.send(delta(2, 3, vec![upsert("a.md", old)]));
         rig.send(delta(3, 4, vec![Change::Remove("a.md".into())]));
         rig.live.drain(Duration::ZERO);
-        assert_eq!(jobs(&rig.live), [("a.md", Job::Remove)], "the remove replaced the upsert");
+        assert_eq!(
+            jobs(&rig.live),
+            [("a.md", Job::Remove)],
+            "the remove replaced the upsert"
+        );
         rig.drive();
         assert!(found(&rig.live, "alpha").is_empty());
         assert!(rig.live.records.is_empty());
@@ -1133,19 +1350,39 @@ mod tests {
     #[test]
     fn a_requeued_job_keeps_its_backoff_only_while_the_job_is_the_same() {
         let project = Project::new("backoff");
-        let (old, new) = (Stamp { size: 1, modified: 1 }, Stamp { size: 2, modified: 2 });
+        let (old, new) = (
+            Stamp {
+                size: 1,
+                modified: 1,
+            },
+            Stamp {
+                size: 2,
+                modified: 2,
+            },
+        );
         let ghost = BTreeMap::from([("ghost.md".to_owned(), old)]);
         let mut rig = project.rig(None);
         rig.live.backoff = Duration::from_secs(60);
         rig.send(snapshot(&ghost, 1));
         rig.live.tick();
-        assert_eq!(tries(&rig.live, "ghost.md"), Some(1), "a missing file is retried");
-        assert!(rig.live.poll_wait() > Duration::ZERO, "the retry is not due yet");
+        assert_eq!(
+            tries(&rig.live, "ghost.md"),
+            Some(1),
+            "a missing file is retried"
+        );
+        assert!(
+            rig.live.poll_wait() > Duration::ZERO,
+            "the retry is not due yet"
+        );
 
         rig.send(snapshot(&ghost, 2));
         rig.send(delta(2, 3, vec![upsert("ghost.md", old)]));
         rig.live.tick();
-        assert_eq!(tries(&rig.live, "ghost.md"), Some(1), "the same job keeps its backoff");
+        assert_eq!(
+            tries(&rig.live, "ghost.md"),
+            Some(1),
+            "the same job keeps its backoff"
+        );
 
         rig.send(delta(3, 4, vec![upsert("ghost.md", new)]));
         rig.live.drain(Duration::ZERO);
@@ -1154,13 +1391,28 @@ mod tests {
         rig.live.tick();
         assert_eq!(tries(&rig.live, "ghost.md"), Some(1));
 
-        rig.send(delta(4, 5, vec![upsert("ghost.md", new), upsert("ghost.md", old), upsert("ghost.md", new)]));
+        rig.send(delta(
+            4,
+            5,
+            vec![
+                upsert("ghost.md", new),
+                upsert("ghost.md", old),
+                upsert("ghost.md", new),
+            ],
+        ));
         rig.live.drain(Duration::ZERO);
-        assert_eq!(tries(&rig.live, "ghost.md"), Some(1), "only the last change for a key counts");
+        assert_eq!(
+            tries(&rig.live, "ghost.md"),
+            Some(1),
+            "only the last change for a key counts"
+        );
 
         rig.send(delta(5, 6, vec![Change::Remove("ghost.md".into())]));
         rig.live.drain(Duration::ZERO);
-        assert_eq!((rig.live.pending(), tries(&rig.live, "ghost.md")), (0, None));
+        assert_eq!(
+            (rig.live.pending(), tries(&rig.live, "ghost.md")),
+            (0, None)
+        );
     }
 
     #[cfg(windows)]
@@ -1201,7 +1453,14 @@ mod tests {
 
         drop(lock);
         rig.live.backoff = Duration::from_millis(1);
-        rig.live.want.get_mut("a.md").unwrap().retry.as_mut().unwrap().due = Instant::now();
+        rig.live
+            .want
+            .get_mut("a.md")
+            .unwrap()
+            .retry
+            .as_mut()
+            .unwrap()
+            .due = Instant::now();
         rig.drive();
         assert_eq!(found(&rig.live, "alpha"), ["a.md"]);
         assert!(rig.live.records["a.md"].indexed);
@@ -1259,6 +1518,39 @@ mod tests {
         assert_eq!(discarded.live.indexed_files(), 0);
         assert_eq!(discarded.live.committed, None);
         assert!(found(&discarded.live, "alpha").is_empty());
+    }
+
+    #[test]
+    fn an_index_saved_before_bodies_were_dropped_is_rebuilt_and_then_reused() {
+        let project = Project::new("old-rules");
+        project.write("a.md", "alpha rebuilt");
+        let files = cache::cache_files(&project.cache, &project.root);
+        let old = cache::fingerprint(&lux::library_path()).replace("rules 2 ", "rules 1 ");
+        assert_ne!(
+            old,
+            cache::fingerprint(&lux::library_path()),
+            "the marker moved on"
+        );
+        let mut stale = LuxIndex::load(&lux::library_path()).unwrap();
+        stale.add("a.md", "a.md", "alpha stale").unwrap();
+        let record = Record {
+            content: Content::Read(project.stamp("a.md")),
+            indexed: true,
+        };
+        let records = Records::from([("a.md".to_owned(), record)]);
+        cache::save(&stale, &files, &old, Some(cursor(1)), &records).unwrap();
+
+        let mut rig = project.rig(Some(&project.cache));
+        assert!(!rig.live.summary.reused);
+        assert!(found(&rig.live, "stale").is_empty());
+        rig.send(snapshot(&project.walk(), 1));
+        rig.settled();
+        assert_eq!(found(&rig.live, "rebuilt"), ["a.md"]);
+        rig.live.close();
+
+        let reopened = project.rig(Some(&project.cache));
+        assert!(reopened.live.summary.reused);
+        assert_eq!(found(&reopened.live, "rebuilt"), ["a.md"]);
     }
 
     #[test]
@@ -1524,11 +1816,297 @@ mod tests {
         live.rescan();
         assert_eq!(live.mode(), &Mode::Connecting);
         let end = Instant::now() + Duration::from_secs(6);
-        while found(&live, "alpha").is_empty() || live.mode() != &(Mode::Live { via: Via::InProcess }) {
+        while found(&live, "alpha").is_empty()
+            || live.mode()
+                != &(Mode::Live {
+                    via: Via::InProcess,
+                })
+        {
             live.tick();
             assert!(Instant::now() < end, "never reconnected: {:?}", live.mode());
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Enough files that the workers read them, not the calling thread.
+    fn many(project: &Project, count: usize, body: impl Fn(usize) -> String) -> Vec<String> {
+        (0..count)
+            .map(|n| {
+                let key = format!("f{n:03}.md");
+                project.write(&key, body(n));
+                key
+            })
+            .collect()
+    }
+
+    /// Dispatches what is queued and waits until every worker has answered,
+    /// without letting any answer reach the index.
+    fn fly(rig: &mut Rig) {
+        rig.live.drain(Duration::ZERO);
+        rig.live.dispatch();
+        let end = Instant::now() + Duration::from_secs(10);
+        while rig
+            .live
+            .window
+            .iter()
+            .any(|slot| matches!(slot.flight, Flight::Reading(_)))
+        {
+            assert!(Instant::now() < end, "the workers never answered");
+            rig.live.collect(Duration::from_millis(10));
+        }
+    }
+
+    fn hits(index: &LuxIndex, query: &str) -> Vec<(String, u64)> {
+        index
+            .search(query, 400)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.key, hit.score.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn workers_give_every_file_the_place_a_one_thread_build_gives_it() {
+        let project = Project::new("ordered");
+        // Equal files score equally, so only their place in the index orders
+        // them. The large files between them finish reading last.
+        let keys = many(&project, 240, |n| match n % 3 {
+            0 => "tiebreak words repeated".into(),
+            1 => format!("filler{n} ").repeat(6_000),
+            _ => format!("tiebreak sometimes note{n}"),
+        });
+        let mut serial = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+        for key in &keys {
+            let body = fs::read_to_string(project.root.join(key)).unwrap();
+            serial.add(key, key, &body).unwrap();
+        }
+
+        let mut rig = project.rig(None);
+        rig.live.set_workers(6);
+        rig.send(snapshot(&project.walk(), 1));
+        rig.drive();
+
+        assert_eq!(rig.live.indexed_files(), 240);
+        for query in ["tiebreak", "words", "sometimes", "filler7", "note"] {
+            let expected = hits(&serial, query);
+            assert!(!expected.is_empty(), "{query}");
+            assert_eq!(hits(rig.live.index(), query), expected, "query {query:?}");
+        }
+        let tied: Vec<String> = hits(rig.live.index(), "repeated")
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(tied.len(), 80);
+        assert!(tied.is_sorted(), "equal scores list in key order: {tied:?}");
+    }
+
+    #[test]
+    fn a_file_removed_while_its_read_is_in_flight_is_never_indexed() {
+        let project = Project::new("stale-remove");
+        many(&project, 90, |n| match n {
+            3 => "zqplumbago common".into(),
+            4 => "kvquartzite common".into(),
+            _ => format!("common note{n}"),
+        });
+        let mut rig = project.rig(None);
+        rig.send(snapshot(&project.walk(), 1));
+        fly(&mut rig);
+
+        project.remove("f003.md");
+        rig.send(delta(1, 2, vec![Change::Remove("f003.md".into())]));
+        rig.drive();
+
+        assert!(found(&rig.live, "zqplumbago").is_empty());
+        assert!(!rig.live.records.contains_key("f003.md"));
+        assert_eq!(rig.live.indexed_files(), 89);
+        assert_eq!(found(&rig.live, "kvquartzite"), ["f004.md"]);
+    }
+
+    #[test]
+    fn a_file_rewritten_while_its_read_is_in_flight_never_shows_the_old_text() {
+        let project = Project::new("stale-rewrite");
+        many(&project, 90, |n| match n {
+            5 => "zqplumbago common".into(),
+            _ => format!("common note{n}"),
+        });
+        let mut rig = project.rig(None);
+        rig.send(snapshot(&project.walk(), 1));
+        fly(&mut rig);
+
+        project.write("f005.md", "kvquartzite five, and longer than before");
+        let stamp = project.stamp("f005.md");
+        rig.send(delta(1, 2, vec![upsert("f005.md", stamp)]));
+        let end = Instant::now() + Duration::from_secs(10);
+        while rig.live.pending() > 0 {
+            rig.live.tick();
+            assert!(
+                found(&rig.live, "zqplumbago").is_empty(),
+                "the stale read was committed"
+            );
+            assert!(Instant::now() < end, "queue never drained");
+        }
+
+        assert_eq!(found(&rig.live, "kvquartzite"), ["f005.md"]);
+        assert_eq!(rig.live.records["f005.md"].content, Content::Read(stamp));
+        assert_eq!(rig.live.indexed_files(), 90);
+    }
+
+    #[test]
+    fn an_update_that_asks_for_the_same_job_again_does_not_read_the_file_twice() {
+        let project = Project::new("same-job");
+        many(&project, 90, |n| format!("sametoken{n}"));
+        let files = project.walk();
+        let mut rig = project.rig(None);
+        rig.send(snapshot(&files, 1));
+        fly(&mut rig);
+
+        rig.send(snapshot(&files, 2));
+        rig.drive();
+        assert_eq!(rig.live.summary().updated, 90, "each file was applied once");
+        assert_eq!(rig.live.indexed_files(), 90);
+        assert_eq!(rig.live.committed, Some(cursor(2)));
+    }
+
+    #[test]
+    fn a_large_batch_handles_unreadable_files_as_a_small_one_does() {
+        let project = Project::new("batch-errors");
+        many(&project, 90, |n| match n {
+            8 => "zqplumbago".into(),
+            _ => format!("common note{n}"),
+        });
+        project.write("f007.md", [0xff, 0xfe, 0x00, 0x9f]);
+        fs::create_dir_all(project.root.join("denied.md")).unwrap();
+        let mut files = project.walk();
+        let ghost = Stamp {
+            size: 1,
+            modified: 1,
+        };
+        files.insert("denied.md".into(), ghost);
+        files.insert("ghost.md".into(), ghost);
+        let mut rig = project.rig(None);
+        rig.live.backoff = Duration::from_secs(60);
+        rig.send(snapshot(&files, 1));
+        let end = Instant::now() + Duration::from_secs(10);
+        while rig.live.pending() > 1 || tries(&rig.live, "ghost.md").is_none() {
+            rig.live.tick();
+            assert!(Instant::now() < end, "queue never drained");
+        }
+
+        assert_eq!(
+            tries(&rig.live, "ghost.md"),
+            Some(1),
+            "a missing file is retried"
+        );
+        assert_eq!(rig.live.indexed_files(), 89);
+        for unreadable in ["f007.md", "denied.md"] {
+            let record = rig.live.records[unreadable];
+            assert!(
+                !record.indexed && matches!(record.content, Content::Read(_)),
+                "{unreadable}"
+            );
+        }
+        assert_eq!(found(&rig.live, "zqplumbago"), ["f008.md"]);
+        assert_eq!(rig.live.committed, None, "the cursor waits for the retry");
+    }
+
+    #[test]
+    fn workers_run_no_further_ahead_than_the_window_allows() {
+        let project = Project::new("window");
+        many(&project, 100, |n| {
+            format!("windowtoken{n} ").repeat(if n < 24 { 30_000 } else { 1 })
+        });
+        let files = project.walk();
+        let mut rig = project.rig(None);
+        rig.send(snapshot(&files, 1));
+        rig.live.drain(Duration::ZERO);
+        rig.live.dispatch();
+        let largest = files.values().map(|stamp| stamp.size).max().unwrap();
+        assert!(
+            rig.live.window.len() < 24,
+            "{} slots",
+            rig.live.window.len()
+        );
+        assert!(
+            rig.live.window_bytes < WINDOW_BYTES + largest,
+            "{} bytes in flight",
+            rig.live.window_bytes
+        );
+        rig.drive();
+        assert_eq!(rig.live.indexed_files(), 100);
+        assert_eq!((rig.live.window.len(), rig.live.window_bytes), (0, 0));
+    }
+
+    #[test]
+    fn a_tick_stays_near_its_budget_while_many_workers_read() {
+        let project = Project::new("tick-budget");
+        many(&project, 6_000, |n| {
+            (0..120).map(|m| format!("budget{n}x{m} ")).collect()
+        });
+        let mut rig = project.rig(None);
+        rig.live.set_workers(16);
+        rig.send(snapshot(&project.walk(), 1));
+        let (mut longest, mut ticks) = (Duration::ZERO, 0);
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            let started = Instant::now();
+            rig.live.tick();
+            longest = longest.max(started.elapsed());
+            ticks += 1;
+            if rig.live.pending() == 0 {
+                break;
+            }
+            assert!(Instant::now() < end, "queue never drained");
+        }
+        assert_eq!(rig.live.indexed_files(), 6_000);
+        assert!(
+            ticks > 3,
+            "{ticks} ticks, longest {longest:?}, indexed {}",
+            rig.live.indexed_files()
+        );
+        assert!(longest < WORK_BUDGET * 8, "a tick took {longest:?}");
+    }
+
+    #[test]
+    fn a_few_changed_files_wake_no_worker_and_are_searchable_when_the_tick_returns() {
+        let project = Project::new("inline");
+        many(&project, 30, |n| format!("basetoken{n}"));
+        let before = project.walk();
+        let mut rig = project.rig(None);
+        rig.send(snapshot(&before, 1));
+        rig.drive();
+
+        project.write("f002.md", "editedtoken");
+        project.write("new.md", "addedtoken");
+        project.remove("f009.md");
+        rig.send(delta(1, 2, changes_between(&before, &project.walk())));
+        let tick = rig.live.tick();
+        assert_eq!(tick.pending, 0);
+        assert_eq!(tick.changed, ["f002.md", "f009.md", "new.md"]);
+        assert_eq!(found(&rig.live, "editedtoken"), ["f002.md"]);
+        assert!(found(&rig.live, "basetoken9").is_empty());
+        assert!(rig.live.pool.is_none(), "three jobs woke the workers");
+    }
+
+    #[test]
+    fn a_cancelled_open_stops_at_once_and_can_be_settled_again() {
+        let project = Project::new("cancel-busy");
+        many(&project, 300, |n| format!("canceltoken{n} ").repeat(2_000));
+        let mut rig = project.rig(None);
+        rig.send(snapshot(&project.walk(), 1));
+        let begun = Instant::now();
+        let finished = rig.live.settle(|_| Ok(false)).unwrap();
+        assert!(!finished);
+        assert!(
+            begun.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert!(rig.live.pending() > 0, "it stopped with work left");
+
+        rig.settled();
+        rig.drive();
+        assert_eq!(rig.live.indexed_files(), 300);
+        assert_eq!(found(&rig.live, "canceltoken299"), ["f299.md"]);
     }
 
     mod lifecycle {
@@ -1598,7 +2176,8 @@ mod tests {
             }
 
             fn take_handed(&mut self) {
-                if let Some((updates, commands)) = HANDED.with(|handed| handed.borrow_mut().take()) {
+                if let Some((updates, commands)) = HANDED.with(|handed| handed.borrow_mut().take())
+                {
                     self.updates = Some(updates);
                     self.commands = Some(commands);
                 }
@@ -1627,7 +2206,9 @@ mod tests {
                     CtrlR => {
                         self.live.rescan();
                         let commands = self.commands.as_ref();
-                        if commands.is_some_and(|commands| matches!(commands.try_recv(), Ok(Cmd::Rescan))) {
+                        if commands
+                            .is_some_and(|commands| matches!(commands.try_recv(), Ok(Cmd::Rescan)))
+                        {
                             self.asked += 1;
                         }
                         self.take_handed();
@@ -1666,8 +2247,18 @@ mod tests {
             let manual_stopped = (manual("watcher stopped"), "○ manual (Ctrl-R)");
             let gone = (Mode::Gone, "○ project gone");
             let rows = vec![
-                ("connecting, unsynced, attached", Start::Linked, vec![], connecting.clone()),
-                ("connecting, unsynced, lost", Start::Unlinked, vec![], connecting.clone()),
+                (
+                    "connecting, unsynced, attached",
+                    Start::Linked,
+                    vec![],
+                    connecting.clone(),
+                ),
+                (
+                    "connecting, unsynced, lost",
+                    Start::Unlinked,
+                    vec![],
+                    connecting.clone(),
+                ),
                 (
                     "scanning, unsynced, attached",
                     Start::Linked,
@@ -1680,47 +2271,206 @@ mod tests {
                     vec![Scan(3), Scan(9)],
                     (Mode::Scanning { found: 9 }, "scanning 9"),
                 ),
-                ("live, synced, attached", Start::Linked, vec![Snapshot], live.clone()),
-                ("a delta syncs too", Start::Linked, vec![Delta], live.clone()),
-                ("scanning then a snapshot", Start::Linked, vec![Scan(3), Snapshot], live.clone()),
-                ("a scan is ignored once synced", Start::Linked, vec![Snapshot, Scan(5)], live.clone()),
-                ("manual, unsynced, attached", Start::Linked, vec![Manual], manual_watch.clone()),
-                ("a scan is ignored in manual", Start::Linked, vec![Manual, Scan(2)], manual_watch.clone()),
-                ("manual while scanning", Start::Linked, vec![Scan(2), Manual], manual_watch.clone()),
-                ("gone, unsynced, attached", Start::Linked, vec![Gone], gone.clone()),
-                ("a scan is ignored when gone", Start::Linked, vec![Gone, Scan(1)], gone.clone()),
-                ("a manual update leaves gone", Start::Linked, vec![Gone, Manual], manual_watch.clone()),
-                ("manual, unsynced, lost", Start::Linked, vec![Stop], manual_stopped.clone()),
-                ("scanning, then the watcher stops", Start::Linked, vec![Scan(3), Stop], manual_stopped.clone()),
-                ("manual, synced, attached", Start::Linked, vec![Snapshot, Manual], manual_watch.clone()),
-                ("a snapshot keeps manual", Start::Linked, vec![Manual, Snapshot], manual_watch.clone()),
-                ("a delta keeps manual", Start::Linked, vec![Manual, Delta], manual_watch.clone()),
-                ("gone, synced, attached", Start::Linked, vec![Snapshot, Gone], gone.clone()),
-                ("a snapshot keeps gone", Start::Linked, vec![Gone, Snapshot], gone.clone()),
-                ("manual, synced, lost", Start::Linked, vec![Snapshot, Stop], manual_stopped.clone()),
-                ("a stop keeps the manual reason", Start::Linked, vec![Manual, Stop], manual_watch.clone()),
-                ("an own walk keeps manual", Start::Linked, vec![Stop, Walk], manual_stopped.clone()),
-                ("gone, unsynced, lost", Start::Linked, vec![Gone, Stop], gone.clone()),
-                ("gone, synced, lost", Start::Linked, vec![Snapshot, Gone, Stop], gone.clone()),
-                ("Ctrl-R after a stop reconnects", Start::Linked, vec![Stop, CtrlR], connecting.clone()),
-                ("Ctrl-R with no link connects", Start::Unlinked, vec![CtrlR], connecting.clone()),
+                (
+                    "live, synced, attached",
+                    Start::Linked,
+                    vec![Snapshot],
+                    live.clone(),
+                ),
+                (
+                    "a delta syncs too",
+                    Start::Linked,
+                    vec![Delta],
+                    live.clone(),
+                ),
+                (
+                    "scanning then a snapshot",
+                    Start::Linked,
+                    vec![Scan(3), Snapshot],
+                    live.clone(),
+                ),
+                (
+                    "a scan is ignored once synced",
+                    Start::Linked,
+                    vec![Snapshot, Scan(5)],
+                    live.clone(),
+                ),
+                (
+                    "manual, unsynced, attached",
+                    Start::Linked,
+                    vec![Manual],
+                    manual_watch.clone(),
+                ),
+                (
+                    "a scan is ignored in manual",
+                    Start::Linked,
+                    vec![Manual, Scan(2)],
+                    manual_watch.clone(),
+                ),
+                (
+                    "manual while scanning",
+                    Start::Linked,
+                    vec![Scan(2), Manual],
+                    manual_watch.clone(),
+                ),
+                (
+                    "gone, unsynced, attached",
+                    Start::Linked,
+                    vec![Gone],
+                    gone.clone(),
+                ),
+                (
+                    "a scan is ignored when gone",
+                    Start::Linked,
+                    vec![Gone, Scan(1)],
+                    gone.clone(),
+                ),
+                (
+                    "a manual update leaves gone",
+                    Start::Linked,
+                    vec![Gone, Manual],
+                    manual_watch.clone(),
+                ),
+                (
+                    "manual, unsynced, lost",
+                    Start::Linked,
+                    vec![Stop],
+                    manual_stopped.clone(),
+                ),
+                (
+                    "scanning, then the watcher stops",
+                    Start::Linked,
+                    vec![Scan(3), Stop],
+                    manual_stopped.clone(),
+                ),
+                (
+                    "manual, synced, attached",
+                    Start::Linked,
+                    vec![Snapshot, Manual],
+                    manual_watch.clone(),
+                ),
+                (
+                    "a snapshot keeps manual",
+                    Start::Linked,
+                    vec![Manual, Snapshot],
+                    manual_watch.clone(),
+                ),
+                (
+                    "a delta keeps manual",
+                    Start::Linked,
+                    vec![Manual, Delta],
+                    manual_watch.clone(),
+                ),
+                (
+                    "gone, synced, attached",
+                    Start::Linked,
+                    vec![Snapshot, Gone],
+                    gone.clone(),
+                ),
+                (
+                    "a snapshot keeps gone",
+                    Start::Linked,
+                    vec![Gone, Snapshot],
+                    gone.clone(),
+                ),
+                (
+                    "manual, synced, lost",
+                    Start::Linked,
+                    vec![Snapshot, Stop],
+                    manual_stopped.clone(),
+                ),
+                (
+                    "a stop keeps the manual reason",
+                    Start::Linked,
+                    vec![Manual, Stop],
+                    manual_watch.clone(),
+                ),
+                (
+                    "an own walk keeps manual",
+                    Start::Linked,
+                    vec![Stop, Walk],
+                    manual_stopped.clone(),
+                ),
+                (
+                    "gone, unsynced, lost",
+                    Start::Linked,
+                    vec![Gone, Stop],
+                    gone.clone(),
+                ),
+                (
+                    "gone, synced, lost",
+                    Start::Linked,
+                    vec![Snapshot, Gone, Stop],
+                    gone.clone(),
+                ),
+                (
+                    "Ctrl-R after a stop reconnects",
+                    Start::Linked,
+                    vec![Stop, CtrlR],
+                    connecting.clone(),
+                ),
+                (
+                    "Ctrl-R with no link connects",
+                    Start::Unlinked,
+                    vec![CtrlR],
+                    connecting.clone(),
+                ),
                 (
                     "a reconnect waits for a new snapshot",
                     Start::Linked,
                     vec![Snapshot, Stop, CtrlR, Scan(4)],
                     (Mode::Scanning { found: 4 }, "scanning 4"),
                 ),
-                ("a reconnect goes live again", Start::Linked, vec![Snapshot, Stop, CtrlR, Snapshot], live.clone()),
-                ("Ctrl-R after an own walk reconnects", Start::Linked, vec![Stop, Walk, CtrlR], connecting.clone()),
-                ("Ctrl-R asks a live watcher", Start::Linked, vec![Snapshot, CtrlR], live.clone()),
-                ("Ctrl-R asks a manual watcher", Start::Linked, vec![Manual, CtrlR], manual_watch.clone()),
-                ("Ctrl-R reconnects a deaf watcher", Start::Linked, vec![Snapshot, Deaf, CtrlR], connecting.clone()),
-                ("gone ignores Ctrl-R", Start::Linked, vec![Gone, CtrlR], gone.clone()),
-                ("gone and lost ignores Ctrl-R", Start::Linked, vec![Gone, Stop, CtrlR], gone.clone()),
+                (
+                    "a reconnect goes live again",
+                    Start::Linked,
+                    vec![Snapshot, Stop, CtrlR, Snapshot],
+                    live.clone(),
+                ),
+                (
+                    "Ctrl-R after an own walk reconnects",
+                    Start::Linked,
+                    vec![Stop, Walk, CtrlR],
+                    connecting.clone(),
+                ),
+                (
+                    "Ctrl-R asks a live watcher",
+                    Start::Linked,
+                    vec![Snapshot, CtrlR],
+                    live.clone(),
+                ),
+                (
+                    "Ctrl-R asks a manual watcher",
+                    Start::Linked,
+                    vec![Manual, CtrlR],
+                    manual_watch.clone(),
+                ),
+                (
+                    "Ctrl-R reconnects a deaf watcher",
+                    Start::Linked,
+                    vec![Snapshot, Deaf, CtrlR],
+                    connecting.clone(),
+                ),
+                (
+                    "gone ignores Ctrl-R",
+                    Start::Linked,
+                    vec![Gone, CtrlR],
+                    gone.clone(),
+                ),
+                (
+                    "gone and lost ignores Ctrl-R",
+                    Start::Linked,
+                    vec![Gone, Stop, CtrlR],
+                    gone.clone(),
+                ),
             ];
             for (name, start, events, (mode, status)) in rows {
                 let driver = run(start, &events);
-                assert_eq!((driver.live.mode(), driver.live.status().as_str()), (&mode, status), "{name}: {events:?}");
+                assert_eq!(
+                    (driver.live.mode(), driver.live.status().as_str()),
+                    (&mode, status),
+                    "{name}: {events:?}"
+                );
             }
         }
 
@@ -1755,17 +2505,27 @@ mod tests {
         // Reading a folder fails with access denied, as an ACL-denied file does.
         fs::create_dir_all(project.root.join("denied.md")).unwrap();
         let mut rig = project.rig(None);
-        let stamp = Stamp { size: 1, modified: 1 };
+        let stamp = Stamp {
+            size: 1,
+            modified: 1,
+        };
         let mut files = project.walk();
         files.insert("denied.md".into(), stamp);
         rig.send(snapshot(&files, 1));
         rig.drive();
         assert_eq!(rig.live.pending(), 0, "it is not retried");
         let record = rig.live.records["denied.md"];
-        assert_eq!((record.content, record.indexed), (Content::Read(stamp), false));
+        assert_eq!(
+            (record.content, record.indexed),
+            (Content::Read(stamp), false)
+        );
         assert_eq!(found(&rig.live, "alpha"), ["ok.md"]);
         rig.settled();
-        assert_eq!(rig.live.committed, Some(cursor(1)), "the cursor still advances");
+        assert_eq!(
+            rig.live.committed,
+            Some(cursor(1)),
+            "the cursor still advances"
+        );
     }
 
     #[test]
@@ -1785,13 +2545,21 @@ mod tests {
         let settled = live
             .settle(|progress| {
                 asked += 1;
-                assert!(matches!(progress.mode, Mode::Scanning { .. }), "{:?}", progress.mode);
+                assert!(
+                    matches!(progress.mode, Mode::Scanning { .. }),
+                    "{:?}",
+                    progress.mode
+                );
                 Ok(false)
             })
             .unwrap();
         assert!(!settled);
         assert_eq!(asked, 1);
-        assert_eq!(live.pending(), 0, "no snapshot was taken from a cancelled walk");
+        assert_eq!(
+            live.pending(),
+            0,
+            "no snapshot was taken from a cancelled walk"
+        );
     }
 
     #[test]
@@ -1812,7 +2580,10 @@ mod tests {
         fs::remove_file(&files.manifest).unwrap();
         rig.live.save.unsaved = 1;
         rig.live.close();
-        assert!(!files.manifest.exists() && !files.index.exists(), "the deleted pair came back");
+        assert!(
+            !files.manifest.exists() && !files.index.exists(),
+            "the deleted pair came back"
+        );
     }
 
     #[test]
@@ -1828,7 +2599,10 @@ mod tests {
         fs::remove_file(&files.manifest).unwrap();
         rig.live.save.unsaved = 1;
         rig.live.close();
-        assert!(!files.manifest.exists() && !files.index.exists(), "the deleted pair came back");
+        assert!(
+            !files.manifest.exists() && !files.index.exists(),
+            "the deleted pair came back"
+        );
     }
 
     #[test]
@@ -1864,7 +2638,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn live_follows_edits_through_a_real_daemon_and_the_real_watcher() {
-        use crate::{daemon::host, ipc::{self, PipeName}};
+        use crate::{
+            daemon::host,
+            ipc::{self, PipeName},
+        };
         let project = Project::new("daemon-e2e");
         project.write("docs/one.md", "alpha bravo");
         project.write("docs/two.md", "charlie delta");
@@ -1906,8 +2683,11 @@ mod tests {
         converge(&mut live, "qwerty", &[]);
         project.remove("docs/two.md");
         converge(&mut live, "charlie", &[]);
-        project.write("docs/.gitignore", "three.md
-");
+        project.write(
+            "docs/.gitignore",
+            "three.md
+",
+        );
         converge(&mut live, "asdfgh", &[]);
         assert_eq!(live.mode(), &Mode::Live { via: Via::Daemon });
 
@@ -1980,7 +2760,11 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
             assert!(found(&live, "lockedtoken").is_empty());
-            assert_eq!(live.records["a.md"].content, Content::Unread, "a close or crash re-reads it");
+            assert_eq!(
+                live.records["a.md"].content,
+                Content::Unread,
+                "a close or crash re-reads it"
+            );
             drop(lock);
             tick_until(&mut live, "a.md is searchable after the unlock", |live| {
                 found(live, "lockedtoken") == ["a.md"]
@@ -2001,8 +2785,11 @@ mod tests {
                 thread::sleep(Duration::from_millis(20));
             }
             let open = |name: &PipeName| {
-                let (root, build, name) =
-                    (project.root.clone(), ipc::build_id().to_owned(), name.clone());
+                let (root, build, name) = (
+                    project.root.clone(),
+                    ipc::build_id().to_owned(),
+                    name.clone(),
+                );
                 Live::build(
                     &project.root,
                     &lux::library_path(),
@@ -2019,12 +2806,18 @@ mod tests {
             first.close();
 
             let mut second = open(&name);
-            assert!(second.committed.is_some(), "the saved cursor was handed over");
+            assert!(
+                second.committed.is_some(),
+                "the saved cursor was handed over"
+            );
             let begun = Instant::now();
             let settled = second
                 .settle(|_| Ok(begun.elapsed() < Duration::from_secs(5)))
                 .unwrap();
-            assert!(settled, "settle never returned for a cursor with nothing new");
+            assert!(
+                settled,
+                "settle never returned for a cursor with nothing new"
+            );
             assert_eq!(second.mode(), &Mode::Live { via: Via::Daemon });
             assert_eq!(found(&second, "alphatoken"), ["a.md"]);
             drop(second);

@@ -10,9 +10,13 @@ use crate::{
 };
 
 pub(super) fn build_preview(source: &Source, key: &str, request: &Request) -> Vec<Line<'static>> {
-    let body = source.index.stored(key, "body").unwrap_or_default();
-    let marked = shelf::snippet(source, key, request, body.len().max(1)).unwrap_or(body);
-    preview_lines(&marked)
+    match source.read(key) {
+        Ok(body) => {
+            let marked = shelf::snippet(source, &body, request, body.len().max(1)).unwrap_or(body);
+            preview_lines(&marked)
+        }
+        Err(why) => vec![Line::from(format!("({why})"))],
+    }
 }
 
 fn preview_lines(marked: &str) -> Vec<Line<'static>> {
@@ -99,6 +103,7 @@ mod tests {
     use crate::{
         lux::{self, LuxIndex},
         shelf::{Mode, Project, Reach, parse_request},
+        testing::picker_dir,
     };
     use ratatui::{
         buffer::Buffer,
@@ -171,7 +176,13 @@ mod tests {
                 "first line\n\twhile we are testing grounds\nlast line\n",
             )
             .unwrap();
-        let project = Project::at("F:/work/note");
+        let root = picker_dir("preview-note");
+        std::fs::write(
+            root.join("note.md"),
+            "first line\n\twhile we are testing grounds\nlast line\n",
+        )
+        .unwrap();
+        let project = Project::at(&root);
         let source = Source {
             project: &project,
             index: &index,
@@ -185,6 +196,28 @@ mod tests {
         assert!(
             seen.iter().any(|(text, hot)| *hot && text == "testing"),
             "expected `testing` highlighted, got {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hit_whose_file_is_gone_previews_as_one_line_that_says_so() {
+        let root = picker_dir("preview-gone");
+        let mut index = LuxIndex::load(&lux::library_path()).expect("build libluxcore");
+        index.add("note.md", "note.md", "testing grounds").unwrap();
+        let project = Project::at(&root);
+        let source = Source {
+            project: &project,
+            index: &index,
+            here: true,
+        };
+        let request = parse_request("testing", Mode::Fuzzy, Reach::Here);
+        let gone = build_preview(&source, "note.md", &request);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(gone.len(), 1);
+        assert!(
+            gone[0].to_string().contains("no longer on disk"),
+            "{gone:?}"
         );
     }
 

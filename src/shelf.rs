@@ -1,11 +1,15 @@
 use std::{
     cmp::Ordering,
+    fmt,
+    fs::File,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
 use crate::{
     cache,
     lux::{Hit, LuxIndex, QueryFailure},
+    scan::MAX_FILE_BYTES,
     view::plain_path,
 };
 
@@ -78,20 +82,33 @@ impl Project {
     }
 }
 
+#[cfg(test)]
 pub struct Shard {
     pub project: Project,
     pub index: LuxIndex,
 }
 
+/// A saved project stays on disk until a request first has it in scope.
+enum Held {
+    Saved(cache::CacheFiles),
+    Loaded(LuxIndex),
+}
+
+struct Shelved {
+    project: Project,
+    held: Held,
+}
+
 struct Origin {
     cache_dir: PathBuf,
     library: PathBuf,
+    fingerprint: String,
     except: Option<PathBuf>,
 }
 
 #[derive(Default)]
 pub struct Shelf {
-    shards: Vec<Shard>,
+    entries: Vec<Shelved>,
     origin: Option<Origin>,
 }
 
@@ -106,70 +123,130 @@ fn same_root(left: &str, right: &str) -> bool {
 }
 
 impl Shelf {
-    pub fn load(cache_dir: &Path, library: &Path, except: Option<&Path>) -> Self {
-        let except_path = except.map(Path::to_path_buf);
-        let except = except.map(|path| path.to_string_lossy().into_owned());
+    /// Lists the saved projects another project can search, reading only
+    /// manifest headers. No index is read until `load_for` needs it.
+    pub fn list(cache_dir: &Path, library: &Path, except: Option<&Path>) -> Self {
+        let except_text = except.map(|path| path.to_string_lossy().into_owned());
         let fingerprint = cache::fingerprint(library);
-        let shards = cache::list_entries(cache_dir)
+        let entries = cache::list_entries(cache_dir)
             .into_iter()
             .filter_map(|entry| {
-                let root = entry.root?;
-                if except
+                let header = entry.header?;
+                if except_text
                     .as_deref()
-                    .is_some_and(|except| same_root(&root, except))
+                    .is_some_and(|except| same_root(&header.root, except))
                 {
                     return None;
                 }
-                if !Path::new(&root).is_dir() {
+                let root = Path::new(&header.root);
+                if !root.is_dir() {
                     return None;
                 }
-                let files = cache::entry_files(cache_dir, &entry.name, Path::new(&root));
-                let mut index = LuxIndex::load(library).ok()?;
-                cache::restore(&mut index, &files, &fingerprint)?;
-                Some(Shard {
-                    project: Project::at(root),
-                    index,
+                let files = cache::entry_files(cache_dir, &entry.name, root);
+                if !cache::restorable(&header, &files, &fingerprint) {
+                    return None;
+                }
+                Some(Shelved {
+                    project: Project::at(&header.root),
+                    held: Held::Saved(files),
                 })
             })
             .collect();
         Self {
+            entries: sorted(entries),
             origin: Some(Origin {
                 cache_dir: cache_dir.to_path_buf(),
                 library: library.to_path_buf(),
-                except: except_path,
+                fingerprint,
+                except: except.map(Path::to_path_buf),
             }),
-            ..Self::from_shards(shards)
         }
     }
 
-    pub fn from_shards(mut shards: Vec<Shard>) -> Self {
-        shards.sort_by_cached_key(|shard| {
-            (
-                shard.project.name.to_lowercase(),
-                shard.project.name.clone(),
-                shard.project.root.clone(),
-            )
-        });
+    #[cfg(test)]
+    pub fn from_shards(shards: Vec<Shard>) -> Self {
+        let entries = shards
+            .into_iter()
+            .map(|shard| Shelved {
+                project: shard.project,
+                held: Held::Loaded(shard.index),
+            })
+            .collect();
         Self {
-            shards,
+            entries: sorted(entries),
             origin: None,
         }
     }
 
+    /// Lists the cache again and forgets every loaded index, so the next
+    /// request reads the saved files afresh.
     pub fn reload(&mut self) {
         if let Some(origin) = self.origin.take() {
-            *self = Self::load(&origin.cache_dir, &origin.library, origin.except.as_deref());
+            *self = Self::list(&origin.cache_dir, &origin.library, origin.except.as_deref());
         }
     }
 
     pub fn len(&self) -> usize {
-        self.shards.len()
+        self.entries.len()
+    }
+
+    pub fn projects(&self) -> impl Iterator<Item = &Project> {
+        self.entries.iter().map(|entry| &entry.project)
+    }
+
+    /// Saved projects the request has in scope that are still on disk.
+    pub fn unloaded(&self, request: &Request) -> Vec<&Project> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.held, Held::Saved(_)))
+            .map(|entry| &entry.project)
+            .filter(|project| wanted(project, false, request))
+            .collect()
+    }
+
+    /// Reads every saved index the request has in scope. One that no longer
+    /// restores leaves the shelf, as if it had never been listed.
+    pub fn load_for(&mut self, request: &Request) {
+        let Some(origin) = &self.origin else {
+            return;
+        };
+        self.entries.retain_mut(|entry| {
+            let Held::Saved(files) = &entry.held else {
+                return true;
+            };
+            if !wanted(&entry.project, false, request) {
+                return true;
+            }
+            let Some(mut index) = LuxIndex::load(&origin.library).ok() else {
+                return false;
+            };
+            if cache::restore(&mut index, files, &origin.fingerprint).is_none() {
+                return false;
+            }
+            entry.held = Held::Loaded(index);
+            true
+        });
     }
 
     #[cfg(test)]
-    pub fn shards(&self) -> &[Shard] {
-        &self.shards
+    pub fn loaded(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.held, Held::Loaded(_)))
+            .map(|entry| entry.project.name.as_str())
+            .collect()
     }
+}
+
+fn sorted(mut entries: Vec<Shelved>) -> Vec<Shelved> {
+    entries.sort_by_cached_key(|entry| {
+        (
+            entry.project.name.to_lowercase(),
+            entry.project.name.clone(),
+            entry.project.root.clone(),
+        )
+    });
+    entries
 }
 
 #[derive(Clone, Copy)]
@@ -179,18 +256,41 @@ pub struct Source<'a> {
     pub here: bool,
 }
 
+/// The open project, then every loaded project on the shelf. A saved project
+/// that `load_for` has not read yet is not a source.
 pub fn sources<'a>(here: Option<(&'a Project, &'a LuxIndex)>, shelf: &'a Shelf) -> Vec<Source<'a>> {
+    let loaded = shelf.entries.iter().filter_map(|entry| match &entry.held {
+        Held::Loaded(index) => Some(Source {
+            project: &entry.project,
+            index,
+            here: false,
+        }),
+        Held::Saved(_) => None,
+    });
     here.into_iter()
         .map(|(project, index)| Source {
             project,
             index,
             here: true,
         })
-        .chain(shelf.shards.iter().map(|shard| Source {
-            project: &shard.project,
-            index: &shard.index,
-            here: false,
-        }))
+        .chain(loaded)
+        .collect()
+}
+
+/// Names of the projects the request has in scope, from the listing alone.
+pub fn scoped_names<'a>(
+    here: Option<&'a Project>,
+    shelf: &'a Shelf,
+    request: &Request,
+) -> Vec<&'a str> {
+    here.filter(|project| wanted(project, true, request))
+        .into_iter()
+        .chain(
+            shelf
+                .projects()
+                .filter(|project| wanted(project, false, request)),
+        )
+        .map(|project| project.name.as_str())
         .collect()
 }
 
@@ -215,10 +315,14 @@ pub struct Outcome {
 }
 
 fn in_scope(source: &Source, request: &Request) -> bool {
+    wanted(source.project, source.here, request)
+}
+
+fn wanted(project: &Project, here: bool, request: &Request) -> bool {
     if request.scopes.is_empty() {
-        return source.here || request.reach == Reach::Everywhere;
+        return here || request.reach == Reach::Everywhere;
     }
-    let name = source.project.name.to_lowercase();
+    let name = project.name.to_lowercase();
     request
         .scopes
         .iter()
@@ -331,12 +435,57 @@ pub fn ghost<'a>(input: &str, suggestions: &'a [String]) -> &'a str {
         .unwrap_or("")
 }
 
-pub fn snippet(source: &Source, key: &str, request: &Request, length: usize) -> Option<String> {
+/// Why a hit has no text to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoText {
+    Gone,
+    TooLarge,
+    NotText,
+    Unreadable,
+}
+
+impl fmt::Display for NoText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            NoText::Gone => "This file is no longer on disk",
+            NoText::TooLarge => "This file is now over 512 KiB, too large to index or preview",
+            NoText::NotText => "This file is no longer UTF-8 text",
+            NoText::Unreadable => "This file cannot be read right now",
+        })
+    }
+}
+
+impl From<io::Error> for NoText {
+    fn from(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::NotFound => NoText::Gone,
+            io::ErrorKind::InvalidData => NoText::NotText,
+            _ => NoText::Unreadable,
+        }
+    }
+}
+
+impl Source<'_> {
+    /// The file's text as it is on disk now. The index keeps no copy of it.
+    pub fn read(&self, key: &str) -> Result<String, NoText> {
+        let mut file = File::open(self.project.root.join(key))?;
+        let size = file.metadata()?.len();
+        if size > MAX_FILE_BYTES {
+            return Err(NoText::TooLarge);
+        }
+        let mut text = String::with_capacity(size as usize);
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    }
+}
+
+/// `text` with the words the request matches marked.
+pub fn snippet(source: &Source, text: &str, request: &Request, length: usize) -> Option<String> {
     match request.mode {
-        Mode::Fuzzy => source.index.snippet(key, "body", request.text, length).ok(),
+        Mode::Fuzzy => source.index.snippet_text(text, request.text, length).ok(),
         Mode::Syntax => source
             .index
-            .snippet_query(key, "body", request.text, length)
+            .snippet_text_query(text, request.text, length)
             .ok(),
     }
 }
@@ -348,7 +497,7 @@ mod tests {
     use super::*;
     use crate::{
         cache::{CacheFiles, Header, Manifest, Records, Stamp, serialize},
-        lux::{MARK_START, library_path},
+        lux::{MARK_END, MARK_START, library_path},
     };
 
     fn shard(name: &str, docs: &[(&str, &str)]) -> Shard {
@@ -456,15 +605,17 @@ mod tests {
         (here, shelf)
     }
 
+    fn listed_names(shelf: &Shelf) -> Vec<&str> {
+        shelf
+            .projects()
+            .map(|project| project.name.as_str())
+            .collect()
+    }
+
     #[test]
     fn a_shelf_orders_its_shards_by_name() {
         let (_, shelf) = corpus();
-        let names: Vec<&str> = shelf
-            .shards()
-            .iter()
-            .map(|shard| shard.project.name.as_str())
-            .collect();
-        assert_eq!(names, ["alpha", "beta"]);
+        assert_eq!(listed_names(&shelf), ["alpha", "beta"]);
     }
 
     #[test]
@@ -476,12 +627,10 @@ mod tests {
             watchers("alpha"),
             watchers("Api"),
         ]);
-        let names: Vec<&str> = shelf
-            .shards()
-            .iter()
-            .map(|shard| shard.project.name.as_str())
-            .collect();
-        assert_eq!(names, ["alpha", "Api", "api", "Beta", "Zeta"]);
+        assert_eq!(
+            listed_names(&shelf),
+            ["alpha", "Api", "api", "Beta", "Zeta"]
+        );
     }
 
     #[test]
@@ -751,26 +900,76 @@ mod tests {
 
     #[test]
     fn snippets_mark_the_matched_words_in_both_modes() {
-        let shelf = Shelf::from_shards(vec![shard(
-            "docs",
-            &[("b.md", "a debt is paid down by the watcher")],
-        )]);
+        let text = "a debt is paid down by the watcher";
+        let shelf = Shelf::from_shards(vec![shard("docs", &[("b.md", text)])]);
         let all = sources(None, &shelf);
         for mode in [Mode::Fuzzy, Mode::Syntax] {
             let req = request("debt", mode, Reach::Here);
-            let marked = snippet(&all[0], "b.md", &req, 80).expect("a snippet");
-            assert!(marked.contains(MARK_START), "{mode:?} {marked:?}");
+            let marked = snippet(&all[0], text, &req, 80).expect("a snippet");
+            assert_eq!(
+                marked,
+                format!("a {MARK_START}debt{MARK_END} is paid down by the watcher"),
+                "{mode:?}"
+            );
         }
     }
 
     #[test]
-    fn a_snippet_that_cannot_be_built_is_none() {
+    fn a_snippet_for_a_query_luxcore_cannot_read_is_none() {
         let shelf = Shelf::from_shards(vec![shard("docs", &[("b.md", "a debt")])]);
         let all = sources(None, &shelf);
         let bad = request("(debt", Mode::Syntax, Reach::Here);
-        assert_eq!(snippet(&all[0], "b.md", &bad, 80), None);
-        let fuzzy = request("debt", Mode::Fuzzy, Reach::Here);
-        assert_eq!(snippet(&all[0], "missing.md", &fuzzy, 80), None);
+        assert_eq!(snippet(&all[0], "a debt", &bad, 80), None);
+    }
+
+    #[test]
+    fn a_hit_is_read_from_its_own_project_folder_as_the_file_is_now() {
+        let dir = temp_dir("read");
+        let (near, far) = (project_dir(&dir, "near"), project_dir(&dir, "far"));
+        fs::create_dir_all(far.join("docs")).unwrap();
+        fs::write(near.join("a.md"), "near text").unwrap();
+        fs::write(far.join("docs/a.md"), "indexed text").unwrap();
+        let shelf = Shelf::from_shards(vec![
+            Shard {
+                project: Project::at(&far),
+                index: index_of("indexed text"),
+            },
+            Shard {
+                project: Project::at(&near),
+                index: index_of("near text"),
+            },
+        ]);
+        let all = sources(None, &shelf);
+        assert_eq!(all[0].read("docs/a.md").as_deref(), Ok("indexed text"));
+        assert_eq!(all[1].read("a.md").as_deref(), Ok("near text"));
+
+        fs::write(far.join("docs/a.md"), "edited since").unwrap();
+        assert_eq!(all[0].read("docs/a.md").as_deref(), Ok("edited since"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_shown_says_why() {
+        let dir = temp_dir("no-text");
+        let root = project_dir(&dir, "docs");
+        fs::write(root.join("binary.md"), [0xff, 0xfe, 0x00, 0x9f]).unwrap();
+        fs::write(root.join("at-cap.md"), vec![b'a'; 512 * 1024]).unwrap();
+        fs::write(root.join("huge.md"), vec![b'a'; 512 * 1024 + 1]).unwrap();
+        fs::create_dir_all(root.join("folder.md")).unwrap();
+        let shelf = Shelf::from_shards(vec![Shard {
+            project: Project::at(&root),
+            index: index_of("anything"),
+        }]);
+        let all = sources(None, &shelf);
+        assert_eq!(all[0].read("deleted.md"), Err(NoText::Gone));
+        assert_eq!(all[0].read("binary.md"), Err(NoText::NotText));
+        assert_eq!(all[0].read("huge.md"), Err(NoText::TooLarge));
+        assert_eq!(all[0].read("folder.md"), Err(NoText::Unreadable));
+        assert_eq!(
+            all[0].read("at-cap.md").map(|text| text.len()),
+            Ok(512 * 1024)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -814,12 +1013,115 @@ mod tests {
         fs::write(&files.manifest, serialize(&header, &Manifest::new())).unwrap();
     }
 
-    fn loaded_names(shelf: &Shelf) -> Vec<&str> {
-        shelf
-            .shards()
+    fn everywhere() -> Request<'static> {
+        request("watcher", Mode::Fuzzy, Reach::Everywhere)
+    }
+
+    fn load_all(shelf: &mut Shelf) -> Vec<&str> {
+        shelf.load_for(&everywhere());
+        shelf.loaded()
+    }
+
+    fn hits(shelf: &Shelf, request: &Request) -> Vec<(String, String, u64)> {
+        let all = sources(None, shelf);
+        search(&all, request, 10)
+            .found
             .iter()
-            .map(|shard| shard.project.name.as_str())
+            .map(|found| {
+                (
+                    all[found.source].project.name.clone(),
+                    found.key.clone(),
+                    found.score.to_bits(),
+                )
+            })
             .collect()
+    }
+
+    #[test]
+    fn listing_a_shelf_reads_no_index() {
+        let dir = temp_dir("listed");
+        save_current(&dir, &project_dir(&dir, "alpha"), "alpha watcher");
+        save_current(&dir, &project_dir(&dir, "beta"), "beta watcher");
+        let shelf = Shelf::list(&dir, &library_path(), None);
+        assert_eq!(listed_names(&shelf), ["alpha", "beta"]);
+        assert_eq!(shelf.len(), 2);
+        assert!(shelf.loaded().is_empty());
+        assert!(sources(None, &shelf).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_request_loads_only_the_saved_projects_it_has_in_scope() {
+        let dir = temp_dir("in-scope");
+        for name in ["alpha", "beta", "gamma"] {
+            save_current(&dir, &project_dir(&dir, name), "watcher");
+        }
+        let mut shelf = Shelf::list(&dir, &library_path(), None);
+        let here = request("watcher", Mode::Fuzzy, Reach::Here);
+        assert!(shelf.unloaded(&here).is_empty());
+        shelf.load_for(&here);
+        assert!(shelf.loaded().is_empty());
+
+        let scoped = request("@bet watcher", Mode::Fuzzy, Reach::Here);
+        let waiting: Vec<&str> = shelf
+            .unloaded(&scoped)
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect();
+        assert_eq!(waiting, ["beta"]);
+        shelf.load_for(&scoped);
+        assert_eq!(shelf.loaded(), ["beta"]);
+        assert!(shelf.unloaded(&scoped).is_empty());
+
+        assert_eq!(load_all(&mut shelf), ["alpha", "beta", "gamma"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loading_on_demand_finds_what_loading_everything_at_once_finds() {
+        let dir = temp_dir("same-hits");
+        save_current(&dir, &project_dir(&dir, "alpha"), "the watcher debounces");
+        save_current(&dir, &project_dir(&dir, "beta"), "watcher watcher debt");
+        save_current(&dir, &project_dir(&dir, "gamma"), "a debt of watchers");
+        let library = library_path();
+        let mut eager = Shelf::list(&dir, &library, None);
+        load_all(&mut eager);
+        let mut lazy = Shelf::list(&dir, &library, None);
+        let queries = [
+            ("@gam watcher", Mode::Fuzzy, Reach::Here),
+            ("watcher", Mode::Fuzzy, Reach::Everywhere),
+            ("+watcher -debt", Mode::Syntax, Reach::Everywhere),
+            ("@a deb", Mode::Fuzzy, Reach::Here),
+        ];
+        for (input, mode, reach) in queries {
+            let request = request(input, mode, reach);
+            lazy.load_for(&request);
+            assert_eq!(hits(&lazy, &request), hits(&eager, &request), "{input:?}");
+            let lazy_all = sources(None, &lazy);
+            let eager_all = sources(None, &eager);
+            assert_eq!(
+                suggest(&lazy_all, &request, 8),
+                suggest(&eager_all, &request, 8),
+                "{input:?}"
+            );
+        }
+        assert!(!hits(&lazy, &request("watcher", Mode::Fuzzy, Reach::Everywhere)).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_index_that_fails_to_load_leaves_the_shelf_for_good() {
+        let dir = temp_dir("fails-late");
+        save_current(&dir, &project_dir(&dir, "kept"), "watcher");
+        let spoiled = save_current(&dir, &project_dir(&dir, "spoiled"), "watcher");
+        let mut shelf = Shelf::list(&dir, &library_path(), None);
+        assert_eq!(listed_names(&shelf), ["kept", "spoiled"]);
+
+        fs::write(&spoiled.index, b"overwritten after the listing").unwrap();
+        assert_eq!(load_all(&mut shelf), ["kept"]);
+        assert_eq!(listed_names(&shelf), ["kept"]);
+        assert!(shelf.unloaded(&everywhere()).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -837,37 +1139,29 @@ mod tests {
         .unwrap();
         let library = library_path();
 
-        let shelf = Shelf::load(&dir, &library, None);
+        let mut shelf = Shelf::list(&dir, &library, None);
+        assert_eq!(listed_names(&shelf), ["Alpha", "Broken", "Zeta"]);
+        assert_eq!(load_all(&mut shelf), ["Alpha", "Zeta"]);
         let roots: Vec<&Path> = shelf
-            .shards()
-            .iter()
-            .map(|shard| shard.project.root.as_path())
+            .projects()
+            .map(|project| project.root.as_path())
             .collect();
         assert_eq!(roots, [alpha.as_path(), zeta.as_path()]);
         let all = sources(None, &shelf);
-        let outcome = search(
-            &all,
-            &request("watcher", Mode::Fuzzy, Reach::Everywhere),
-            10,
-        );
-        assert_eq!(outcome.found.len(), 2);
+        assert_eq!(search(&all, &everywhere(), 10).found.len(), 2);
 
         let shouted = format!(r"\\?\{}", alpha.to_string_lossy().to_uppercase());
-        let skipped = Shelf::load(&dir, &library, Some(Path::new(&shouted)));
+        let mut skipped = Shelf::list(&dir, &library, Some(Path::new(&shouted)));
         let expected: &[&str] = if cfg!(windows) {
             &["Zeta"]
         } else {
             &["Alpha", "Zeta"]
         };
-        assert_eq!(loaded_names(&skipped), expected);
-        let skipped = Shelf::load(&dir, &library, Some(&alpha));
-        assert_eq!(skipped.shards().len(), 1);
+        assert_eq!(load_all(&mut skipped), expected);
+        let mut skipped = Shelf::list(&dir, &library, Some(&alpha));
+        assert_eq!(load_all(&mut skipped).len(), 1);
 
-        assert!(
-            Shelf::load(&dir.join("missing"), &library, None)
-                .shards()
-                .is_empty()
-        );
+        assert_eq!(Shelf::list(&dir.join("missing"), &library, None).len(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -881,27 +1175,35 @@ mod tests {
         save_current(&dir, &kept, "watcher");
         save_current(&dir, &open, "watcher");
         save_current(&dir, &dropped, "watcher");
-        let mut shelf = Shelf::load(&dir, &library, Some(&open));
-        assert_eq!(loaded_names(&shelf), ["dropped", "kept"]);
+        let mut shelf = Shelf::list(&dir, &library, Some(&open));
+        assert_eq!(load_all(&mut shelf), ["dropped", "kept"]);
 
         fs::remove_dir_all(&dropped).unwrap();
         save_current(&dir, &project_dir(&dir, "added"), "watcher");
+        save_current(&dir, &kept, "watcher rewritten");
+        shelf.reload();
+        assert!(shelf.loaded().is_empty());
+        assert_eq!(listed_names(&shelf), ["added", "kept"]);
+        assert_eq!(load_all(&mut shelf), ["added", "kept"]);
+        let rewritten = request("rewritten", Mode::Fuzzy, Reach::Everywhere);
+        assert_eq!(hits(&shelf, &rewritten).len(), 1);
+
         index_of(&"fresh body ".repeat(40))
             .save(&cache::cache_files(&dir, &kept).index)
             .unwrap();
         shelf.reload();
-        assert_eq!(loaded_names(&shelf), ["added"]);
+        assert_eq!(load_all(&mut shelf), ["added"]);
 
         fs::remove_dir_all(&dir).unwrap();
         shelf.reload();
-        assert!(shelf.shards().is_empty());
+        assert_eq!(shelf.len(), 0);
     }
 
     #[test]
     fn reloading_a_shelf_made_from_shards_changes_nothing() {
         let mut shelf = Shelf::from_shards(vec![watchers("beta"), watchers("alpha")]);
         shelf.reload();
-        assert_eq!(loaded_names(&shelf), ["alpha", "beta"]);
+        assert_eq!(shelf.loaded(), ["alpha", "beta"]);
         Shelf::default().reload();
     }
 
@@ -915,8 +1217,8 @@ mod tests {
             "rules 0 lib 1 1",
             "watcher",
         );
-        let shelf = Shelf::load(&dir, &library_path(), None);
-        assert_eq!(loaded_names(&shelf), ["fresh"]);
+        let mut shelf = Shelf::list(&dir, &library_path(), None);
+        assert_eq!(load_all(&mut shelf), ["fresh"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -928,8 +1230,8 @@ mod tests {
         index_of(&"another body entirely ".repeat(50))
             .save(&torn.index)
             .unwrap();
-        let shelf = Shelf::load(&dir, &library_path(), None);
-        assert_eq!(loaded_names(&shelf), ["whole"]);
+        let mut shelf = Shelf::list(&dir, &library_path(), None);
+        assert_eq!(load_all(&mut shelf), ["whole"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -940,8 +1242,8 @@ mod tests {
         let removed = project_dir(&dir, "removed");
         save_current(&dir, &removed, "watcher");
         fs::remove_dir_all(&removed).unwrap();
-        let shelf = Shelf::load(&dir, &library_path(), None);
-        assert_eq!(loaded_names(&shelf), ["kept"]);
+        let mut shelf = Shelf::list(&dir, &library_path(), None);
+        assert_eq!(load_all(&mut shelf), ["kept"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

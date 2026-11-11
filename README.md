@@ -52,6 +52,8 @@ Type words, a phrase, or a code symbol. Results update as you type. Use the arro
 
 Recall currently uses LuxCore’s lexical BM25 search and typo tolerance. It does not embed text or perform vector/semantic retrieval, so it works best when the query shares words with the relevant source. Recall saves the index and a file manifest under `%LOCALAPPDATA%\Recall` (or `$XDG_CACHE_HOME/recall`, or `~/.cache/recall`), one pair per folder: a `.lux` index and a `.manifest` that records the folder path and a stamp for each file. At the next launch it loads the saved index and catches up on what changed (see Live updates). A different LuxCore library file, a change to the scan rules, or an index saved by an older version of Recall rebuilds the index from scratch.
 
+The saved index holds each file's words and not its text, so it is much smaller than the source. The preview reads the selected file from disk, which means it shows the file as it is now. A hit whose file was deleted, grew past 512 KiB, or is no longer UTF-8 text previews as one line that says so. Indexing reads and tokenizes files on several threads, 8 to 16 depending on the machine, because a first index of files the system has not cached waits mostly on the disk. The result of a search does not depend on the number of threads.
+
 ## Every project at once
 
 Recall searches the open project until you ask for more. Press `Ctrl-E` and each query also runs against every other project Recall has saved. The hits are merged into one list, best score first, and a hit from another project shows that project's name in front of its path. The box title says `everywhere` while this is on. Press `Ctrl-E` again to return to the open project.
@@ -60,7 +62,7 @@ Start the query with `@name` to search only the saved projects whose folder name
 
 `Ctrl-T` switches to LuxCore query syntax, such as `title:readme AND build` or `+watcher -daemon`, and the box title says `syntax`. This mode matches whole words only, with no typo tolerance and no completion. When LuxCore cannot read the query, the query turns red from the byte it rejected. Recall builds its indexes without positions, so a quoted phrase is rejected.
 
-The open project is searched live. The other projects are read from their saved indexes when you open a project, so they are as fresh as their last save. `Ctrl-R` re-reads those saved indexes. A saved project is left out when its index was saved with a different LuxCore library or scan rules, by an older version of Recall, or when its folder no longer exists. Opening a project rebuilds a stale index. Each project scores against its own statistics, so scores from different projects are close but not strictly comparable.
+The open project is searched live. Another project is read from its saved index the first time a query reaches it, through `Ctrl-E` or an `@name` that matches it, so it is as fresh as its last save. Until then it costs no memory. The status line says `Loading` while a large index is read, which can take several seconds. An `@name` with no query words yet reads nothing. A project stays in memory once read. `Ctrl-R` forgets what was read, so the next query reads the saved indexes again. A saved project is left out when its index was saved with a different LuxCore library or scan rules, by an older version of Recall, or when its folder no longer exists. Opening a project rebuilds a stale index. Each project scores against its own statistics, so scores from different projects are close but not strictly comparable.
 
 ## From a script
 
@@ -71,7 +73,7 @@ recall search --syntax "title:readme AND build"
 recall projects
 ```
 
-`recall search` searches every saved project without opening the interface. It prints each hit as `project/path` with its score and one line of context, or a JSON array with `--json`. It exits with 0 when it printed matches, 1 when there were none, and 2 for a query LuxCore cannot read or a bad argument. `recall projects` lists the saved project folders. Both take `--lib PATH`. A project folder named `search` or `projects` needs a path such as `.\search` to open.
+`recall search` searches every saved project without opening the interface. It prints each hit as `project/path` with its score and one line of context, or a JSON array with `--json`. It exits with 0 when it printed matches, 1 when there were none, and 2 for a query LuxCore cannot read or a bad argument. With `@name`, it reads only the saved projects that match. `recall projects` lists the saved project folders without reading any index. Both take `--lib PATH`. A project folder named `search` or `projects` needs a path such as `.\search` to open.
 
 ## Live updates
 
